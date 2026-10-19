@@ -9,5 +9,9 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
     host: '127.0.0.1',
+    // Cargo scrive in src-tauri/target durante la build: sorvegliarla fa crashare Vite (EBUSY su Windows)
+    watch: {
+      ignored: ['**/src-tauri/**'],
+    },
   },
 })
