@@ -1,4 +1,4 @@
-import { osBadge } from '../lib/platform';
+import { osBadge, isMac } from '../lib/platform';
 import { useEffect, useState } from 'react';
 import { 
   Sparkles, Folder, ArrowRight, ArrowLeft, 
@@ -223,7 +223,7 @@ export default function Wizard() {
         className="h-14 px-6 flex items-center justify-between border-b border-white/[0.08] liquid-glass flex-shrink-0 z-40"
       >
         <div className="flex items-center min-w-[200px]">
-          <div className="w-[72px] h-4 pointer-events-none flex-shrink-0" />
+          {isMac && <div className="w-[72px] h-4 pointer-events-none flex-shrink-0" />}
         </div>
 
         {isDownloadingScreen ? (
