@@ -1,3 +1,4 @@
+import { osBadge } from '../lib/platform';
 import { useEffect, useState } from 'react';
 import { 
   Sparkles, Folder, ArrowRight, ArrowLeft, 
@@ -20,19 +21,19 @@ const STEPS = [
 const LLM_OPTIONS = [
   {
     id: 'mlx-community/Qwen3.5-4B-MLX-4bit',
-    name: 'Qwen 3.5 4B (4-bit MLX Metal)',
+    name: 'Qwen 3.5 4B (4-bit)',
     badge: 'Consigliato 2026',
     badgeColor: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30',
-    description: 'Architettura Gated DeltaNet 2026, KV cache quantizzata 4-bit, ideale per MacBook Air M1 8GB. Risposte flash istantanee live e capitoli completi del Quaderno.',
+    description: 'Architettura Gated DeltaNet 2026, KV cache quantizzata 4-bit, ideale per computer con 8GB di RAM. Risposte flash istantanee live e capitoli completi del Quaderno.',
     downloadSize: '~2.4 GB',
     ram: '~2.3 GB',
   },
   {
     id: 'unsloth/gemma-4-E4B-it-UD-MLX-4bit',
-    name: 'Gemma 4 E4B (4-bit MLX Metal)',
+    name: 'Gemma 4 E4B (4-bit)',
     badge: 'Alternativo',
     badgeColor: 'bg-blue-500/20 text-blue-300 border-blue-500/30',
-    description: 'Modello compatto ad alta efficienza per sintesi accademiche e spiegazioni didattiche su Apple Silicon Metal.',
+    description: 'Modello compatto ad alta efficienza per sintesi accademiche e spiegazioni didattiche in locale.',
     downloadSize: '~2.5 GB',
     ram: '~2.4 GB',
   },
@@ -276,7 +277,7 @@ export default function Wizard() {
 
         <div className="min-w-[200px] flex justify-end pointer-events-none">
           <span className="text-[11px] font-mono text-white/30 px-2.5 py-1 rounded-full border border-white/[0.06] bg-white/[0.02]">
-            Apple Silicon Native
+            {osBadge ?? 'SbobinAI'}
           </span>
         </div>
       </header>
@@ -296,7 +297,7 @@ export default function Wizard() {
                 Benvenuto in SbobinAI
               </h1>
               <p className="text-sm text-white/60 max-w-lg mx-auto leading-relaxed">
-                Il quaderno universitario per Apple Silicon: registra e trascrivi lezioni senza allucinazioni, 
+                Il quaderno universitario intelligente: registra e trascrivi lezioni senza allucinazioni, 
                 indicizza i materiali del corso e interroga la memoria con modelli IA al 100% in locale.
               </p>
             </div>
@@ -305,7 +306,7 @@ export default function Wizard() {
               <div className="p-4 rounded-2xl liquid-glass border border-white/[0.10] shadow-liquid-sm space-y-2">
                 <ShieldCheck size={22} className="text-emerald-400" />
                 <p className="text-xs font-semibold text-white/95">Privacy & Locale</p>
-                <p className="text-[11px] text-white/50 leading-relaxed">Audio, sbobine e vettori risiedono sul tuo Mac senza invio a server esterni.</p>
+                <p className="text-[11px] text-white/50 leading-relaxed">Audio, sbobine e vettori risiedono sul tuo computer senza invio a server esterni.</p>
               </div>
               <div className="p-4 rounded-2xl liquid-glass border border-white/[0.10] shadow-liquid-sm space-y-2">
                 <Zap size={22} className="text-amber-400" />
@@ -314,7 +315,7 @@ export default function Wizard() {
               </div>
               <div className="p-4 rounded-2xl liquid-glass border border-white/[0.10] shadow-liquid-sm space-y-2">
                 <Laptop size={22} className="text-blue-400" />
-                <p className="text-xs font-semibold text-white/95">Ottimizzato M1 8GB</p>
+                <p className="text-xs font-semibold text-white/95">Leggero e veloce</p>
                 <p className="text-[11px] text-white/50 leading-relaxed">KV cache 4-bit, auto-unload intelligente e zero consumo di batteria.</p>
               </div>
             </div>
@@ -339,7 +340,7 @@ export default function Wizard() {
 
             <div className="p-5 rounded-3xl liquid-glass border border-white/[0.12] shadow-liquid-sm space-y-4">
               <label className="text-xs font-medium text-white/70 block">
-                Percorso Cartella sul tuo Mac
+                Percorso Cartella sul tuo computer
               </label>
               
               <div className="flex items-center gap-3">
@@ -425,7 +426,7 @@ export default function Wizard() {
               <span>
                 {llmModel === 'later'
                   ? 'Hai scelto di rimandare: potrai registrare e sbobinare subito le lezioni, e scaricare l\'LLM in seguito dalle Impostazioni.'
-                  : `Hai selezionato ${LLM_OPTIONS.find((o) => o.id === llmModel)?.name}. Sarà pronto all'uso sul tuo Mac.`}
+                  : `Hai selezionato ${LLM_OPTIONS.find((o) => o.id === llmModel)?.name}. Sarà pronto all'uso sul tuo computer.`}
               </span>
             </div>
           </div>
@@ -443,7 +444,7 @@ export default function Wizard() {
                 Componenti di Sistema Obbligatori (Audio & Ricerca Semantica)
               </h2>
               <p className="text-xs text-white/60 leading-relaxed">
-                SbobinAI richiede questi due motori nativi Apple Silicon per poter catturare le lezioni e abilitare la memoria del corso. 
+                SbobinAI richiede questi due motori nativi per poter catturare le lezioni e abilitare la memoria del corso. 
                 L'installazione su disco è obbligatoria per sbloccare l'applicazione.
               </p>
             </div>
@@ -465,7 +466,7 @@ export default function Wizard() {
                         ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
                         : 'bg-amber-500/20 text-amber-300 border-amber-500/30'
                     )}>
-                      {isWhisperDownloaded ? 'Installato sul Mac ✓' : 'Da Installare'}
+                      {isWhisperDownloaded ? 'Installato sul computer ✓' : 'Da Installare'}
                     </span>
                     <div className="w-8 h-8 rounded-xl bg-white/[0.08] flex items-center justify-center text-white/80">
                       <Mic size={15} />
@@ -475,7 +476,7 @@ export default function Wizard() {
                   <h3 className="text-sm font-bold text-white mb-0.5">Motore Vocale Whisper</h3>
                   <p className="text-[11px] font-mono text-white/40">Whisper Large-v3-Turbo Q4 (~580 MB)</p>
                   <p className="text-xs text-white/60 mt-2 leading-relaxed">
-                    Trascrizione continua, fedele e priva di allucinazioni, accelerata da Metal.
+                    Trascrizione continua, fedele e priva di allucinazioni, accelerata in locale.
                   </p>
                 </div>
 
@@ -500,7 +501,7 @@ export default function Wizard() {
                         ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
                         : 'bg-amber-500/20 text-amber-300 border-amber-500/30'
                     )}>
-                      {isEmbeddingDownloaded ? 'Installato sul Mac ✓' : 'Da Installare'}
+                      {isEmbeddingDownloaded ? 'Installato sul computer ✓' : 'Da Installare'}
                     </span>
                     <div className="w-8 h-8 rounded-xl bg-white/[0.08] flex items-center justify-center text-white/80">
                       <Database size={15} />
@@ -510,7 +511,7 @@ export default function Wizard() {
                   <h3 className="text-sm font-bold text-white mb-0.5">Motore Memoria RAG</h3>
                   <p className="text-[11px] font-mono text-white/40">Qwen3-Embedding 0.6B DWQ (~300 MB)</p>
                   <p className="text-xs text-white/60 mt-2 leading-relaxed">
-                    Vettorializzazione 1024-dim nativa MLX per la ricerca ibrida nei materiali e lezioni.
+                    Vettorializzazione 1024-dim nativa per la ricerca ibrida nei materiali e lezioni.
                   </p>
                 </div>
 
@@ -532,7 +533,7 @@ export default function Wizard() {
                 <>
                   <CheckCircle2 size={18} className="text-emerald-400 flex-shrink-0" />
                   <span>
-                    <strong>Componenti di sistema base verificati!</strong> Il tuo Mac è pronto per registrare le lezioni e indicizzare i contenuti. Clicca su "Inizia a Studiare".
+                    <strong>Componenti di sistema base verificati!</strong> Il tuo computer è pronto per registrare le lezioni e indicizzare i contenuti. Clicca su "Inizia a Studiare".
                   </span>
                 </>
               ) : (
@@ -633,7 +634,7 @@ export default function Wizard() {
                     : activeInfo?.stage || (
                         progressPct < 90
                           ? `Download ${activeDownloadModel === CORE_WHISPER_ID ? 'Whisper Large Turbo' : 'Qwen3 Embedding'}...`
-                          : 'Ottimizzazione pesi su Apple Silicon Metal...'
+                          : 'Ottimizzazione pesi su in locale...'
                       )}
                 </span>
               </div>
@@ -641,7 +642,7 @@ export default function Wizard() {
               <p className="text-xs text-white/50 leading-relaxed">
                 {downloadError
                   ? `Si è verificato un errore: ${downloadError}. Clicca su "Interrompi" per riprovare.`
-                  : 'I componenti risiedono interamente nella memoria locale del tuo Mac.'}
+                  : 'I componenti risiedono interamente nella memoria locale del tuo computer.'}
               </p>
             </div>
           </div>

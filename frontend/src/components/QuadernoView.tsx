@@ -191,7 +191,7 @@ export default function QuadernoView({
       if (err?.name === 'AbortError') {
         return;
       }
-      setSummaryError(err?.message || 'Errore durante la generazione della sintesi con mlx-lm');
+      setSummaryError(err?.message || 'Errore durante la generazione della sintesi in locale');
     } finally {
       setIsGeneratingSummary(false);
       abortControllerRef.current = null;
@@ -629,7 +629,7 @@ export default function QuadernoView({
                           type="button"
                           onClick={handleCancelSummary}
                           className="h-8 px-3.5 rounded-full bg-red-500/20 hover:bg-red-500/30 text-xs font-semibold text-red-300 border border-red-500/40 transition-all flex items-center gap-1.5 cursor-pointer shadow-liquid-sm animate-pulse"
-                          title="Interrompi subito l'inferenza IA e raffredda il Mac"
+                          title="Interrompi subito l'inferenza IA e libera le risorse del computer"
                         >
                           <Square size={10} fill="currentColor" strokeWidth={0} />
                           <span>Interrompi</span>
@@ -639,7 +639,7 @@ export default function QuadernoView({
                           type="button"
                           onClick={handleGenerateSummary}
                           className="h-8 px-3.5 rounded-full liquid-glass-pill hover:bg-white/[0.14] text-xs font-medium text-white/90 border border-white/[0.14] transition-all flex items-center gap-1.5 cursor-pointer shadow-liquid-sm"
-                          title="Genera o rigenera la sintesi strutturata del Quaderno con MLX"
+                          title="Genera o rigenera la sintesi strutturata del Quaderno"
                         >
                           <Sparkles size={12} strokeWidth={2} className="text-amber-300" />
                           <span>Sintesi IA</span>
@@ -809,7 +809,7 @@ export default function QuadernoView({
                         <Loader2 size={22} className="animate-spin text-amber-400" />
                       </div>
                       <div className="space-y-1">
-                        <h3 className="text-sm font-semibold text-white">Generazione Capitolo con Qwen 3.5 MLX...</h3>
+                        <h3 className="text-sm font-semibold text-white">Generazione Capitolo con Qwen 3.5...</h3>
                         <p className="text-xs text-white/60 max-w-md mx-auto leading-relaxed">
                           L'LLM sta sintetizzando la trascrizione e i concetti chiave della lezione per redigere il capitolo strutturato per il tuo Quaderno.
                         </p>
@@ -818,7 +818,7 @@ export default function QuadernoView({
                         <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
                         <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse [animation-delay:150ms]" />
                         <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse [animation-delay:300ms]" />
-                        <span className="text-[11px] font-mono text-amber-300/80 ml-2">Inferenza Metal GPU attiva (100% Offline)</span>
+                        <span className="text-[11px] font-mono text-amber-300/80 ml-2">Inferenza locale attiva (100% Offline)</span>
                       </div>
                       <div className="pt-2">
                         <button
@@ -828,7 +828,7 @@ export default function QuadernoView({
                           title="Interrompi subito l'elaborazione IA e libera la RAM"
                         >
                           <Square size={10} fill="currentColor" strokeWidth={0} />
-                          <span>Interrompi e Raffredda Mac</span>
+                          <span>Interrompi e libera risorse</span>
                         </button>
                       </div>
                     </div>
@@ -842,7 +842,7 @@ export default function QuadernoView({
                       <h3 className="text-sm font-semibold text-white/90">Nessun appunto nel Quaderno</h3>
                       <p className="text-xs text-white/50 max-w-sm mx-auto leading-relaxed">
                         {selectedLecture.raw_transcript 
-                          ? "La trascrizione è pronta! Puoi generare automaticamente il capitolo strutturato per il Quaderno con l'LLM nativo Apple Silicon."
+                          ? "La trascrizione è pronta! Puoi generare automaticamente il capitolo strutturato per il Quaderno con l'LLM locale."
                           : "Non ci sono note scritte per questa lezione. Puoi scriverle o incollarle cliccando su Modifica."}
                       </p>
                       
@@ -860,7 +860,7 @@ export default function QuadernoView({
                             className="px-4 py-1.5 rounded-full bg-white/[0.18] hover:bg-white/[0.26] border border-white/[0.22] text-xs font-semibold text-white transition-all inline-flex items-center gap-1.5 cursor-pointer shadow-liquid-sm"
                           >
                             <Sparkles size={13} className="text-amber-300" />
-                            <span>Genera Capitolo con MLX</span>
+                            <span>Genera Capitolo</span>
                           </button>
                         )}
                         <button
@@ -993,7 +993,7 @@ export default function QuadernoView({
                                 <div className="flex items-center justify-between mb-1.5">
                                   <div className="flex items-center gap-1.5 text-[10px] font-mono text-white/40">
                                     <Sparkles size={11} className="text-amber-400/70" />
-                                    <span>Risposta SbobinAI (MLX Metal)</span>
+                                    <span>Risposta SbobinAI (locale)</span>
                                   </div>
                                   {hasModel && (
                                     <button

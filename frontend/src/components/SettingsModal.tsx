@@ -8,6 +8,8 @@ import {
 import { clsx } from 'clsx';
 import { useSettings } from '../lib/SettingsContext';
 import { pickFolder } from '../lib/tauri';
+import { osBadge } from '../lib/platform';
+import { useUpdater } from '../lib/useUpdater';
 import { api } from '../lib/api';
 import type { ModelsStatusResponse, ModelInfo } from '../types';
 
@@ -27,6 +29,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
   const updateSettingsRef = useRef(updateSettings);
   updateSettingsRef.current = updateSettings;
 
+  const updater = useUpdater();
   const [activeTab, setActiveTab] = useState<TabType>('models');
   const [modelFilter, setModelFilter] = useState<ModelFilterType>('system_core');
 
@@ -428,7 +431,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                 </div>
 
                 <div className="p-4 rounded-3xl liquid-glass border border-white/[0.10] shadow-liquid-sm space-y-3">
-                  <label className="text-xs font-semibold text-white/70 block">Percorso Libreria Corsi sul Mac</label>
+                  <label className="text-xs font-semibold text-white/70 block">Percorso Libreria Corsi sul computer</label>
                   <div className="flex items-center gap-3">
                     <div className="flex-1 px-4 py-2.5 rounded-2xl liquid-input font-mono text-xs text-white/95 truncate">
                       {storagePath}
@@ -543,14 +546,14 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                     <div className="min-w-0">
                       <div className="flex items-center gap-2.5 flex-wrap">
                         <span className="text-xs font-bold text-white">
-                          Memoria Modelli IA sul Mac:
+                          Memoria Modelli IA sul computer:
                         </span>
                         <span className="text-xs font-bold font-mono px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
                           {totalInstalledMb} MB {totalInstalledMb > 1024 ? `(~${(totalInstalledMb / 1024).toFixed(2)} GB)` : ''}
                         </span>
                       </div>
                       <p className="text-[11px] text-white/45 mt-0.5 truncate">
-                        Posizione cache sul Mac: ~/.cache/huggingface/hub
+                        Posizione cache sul computer: ~/.cache/huggingface/hub
                       </p>
                     </div>
                   </div>
@@ -649,7 +652,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                   <div className="space-y-4">
                     <div>
                       <span className="text-xs font-semibold uppercase tracking-wider text-white/50 block">
-                        Componenti di Sistema Obbligatori (Apple Silicon Metal)
+                        Componenti di Sistema Obbligatori{osBadge ? ` — ${osBadge}` : ''}
                       </span>
                       <p className="text-[11px] text-white/45 mt-1 leading-relaxed">
                         Questi due motori costituiscono il nucleo stabile di SbobinAI: Whisper Large Turbo per la trascrizione in memoria e Qwen3-Embedding per la memoria RAG (1024 dim) su LanceDB.
@@ -666,10 +669,10 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                         (() => {
                           const coreWhisper = modelsStatus?.whisper?.find((m) => m.id === 'large-v3-turbo-q4') || {
                             id: 'large-v3-turbo-q4',
-                            name: 'Whisper Large-v3-Turbo Q4 (Apple Silicon)',
+                            name: 'Whisper Large-v3-Turbo Q4 (locale)',
                             type: 'whisper' as const,
                             approx_size: '~580 MB',
-                            description: 'Motore Vocale di sistema obbligatorio: trascrizione ad alta precisione 4-bit per Apple Silicon Metal (~580 MB). Fedeltà massima e consumo nullo in pausa.',
+                            description: 'Motore Vocale di sistema obbligatorio: trascrizione ad alta precisione 4-bit (~580 MB). Fedeltà massima e consumo nullo in pausa.',
                             downloaded: false,
                             status: 'idle' as const,
                             disk_size_mb: null,
@@ -677,10 +680,10 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
 
                           const coreEmbedding = modelsStatus?.embedding?.find((m) => m.id === 'mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ') || {
                             id: 'mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ',
-                            name: 'Qwen3 Embedding 0.6B 4-bit DWQ (MLX)',
+                            name: 'Qwen3 Embedding 0.6B 4-bit DWQ',
                             type: 'embedding' as const,
                             approx_size: '~300 MB',
-                            description: 'Motore Memoria RAG di sistema obbligatorio: architettura Qwen3 nativa MLX, 1024 dimensioni (~300 MB in RAM). Indicizzazione ad altissima velocità e ricerca ibrida su LanceDB.',
+                            description: 'Motore Memoria RAG di sistema obbligatorio: architettura Qwen3 nativa, 1024 dimensioni (~300 MB in RAM). Indicizzazione ad altissima velocità e ricerca ibrida su LanceDB.',
                             downloaded: false,
                             status: 'idle' as const,
                             disk_size_mb: null,
@@ -812,7 +815,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                   <div className="space-y-4">
                     <div>
                       <span className="text-xs font-semibold uppercase tracking-wider text-white/50 block">
-                        Modelli Linguistici LLM (Accelerazione Metal Apple Silicon & mlx-lm)
+                        Modelli Linguistici LLM (esecuzione locale)
                       </span>
                       <p className="text-[11px] text-white/45 mt-1 leading-relaxed">
                         I modelli 4-bit generano capitoli di studio e rispondono nella chat. Puoi scaricare il modello desiderato, impostarlo come attivo o eliminarlo per recuperare spazio su disco.
@@ -1063,7 +1066,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                 <div>
                   <h3 className="text-sm font-bold text-white">Privacy & Controllo Sistema</h3>
                   <p className="text-xs text-white/50 mt-1 leading-relaxed">
-                    SbobinAI opera al 100% in locale sul processore del tuo Mac. Nessun audio viene mai trasmesso all'esterno.
+                    SbobinAI opera al 100% in locale sul processore del tuo computer. Nessun audio viene mai trasmesso all'esterno.
                   </p>
                 </div>
 
@@ -1072,8 +1075,46 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                   <div className="text-xs text-white/80 space-y-1">
                     <h4 className="font-bold text-emerald-300">Confidenzialità Accademica Totale</h4>
                     <p className="text-[11px] text-white/60 leading-relaxed">
-                      Le registrazioni e gli appunti risiedono esclusivamente sul disco del tuo Mac. I modelli IA girano tramite Apple Silicon Metal e la memoria unificata senza connessioni a server remoti.
+                      Le registrazioni e gli appunti risiedono esclusivamente sul disco del tuo computer. I modelli IA girano direttamente sul tuo computer senza connessioni a server remoti.
                     </p>
+                  </div>
+                </div>
+
+                {/* Sezione Aggiornamenti */}
+                <div className="p-4 rounded-3xl liquid-glass border border-white/[0.12] space-y-3">
+                  <div>
+                    <h4 className="text-sm font-bold text-white">Aggiornamenti</h4>
+                    <p className="text-[11px] text-white/50 mt-0.5">
+                      {updater.supported
+                        ? "SbobinAI controlla automaticamente gli aggiornamenti all'avvio."
+                        : "Gli aggiornamenti automatici sono disponibili solo nell'app desktop."}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-3 flex-wrap">
+                    <button
+                      type="button"
+                      disabled={!updater.supported || updater.status === 'checking' || updater.status === 'downloading' || updater.status === 'installing'}
+                      onClick={() => void updater.checkNow()}
+                      className="px-4 py-1.5 rounded-full bg-white/[0.10] hover:bg-white/[0.18] border border-white/[0.12] text-xs font-semibold text-white disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                    >
+                      {updater.status === 'checking' ? 'Controllo in corso...' : 'Controlla aggiornamenti'}
+                    </button>
+                    {updater.status === 'uptodate' && <span className="text-[11px] text-emerald-300">Sei aggiornato</span>}
+                    {updater.status === 'available' && (
+                      <>
+                        <span className="text-[11px] text-blue-300">Versione {updater.version} disponibile</span>
+                        <button
+                          type="button"
+                          onClick={() => void updater.install()}
+                          className="px-4 py-1.5 rounded-full bg-blue-500 hover:bg-blue-400 text-xs font-semibold text-white cursor-pointer"
+                        >
+                          Aggiorna e Riavvia
+                        </button>
+                      </>
+                    )}
+                    {updater.status === 'downloading' && <span className="text-[11px] text-white/60">Download {updater.progress}%</span>}
+                    {updater.status === 'installing' && <span className="text-[11px] text-white/60">Installazione e riavvio...</span>}
+                    {updater.status === 'error' && <span className="text-[11px] text-red-300">Errore: {updater.error}</span>}
                   </div>
                 </div>
 

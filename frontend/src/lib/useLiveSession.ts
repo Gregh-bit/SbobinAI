@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { api } from './api';
+import { isTauri } from './tauri';
 import { useSettings } from './SettingsContext';
 import type { 
   ChatMessage, DetectedQuestion, Lecture, Subject, 
@@ -505,6 +506,31 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [lecture, handleBookmark]);
+
+  // Scorciatoia globale (Tauri) -> Segnalibro
+  const handleBookmarkRef = useRef(handleBookmark);
+  handleBookmarkRef.current = handleBookmark;
+  useEffect(() => {
+    if (!lecture || !isTauri()) return;
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    (async () => {
+      try {
+        const { listen } = await import('@tauri-apps/api/event');
+        const un = await listen('global-bookmark', () => {
+          if (isPausedRef.current) return;
+          handleBookmarkRef.current(); // imposta anche lastBookmarkPinned (feedback visivo sul pulsante)
+        });
+        if (cancelled) un(); else unlisten = un;
+      } catch (e) {
+        console.warn('[Tauri] listen global-bookmark fallito:', e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [lecture]);
 
   return {
     isConnected,

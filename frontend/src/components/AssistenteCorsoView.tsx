@@ -226,8 +226,8 @@ export default function AssistenteCorsoView({ subject }: Props) {
           {
             ...last,
             content: last.content
-              ? `${last.content}\n\n*(Risposta interrotta su richiesta. Memoria Metal e cache liberate)*`
-              : 'Risposta interrotta su richiesta. Memoria Metal liberata e processi azzerati.',
+              ? `${last.content}\n\n*(Risposta interrotta su richiesta. Memoria e cache liberate)*`
+              : 'Risposta interrotta su richiesta. Memoria liberata e processi azzerati.',
           },
         ];
       }

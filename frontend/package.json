@@ -12,6 +12,9 @@
   },
   "dependencies": {
     "@tauri-apps/plugin-dialog": "^2.8.3",
+    "@tauri-apps/plugin-global-shortcut": "^2.4.1",
+    "@tauri-apps/plugin-process": "^2.4.0",
+    "@tauri-apps/plugin-updater": "^2.14.0",
     "clsx": "^2.1.1",
     "dompurify": "^3.4.17",
     "framer-motion": "^14.3.0",

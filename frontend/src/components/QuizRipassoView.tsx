@@ -1,4 +1,4 @@
-// components/QuizRipassoView.tsx — Sezione Quiz & Ripasso (Scelta Multipla Reale + Interrogazione Vocale MLX)
+// components/QuizRipassoView.tsx — Sezione Quiz & Ripasso (Scelta Multipla Reale + Interrogazione Vocale)
 import { useState, useRef, useEffect } from 'react';
 import { 
   HelpCircle, Mic, CheckCircle2, XCircle, ArrowRight, 
@@ -616,7 +616,7 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
               {isEvaluatingOral && (
                 <div className="p-6 rounded-2xl bg-white/[0.02] border border-white/[0.06] flex items-center justify-center gap-3 text-xs text-emerald-300">
                   <Loader2 size={16} className="animate-spin text-emerald-400" />
-                  <span>Elaborazione accademica in corso (Metal Unified Memory)...</span>
+                  <span>Elaborazione accademica in corso in locale...</span>
                 </div>
               )}
 

@@ -308,14 +308,14 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
                     <span className="font-semibold tracking-tight">{formatElapsed(liveSession.elapsed)}</span>
                   </div>
 
-                  {/* Quick Bookmark (⌘B / Ctrl+B) Button */}
+                  {/* Quick Bookmark (⌘⇧B / Ctrl+Shift+B) Button */}
                   <button
                     type="button"
                     onClick={(e) => {
                       e.stopPropagation();
                       liveSession.handleBookmark();
                     }}
-                    title={`Segnalibro Esame (${shortcutLabel('B')})`}
+                    title={`Segnalibro Esame (${shortcutLabel('B', true)})`}
                     className={clsx(
                       'flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium transition-all border cursor-pointer',
                       liveSession.lastBookmarkPinned && Date.now() - liveSession.lastBookmarkPinned < 2000
@@ -325,7 +325,7 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
                   >
                     <Bookmark size={11} strokeWidth={2} className="text-amber-400 fill-amber-400/20" />
                     <span>Segnalibro</span>
-                    <span className="text-[9px] font-mono text-white/40 ml-0.5">{shortcutLabel('B')}</span>
+                    <span className="text-[9px] font-mono text-white/40 ml-0.5">{shortcutLabel('B', true)}</span>
                     {liveSession.bookmarks.length > 0 && (
                       <span className="text-[9px] font-mono bg-amber-400/25 text-amber-300 px-1 rounded-full">
                         {liveSession.bookmarks.length}

@@ -4,6 +4,7 @@ import { api } from './lib/api';
 import Sidebar from './components/Sidebar';
 import SubjectDashboard from './components/SubjectDashboard';
 import EmptyState from './components/EmptyState';
+import UpdateBanner from './components/UpdateBanner';
 import ErrorBoundary from './components/ErrorBoundary';
 import { SettingsProvider, useSettings } from './lib/SettingsContext';
 import type { Lecture, Subject } from './types';
@@ -100,6 +101,7 @@ function MainApp() {
 
   return (
     <>
+      <UpdateBanner />
       {/* Onboarding Wizard a tutto schermo se setupComplete è false */}
       {!settings.setupComplete ? (
         <Suspense fallback={<div className="h-screen w-screen flex items-center justify-center bg-black/40"><div className="w-8 h-8 rounded-full border-2 border-white/20 border-t-white animate-spin" /></div>}>

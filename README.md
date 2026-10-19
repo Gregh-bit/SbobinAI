@@ -100,7 +100,7 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 # Wheel CPU precompilata di llama-cpp-python (nessun compilatore richiesto)
-pip install -r requirements.txt --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+pip install -r requirements-windows.txt --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 python -m uvicorn main:app --host 127.0.0.1 --port 8000
 ```
 

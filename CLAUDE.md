@@ -57,3 +57,12 @@ Se aggiungi codice che tocca LLM/Whisper/RAG, stub-alo nei test come in `tests/c
 ## Porte in sviluppo
 Default 8000 (backend) e 5173 (Vite). Se la 8000 è occupata (es. Docker) usa un'altra porta e passa
 `VITE_API_URL=http://localhost:<porta>/api/v1` e `VITE_WS_URL=ws://localhost:<porta>`; la CSP ammette già 8000 e 8765.
+
+## Aggiornamento: sidecar, updater, CI (NON compilati)
+Aggiunti da Windows senza poter eseguire `cargo`: **il primo `cargo build` sul Mac è il vero test** di `frontend/src-tauri/src/lib.rs`
+(avvio/chiusura automatica del backend Python sulla 8000, Mica/Acrylic su Windows, vibrancy su macOS, scorciatoia globale `CommandOrControl+Shift+B` → evento `global-bookmark`,
+plugin updater/process). Se la mappa `bundle.resources` in `tauri.conf.json` viene rifiutata, passa a voci per singolo file.
+- Requirements separati: `backend/requirements.txt` = solo macOS/MLX, `backend/requirements-windows.txt` = Windows/Linux. Guida: `WINDOWS_BUILD_GUIDE.md`.
+- Release: `.github/workflows/release.yml` (tag `v*`). Servono i segreti GitHub `TAURI_SIGNING_PRIVATE_KEY` e `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+  La chiave pubblica è già in `tauri.conf.json`; la privata NON è nel repo (chi l'ha generata la tiene fuori dal repo).
+- Sito: `NETLIFY_INTEGRATION.md` (bottone download automatico per OS).
