@@ -5,6 +5,7 @@
 
 [![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon%20(Metal)-black?logo=apple&style=flat-square)](https://github.com/Gregh-bit/SbobinAI/releases)
 [![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-0078d4?logo=windows&style=flat-square)](https://github.com/Gregh-bit/SbobinAI/releases)
+[![Downloads](https://img.shields.io/github/downloads/Gregh-bit/SbobinAI/total?color=2563eb&style=flat-square&logo=github&label=Downloads)](https://github.com/Gregh-bit/SbobinAI/releases)
 [![Privacy](https://img.shields.io/badge/Privacy-100%25%20Locale-success?style=flat-square)](https://github.com/Gregh-bit/SbobinAI)
 [![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
 
