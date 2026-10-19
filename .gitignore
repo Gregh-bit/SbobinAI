@@ -85,3 +85,8 @@ frontend/src-tauri/gen/
 *.swp
 *.swo
 *~
+
+# ── Keys & Secrets ────────────────────────────────────────────────────────────
+*.key
+*.pem
+*.pub
