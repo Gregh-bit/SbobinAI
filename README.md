@@ -16,7 +16,7 @@
 Puoi scaricare l'applicazione precompilata scegliendo il canale che preferisci:
 
 ### 🌐 Dal Sito Ufficiale
-👉 **[Accedi alla pagina ufficiale di SbobinAI su gregfolio](https://gregfolio.netlify.app/progetti/sbobinai)**  
+👉 **[Accedi alla pagina ufficiale di SbobinAI](https://gregfolio.netlify.app/progetti/sbobinai)**  
 *(Riconosce in automatico il tuo sistema operativo e avvia il download dell'ultima versione)*
 
 ### 📦 Download Diretto da GitHub
