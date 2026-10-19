@@ -30,7 +30,10 @@
     height: 100%;
     border-radius: 12px;
     overflow: hidden;
-    background: transparent !important;
+    background-color: rgba(13, 16, 23, 0.95);
+    background-image: 
+      radial-gradient(ellipse 90% 60% at 20% -10%, rgba(25, 34, 52, 0.5), transparent 70%),
+      radial-gradient(ellipse 70% 50% at 85% 100%, rgba(18, 25, 38, 0.55), transparent 70%);
     contain: paint;
     transform: translateZ(0);
   }
