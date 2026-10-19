@@ -56,3 +56,34 @@ jobs:
           prerelease: false
           uploadUpdaterJson: true
           args: ${{ matrix.args }}
+
+      - name: Upload fixed-name asset for direct website download (macOS)
+        if: matrix.platform == 'macos-14'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="${{ github.ref_type == 'tag' && github.ref_name || '' }}"
+          if [ -z "$TAG_NAME" ]; then
+            TAG_NAME=$(gh release list --limit 1 | awk '{print $1}')
+          fi
+          DMG_FILE=$(find frontend/src-tauri/target -name "*.dmg" | head -n 1)
+          if [ -n "$DMG_FILE" ] && [ -n "$TAG_NAME" ]; then
+            cp "$DMG_FILE" SbobinAI-macOS.dmg
+            gh release upload "$TAG_NAME" SbobinAI-macOS.dmg --clobber
+          fi
+
+      - name: Upload fixed-name asset for direct website download (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="${{ github.ref_type == 'tag' && github.ref_name || '' }}"
+          if [ -z "$TAG_NAME" ]; then
+            TAG_NAME=$(gh release list --limit 1 | awk '{print $1}')
+          fi
+          EXE_FILE=$(find frontend/src-tauri/target -name "*setup*.exe" -o -name "*.exe" | head -n 1)
+          if [ -n "$EXE_FILE" ] && [ -n "$TAG_NAME" ]; then
+            cp "$EXE_FILE" SbobinAI-Windows.exe
+            gh release upload "$TAG_NAME" SbobinAI-Windows.exe --clobber
+          fi
