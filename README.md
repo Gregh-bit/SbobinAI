@@ -1,73 +1,84 @@
 # SbobinAI 🎓
 
-> **L'assistente universitario intelligente, 100% locale e privato, ottimizzato per Apple Silicon.**
+> **L'assistente universitario intelligente, 100% locale e privato.**  
+> Trasforma registrazioni, slide e appunti in quaderni di studio interattivi, quiz d'esame e simulazioni orali con intelligenza artificiale eseguita interamente sul tuo dispositivo.
 
-SbobinAI trasforma le registrazioni delle lezioni universitarie e i materiali didattici in un quaderno di studio interattivo, quiz d'esame e simulazioni orali, eseguendo modelli di intelligenza artificiale all'avanguardia **interamente in locale su Apple Silicon Metal**, senza inviare alcun dato all'esterno e senza consumare batteria o memoria swap.
+[![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon%20(Metal)-black?logo=apple&style=flat-square)](https://github.com/Gregh-bit/SbobinAI/releases)
+[![Windows](https://img.shields.io/badge/Windows-10%20%2F%2011%20x64-0078d4?logo=windows&style=flat-square)](https://github.com/Gregh-bit/SbobinAI/releases)
+[![Privacy](https://img.shields.io/badge/Privacy-100%25%20Locale-success?style=flat-square)](https://github.com/Gregh-bit/SbobinAI)
+[![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](LICENSE)
 
 ---
 
-## ✨ Funzionalità Chiave
+## 📥 Scarica SbobinAI
 
-- 🎙️ **Registrazione Live & Trascrizione Streaming**: Trascrizione in tempo reale con `mlx-whisper` (Large-v3-Turbo quantizzato a 4-bit) con audio buffering in RAM a zero disk I/O.
-- 🔖 **Segnalibri Esame & Player Sincronizzato**: Salva i momenti chiave indicati dal docente durante la lezione e riascoltali con un clic saltando al secondo esatto (`click-to-play`).
-- 📖 **Quaderno di Studio Digitale**: Generazione automatica di schemi concettuali e capitoli approfonditi in Markdown tramite `Qwen 3.5 4B MLX`. Esportazione con un clic in `.md`.
-- 📚 **Ingestione Reale dei Materiali**: Caricamento di slide, PDF (estrazione ultra-rapida con PyMuPDF) e audio esterni con indicizzazione semantica ibrida immediata su `LanceDB`.
+Puoi scaricare l'applicazione precompilata scegliendo il canale che preferisci:
+
+### 🌐 Dal Sito Ufficiale
+👉 **[Accedi alla pagina ufficiale di SbobinAI su gregfolio](https://gregfolio.netlify.app/progetti/sbobinai)**  
+*(Riconosce in automatico il tuo sistema operativo e avvia il download dell'ultima versione)*
+
+### 📦 Download Diretto da GitHub
+* 🍏 **[Scarica per macOS (.dmg)](https://github.com/Gregh-bit/SbobinAI/releases/latest/download/SbobinAI-macOS.dmg)** — Ottimizzato per Apple Silicon (M1/M2/M3/M4)
+* 🪟 **[Scarica per Windows (.exe)](https://github.com/Gregh-bit/SbobinAI/releases/latest/download/SbobinAI-Windows.exe)** — Installer per Windows 10/11 x64
+
+Puoi visualizzare l'elenco di tutte le versioni, i changelog e i file di installazione nella [sezione GitHub Releases](https://github.com/Gregh-bit/SbobinAI/releases).
+
+---
+
+## ✨ Funzionalità
+
+- 🎙️ **Registrazione Live & Trascrizione Streaming**: Trascrive la voce in tempo reale ad alta precisione con Whisper Large-v3-Turbo a 4-bit, con buffering in memoria a zero carico sul disco.
+- 🔖 **Segnalibri Esame (`⌘B` / `⌘⇧B`) & Player Audio Sincronizzato**: Segna con una scorciatoia i punti cruciali indicati dal professore e riascoltali con un clic al secondo esatto (`click-to-play`).
+- 📖 **Quaderno di Studio Intelligente**: Genera automaticamente capitoli ordinati, formule e schemi Markdown completi basati sulle lezioni. Esportabile con un clic.
+- 📚 **Ingestione dei Materiali (RAG Ibrido)**: Carica slide, PDF e audio esterni; il motore indicizza i contenuti su LanceDB rendendoli consultabili all'istante dall'assistente.
 - 🧠 **Quiz & Simulazione Esame Orale**:
-  - **Quiz a Scelta Multipla**: 5 domande d'esame contestualizzate dalle lezioni con correzione e spiegazione.
-  - **Interrogazione Vocale**: Parla al microfono, l'IA trascrive la risposta e la valuta confrontandola con gli appunti (voto in trentesimi, punti di forza, lacune e formulazione ideale).
-- 🧹 **Garbage Collector & Storage Optimizer**: Monitoraggio dello spazio su disco, eliminazione fisica a cascata di audio/materiali e compattazione automatica (`VACUUM` SQLite e `optimize` LanceDB).
-- 🎨 **Interfaccia Nativa macOS Liquid Glass**: Applicazione desktop nativa realizzata con Tauri 2.0 (Rust) e React 18, fluida, reattiva e con supporto Dark Mode integrato.
+  - **Quiz a Risposta Multipla**: 5 domande contestualizzate per lezione con punteggio e spiegazione.
+  - **Interrogazione Vocale**: Rispondi a voce al microfono a una domanda aperta; l'IA valuta la tua esposizione in trentesimi, evidenziando punti di forza e lacune.
+- 🔒 **Zero Cloud & Zero Swap**: Nessun abbonamento, nessuna chiave API, nessun dato lascia il tuo computer.
 
 ---
 
-## 🛠️ Stack Tecnologico
+## 🛠️ Architettura & Stack Tecnologico
 
-### Frontend
-- **Framework Desktop**: [Tauri 2.0](https://tauri.app/) (Rust)
-- **UI / Core**: React 18, TypeScript, Vite
-- **Stili & Animazioni**: Tailwind CSS, Framer Motion (Apple Liquid Glass design system)
-- **Icone & Markdown**: Lucide React, Marked
+SbobinAI seleziona all'avvio il motore di intelligenza artificiale più efficiente per l'hardware in uso:
 
-### Backend
-- **Server API**: FastAPI, Uvicorn, WebSockets
-- **Database Relazionale**: SQLite con SQLAlchemy ORM
-- **Database Vettoriale & RAG**: LanceDB, PyArrow
-- **Motore Vocale (STT)**: `mlx-whisper` (Whisper Large-v3-Turbo Q4 Metal)
-- **Motore LLM**: `mlx-lm` (Qwen 3.5 4B 4-bit Metal)
-- **Motore Embeddings**: `mlx-embeddings` (Qwen3-Embedding-0.6B-4bit-DWQ, 1024 dim)
-- **Elaborazione Documenti**: PyMuPDF (`pymupdf`) in C
+| Componente | macOS (Apple Silicon) | Windows / Altri (x64) |
+|---|---|---|
+| **Interfaccia Desktop** | Tauri 2.0 (Rust) + React 18, Vite | Tauri 2.0 (Rust) + React 18, Vite |
+| **Server Backend** | FastAPI (Python 3.12) locale | FastAPI (Python 3.12) locale |
+| **Speech-to-Text** | `mlx-whisper` (Metal GPU/Neural Engine) | `faster-whisper` (CTranslate2, CUDA/CPU) |
+| **Modello LLM** | `mlx-lm` (Qwen 3.5 4B quantizzato 4-bit) | `llama-cpp-python` (Qwen 3.5 4B GGUF Q4) |
+| **Vector DB & RAG** | LanceDB + Qwen3-Embedding (0.6B) | LanceDB + Qwen3-Embedding GGUF |
+| **Database Dati** | SQLite con SQLAlchemy ORM | SQLite con SQLAlchemy ORM |
 
 ---
 
-## 🚀 Requisiti di Sistema
+## 💻 Avvio in Sviluppo (Per Sviluppatori)
 
-- **macOS**: macOS Sonoma (14.0+) o successivo
-- **Hardware**: Mac con processore Apple Silicon (M1, M2, M3, M4 con memoria unificata ≥ 8 GB)
-- **Windows**: Windows 10/11 x64, vedi la sezione [Windows](#-windows-x64)
-- **Linguaggi**: Python 3.10+ (consigliato 3.12), Node.js 18+, Rust (tramite `rustup`)
+Se desideri clonare e compilare SbobinAI in autonomia:
 
----
+### 1. Prerequisiti
+- **Python 3.12**
+- **Node.js 18+** e `npm`
+- **Rust** (installato via `rustup`)
 
-## 💻 Installazione & Avvio Rapido
-
-### 1. Clona il repository
+### 2. Clona il repository
 ```bash
 git clone https://github.com/Gregh-bit/SbobinAI.git
 cd SbobinAI
 ```
 
-### 2. Configura il Backend (Python)
+### 3. Avvia Backend & Frontend
 ```bash
+# Terminale 1: Backend Python
 cd backend
 python3 -m venv venv
-source venv/bin/activate
+source venv/bin/activate       # Su Windows: .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python -m uvicorn main:app --host 127.0.0.1 --port 8000
-```
 
-### 3. Avvia l'Applicazione Desktop (Tauri + React)
-In un altro terminale:
-```bash
+# Terminale 2: Frontend Desktop (Tauri)
 cd frontend
 npm install
 npm run tauri dev
@@ -75,73 +86,12 @@ npm run tauri dev
 
 ---
 
-## 🪟 Windows (x64)
+## 🔒 Privacy & Riservatezza
 
-SbobinAI funziona anche su Windows 10/11 x64. Il backend sceglie automaticamente lo stack IA in base alla piattaforma (`backend/platform_utils.py`): su Apple Silicon resta MLX, su Windows usa uno stack portabile con GPU NVIDIA se presente e fallback automatico su CPU.
-
-| Ruolo | macOS Apple Silicon | Windows / Linux |
-|---|---|---|
-| Trascrizione | `mlx-whisper` · Whisper Large-v3-Turbo Q4 | `faster-whisper` (CTranslate2) · Large-v3-Turbo, CUDA float16 o CPU int8 |
-| LLM | `mlx-lm` · Qwen 3.5 4B MLX 4-bit | `llama-cpp-python` · Qwen 3.5 4B GGUF Q4_K_M (offload GPU se la build lo supporta) |
-| Embeddings | `mlx-embeddings` · Qwen3-Embedding-0.6B 4-bit | `llama-cpp-python` · Qwen3-Embedding-0.6B GGUF Q8_0 |
-
-Gli ID dei modelli nelle Impostazioni sono gli stessi su entrambe le piattaforme, e lo schema LanceDB (vettori a 1024 dimensioni) è identico. I modelli si scaricano dall'app (Impostazioni → Modelli) nella cache HuggingFace (`%USERPROFILE%\.cache\huggingface\hub`, oppure il percorso in `HF_HOME`).
-
-### Requisiti
-- Windows 10/11 x64, ≥ 16 GB di RAM consigliati (8 GB bastano solo in CPU con un modello alla volta)
-- Python 3.12 x64 consigliato (testato anche con 3.14), Node.js 18+, Rust tramite `rustup` (toolchain MSVC) e WebView2 (già presente su Windows 11)
-- Opzionale, GPU NVIDIA: driver recente, CUDA 12 e cuDNN 9 per `faster-whisper`; CUDA Toolkit 12 e Visual Studio Build Tools (C++) per compilare `llama-cpp-python` con CUDA
-- ffmpeg non serve: l'audio viene decodificato con PyAV
-
-### Backend (PowerShell)
-```powershell
-cd backend
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-# Wheel CPU precompilata di llama-cpp-python (nessun compilatore richiesto)
-pip install -r requirements-windows.txt --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
-python -m uvicorn main:app --host 127.0.0.1 --port 8000
-```
-
-Se PowerShell blocca `Activate.ps1`, esegui una volta `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
-
-### Accelerazione GPU NVIDIA (opzionale)
-```powershell
-# Trascrizione: librerie CUDA per CTranslate2 (rilevate automaticamente all'avvio)
-pip install nvidia-cublas-cu12 "nvidia-cudnn-cu12==9.*"
-
-# LLM + embeddings: ricompila llama-cpp-python con CUDA (da "Developer PowerShell for VS")
-$env:CMAKE_ARGS = "-DGGML_CUDA=on"
-pip install --force-reinstall --no-cache-dir --no-binary llama-cpp-python "llama-cpp-python>=0.3.36"
-```
-Senza questi passaggi tutto funziona comunque su CPU. Se l'inizializzazione CUDA fallisce, Whisper torna automaticamente su CPU int8.
-
-### App desktop
-```powershell
-cd frontend
-npm install
-npm run tauri dev      # sviluppo
-npm run tauri build    # installer .msi / .exe (NSIS) in src-tauri\target\release\bundle
-```
-
-### Variabili d'ambiente utili
-- `SBOBINAI_INPUT_DEVICE`: microfono da usare (indice o parte del nome, es. `"USB"`); altrimenti si usa quello predefinito di Windows
-- `SBOBINAI_AI_BACKEND`: forza `mlx` o `portable`
-- `SBOBINAI_LLM_CTX`: contesto LLM in token (default `8192`)
-
-### Risoluzione problemi
-- **"Un criterio di controllo dell'applicazione ha bloccato il file" / "DLL load failed"** (spesso `pyarrow` o `pymupdf`): è Windows Smart App Control che blocca DLL non firmate. Installa una versione diversa del pacchetto (es. `pip install "pyarrow<26"`), oppure disattiva Smart App Control in Sicurezza di Windows → Controllo app e browser.
-- **Microfono non rilevato**: abilita l'accesso in Impostazioni → Privacy e sicurezza → Microfono ("Consenti alle app desktop di accedere al microfono"). Se il dispositivo non supporta 16 kHz, il backend registra alla frequenza nativa e ricampiona da solo.
-- **Cartella Documenti su OneDrive**: il percorso di archiviazione si può cambiare dalle Impostazioni dell'app.
-- **Eliminazione modelli non riuscita**: chiudi le altre istanze del backend. Su Windows un file del modello resta bloccato finché è caricato in memoria; l'app scarica i modelli prima di eliminarli.
-
----
-
-## 🔒 Privacy & Sicurezza
-Tutti i modelli, i file audio e i vettori risiedono **esclusivamente sul tuo disco locale** (di default in `~/Documents/SbobinAI`). Nessun dato audio, testo o credenziale lascia il tuo Mac.
+Tutti i modelli, i file audio, i documenti caricati e le trascrizioni risiedono **esclusivamente sul tuo disco locale** (nella cartella configurabile di SbobinAI, di default in Documenti). Non vengono effettuate chiamate a server esterni di terze parti né raccolti dati telemetrici.
 
 ---
 
 ## 📄 Licenza
-Rilasciato sotto licenza MIT.
+
+Distribuito sotto licenza [MIT](LICENSE). Libero per uso personale e studio.
