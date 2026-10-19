@@ -1,5 +1,5 @@
 // components/SubjectDashboard.tsx — Dashboard Corso con Segmented Control e viste
-import { useState, useEffect, useCallback, lazy, Suspense } from 'react';
+import { useState, useEffect, useCallback, useRef, lazy, Suspense } from 'react';
 import { 
   Mic, BookOpen, Layers, HelpCircle, MessageSquare, 
   Loader2, Download, AlertTriangle, Square, Pause, Play, Bookmark 
@@ -9,6 +9,7 @@ import { clsx } from 'clsx';
 import { api } from '../lib/api';
 import { useSettings } from '../lib/SettingsContext';
 import { useLiveSession, formatElapsed } from '../lib/useLiveSession';
+import { shortcutLabel } from '../lib/platform';
 import type { CourseTab, Lecture, Subject } from '../types';
 import QuadernoView from './QuadernoView';
 import SegmentedControl from './SegmentedControl';
@@ -23,7 +24,12 @@ interface Props {
   subject: Subject;
   onStartLecture?: (lecture: Lecture) => void;
   onOpenSettings?: () => void;
+  onRecordingChange?: (isRecording: boolean) => void;
 }
+
+// Polling delle lezioni dopo lo stop finché il backend non ha generato gli appunti
+const NOTES_POLL_INTERVAL_MS = 5000;
+const NOTES_POLL_MAX_MS = 3 * 60 * 1000;
 
 const TABS: { id: CourseTab; label: string; icon: typeof BookOpen }[] = [
   { id: 'quaderno', label: 'Quaderno', icon: BookOpen },
@@ -32,7 +38,7 @@ const TABS: { id: CourseTab; label: string; icon: typeof BookOpen }[] = [
   { id: 'assistente', label: 'Assistente', icon: MessageSquare },
 ];
 
-export default function SubjectDashboard({ subject, onOpenSettings }: Props) {
+export default function SubjectDashboard({ subject, onOpenSettings, onRecordingChange }: Props) {
   const { settings } = useSettings();
   const [activeTab, setActiveTab] = useState<CourseTab>('quaderno');
   const [lectures, setLectures] = useState<Lecture[]>([]);
@@ -40,15 +46,32 @@ export default function SubjectDashboard({ subject, onOpenSettings }: Props) {
   const [startingLive, setStartingLive] = useState(false);
   const [activeRecordingLecture, setActiveRecordingLecture] = useState<Lecture | null>(null);
 
-  const loadLectures = useCallback(async (isInitial = false) => {
+  // Guardie contro risposte asincrone obsolete (dismount o richieste superate)
+  const isMountedRef = useRef(true);
+  const loadSeqRef = useRef(0);
+  const notesPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      if (notesPollRef.current) clearInterval(notesPollRef.current);
+    };
+  }, []);
+
+  const loadLectures = useCallback(async (isInitial = false): Promise<Lecture[] | null> => {
+    const seq = ++loadSeqRef.current;
     if (isInitial) setLoading(true);
     try {
       const data = await api.lectures.listBySubject(subject.id);
+      if (!isMountedRef.current || seq !== loadSeqRef.current) return null;
       setLectures(data);
+      return data;
     } catch {
       // Ignora silenziosamente
+      return null;
     } finally {
-      setLoading(false);
+      if (isMountedRef.current && seq === loadSeqRef.current) setLoading(false);
     }
   }, [subject.id]);
 
@@ -56,10 +79,45 @@ export default function SubjectDashboard({ subject, onOpenSettings }: Props) {
     loadLectures(true);
   }, [loadLectures]);
 
-  const handleRecordingFinished = useCallback(() => {
-    setActiveRecordingLecture(null);
-    loadLectures(false);
+  // Notifica al genitore lo stato di registrazione (blocca il cambio corso nella Sidebar)
+  useEffect(() => {
+    onRecordingChange?.(activeRecordingLecture !== null);
+  }, [activeRecordingLecture, onRecordingChange]);
+
+  useEffect(() => {
+    return () => onRecordingChange?.(false);
+  }, [onRecordingChange]);
+
+  const activeRecordingLectureRef = useRef<Lecture | null>(null);
+  activeRecordingLectureRef.current = activeRecordingLecture;
+
+  const pollUntilNotesReady = useCallback((lectureId: number) => {
+    if (notesPollRef.current) clearInterval(notesPollRef.current);
+    const startedAt = Date.now();
+    const isDone = (data: Lecture[] | null) => {
+      const lec = data?.find((l) => l.id === lectureId);
+      if (!lec) return false;
+      // Il backend genera gli appunti solo se la trascrizione è sufficientemente lunga
+      return Boolean(lec.processed_notes) || (lec.raw_transcript || '').trim().length <= 30;
+    };
+    notesPollRef.current = setInterval(async () => {
+      const data = await loadLectures(false);
+      if (isDone(data) || Date.now() - startedAt > NOTES_POLL_MAX_MS) {
+        if (notesPollRef.current) clearInterval(notesPollRef.current);
+        notesPollRef.current = null;
+      }
+    }, NOTES_POLL_INTERVAL_MS);
   }, [loadLectures]);
+
+  const handleRecordingFinished = useCallback(() => {
+    const finished = activeRecordingLectureRef.current;
+    setActiveRecordingLecture(null);
+    loadLectures(false).then((data) => {
+      if (!finished || !isMountedRef.current) return;
+      const lec = data?.find((l) => l.id === finished.id);
+      if (!lec || !lec.processed_notes) pollUntilNotesReady(finished.id);
+    });
+  }, [loadLectures, pollUntilNotesReady]);
 
   const liveSession = useLiveSession({
     subject,
@@ -83,14 +141,20 @@ export default function SubjectDashboard({ subject, onOpenSettings }: Props) {
     }
   };
 
+  // In caso di errore la lezione resta in lista e l'errore viene propagato al chiamante
   const handleDeleteLecture = async (id: number) => {
     try {
       await api.lectures.delete(id);
       setLectures((prev) => prev.filter((l) => l.id !== id));
     } catch (e) {
       console.error('Impossibile eliminare la lezione:', e);
+      throw e;
     }
   };
+
+  const handleLocalLectureUpdate = useCallback((id: number, updater: (lecture: Lecture) => Lecture) => {
+    setLectures((prev) => prev.map((l) => (l.id === id ? updater(l) : l)));
+  }, []);
 
   const handleUpdateLecture = async (
     id: number,
@@ -244,14 +308,14 @@ export default function SubjectDashboard({ subject, onOpenSettings }: Props) {
                     <span className="font-semibold tracking-tight">{formatElapsed(liveSession.elapsed)}</span>
                   </div>
 
-                  {/* Quick Bookmark (⌘B) Button */}
+                  {/* Quick Bookmark (⌘B / Ctrl+B) Button */}
                   <button
                     type="button"
                     onClick={(e) => {
                       e.stopPropagation();
                       liveSession.handleBookmark();
                     }}
-                    title="Segnalibro Esame (⌘B)"
+                    title={`Segnalibro Esame (${shortcutLabel('B')})`}
                     className={clsx(
                       'flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium transition-all border cursor-pointer',
                       liveSession.lastBookmarkPinned && Date.now() - liveSession.lastBookmarkPinned < 2000
@@ -261,7 +325,7 @@ export default function SubjectDashboard({ subject, onOpenSettings }: Props) {
                   >
                     <Bookmark size={11} strokeWidth={2} className="text-amber-400 fill-amber-400/20" />
                     <span>Segnalibro</span>
-                    <span className="text-[9px] font-mono text-white/40 ml-0.5">⌘B</span>
+                    <span className="text-[9px] font-mono text-white/40 ml-0.5">{shortcutLabel('B')}</span>
                     {liveSession.bookmarks.length > 0 && (
                       <span className="text-[9px] font-mono bg-amber-400/25 text-amber-300 px-1 rounded-full">
                         {liveSession.bookmarks.length}
@@ -304,10 +368,15 @@ export default function SubjectDashboard({ subject, onOpenSettings }: Props) {
                       e.stopPropagation();
                       liveSession.handleStop();
                     }}
-                    className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-white/[0.18] hover:bg-white/[0.28] text-white text-[11px] font-semibold border border-white/[0.22] shadow-liquid-sm transition-all cursor-pointer"
+                    disabled={liveSession.isStopping}
+                    className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-white/[0.18] hover:bg-white/[0.28] text-white text-[11px] font-semibold border border-white/[0.22] shadow-liquid-sm transition-all cursor-pointer disabled:opacity-60 disabled:cursor-wait"
                   >
-                    <Square size={9} strokeWidth={2.5} className="fill-white" />
-                    <span>Termina e Rielabora</span>
+                    {liveSession.isStopping ? (
+                      <Loader2 size={10} className="animate-spin" />
+                    ) : (
+                      <Square size={9} strokeWidth={2.5} className="fill-white" />
+                    )}
+                    <span>{liveSession.isStopping ? 'Salvataggio...' : 'Termina e Rielabora'}</span>
                   </button>
                 </motion.div>
               )}
@@ -333,6 +402,29 @@ export default function SubjectDashboard({ subject, onOpenSettings }: Props) {
             <Download size={11} />
             <span>Scarica Modelli</span>
           </button>
+        </div>
+      )}
+
+      {/* ── Banner stato connessione registrazione live ── */}
+      {activeRecordingLecture && !liveSession.isStopping && (liveSession.connectionError || !liveSession.isConnected) && (
+        <div
+          className={clsx(
+            'px-6 py-2 border-b flex items-center gap-2.5 text-xs flex-shrink-0',
+            liveSession.connectionError
+              ? 'bg-red-500/10 border-red-500/20 text-red-200/90'
+              : 'bg-white/[0.04] border-white/[0.08] text-white/60'
+          )}
+        >
+          {liveSession.connectionError ? (
+            <AlertTriangle size={14} className="text-red-400 flex-shrink-0" />
+          ) : (
+            <Loader2 size={13} className="animate-spin text-white/50 flex-shrink-0" />
+          )}
+          <span className="truncate">
+            {liveSession.connectionError
+              ? `Registrazione non attiva: ${liveSession.connectionError}`
+              : 'Connessione al motore di registrazione in corso...'}
+          </span>
         </div>
       )}
 
@@ -372,6 +464,7 @@ export default function SubjectDashboard({ subject, onOpenSettings }: Props) {
             >
               {activeTab === 'quaderno' && (
                 <QuadernoView
+                  key={subject.id}
                   subject={subject}
                   lectures={lectures.filter((l) => l.in_quaderno !== false)}
                   onDeletePermanently={handleDeleteLecture}
@@ -381,12 +474,14 @@ export default function SubjectDashboard({ subject, onOpenSettings }: Props) {
                   onUpdateLecture={handleUpdateLecture}
                   onOpenAddMaterialModal={() => setActiveTab('materiali')}
                   onOpenSettings={onOpenSettings}
+                  onLocalLectureUpdate={handleLocalLectureUpdate}
                 />
               )}
               {activeTab === 'materiali' && (
                 <Suspense fallback={<div className="flex-1 flex items-center justify-center"><Loader2 size={24} className="animate-spin text-white/30" /></div>}>
                   <MaterialiView 
                     subject={subject} 
+                    key={subject.id}
                     onDeleteLecturePermanently={handleDeleteLecture}
                     onRestoreLectureToQuaderno={handleRestoreToQuaderno}
                     onLectureCreated={(newLecture) => {
@@ -402,6 +497,7 @@ export default function SubjectDashboard({ subject, onOpenSettings }: Props) {
               {activeTab === 'quiz' && (
                 <Suspense fallback={<div className="flex-1 flex items-center justify-center"><Loader2 size={24} className="animate-spin text-white/30" /></div>}>
                   <QuizRipassoView
+                    key={subject.id}
                     subject={subject}
                     lectures={lectures}
                     onOpenSettings={onOpenSettings}
@@ -410,7 +506,7 @@ export default function SubjectDashboard({ subject, onOpenSettings }: Props) {
               )}
               {activeTab === 'assistente' && (
                 <Suspense fallback={<div className="flex-1 flex items-center justify-center"><Loader2 size={24} className="animate-spin text-white/30" /></div>}>
-                  <AssistenteCorsoView subject={subject} />
+                  <AssistenteCorsoView key={subject.id} subject={subject} />
                 </Suspense>
               )}
             </motion.div>

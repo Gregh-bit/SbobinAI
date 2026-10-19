@@ -10,6 +10,7 @@ import logging
 import os
 import shutil
 import threading
+import time
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
@@ -29,6 +30,19 @@ from config import get_uploads_dir
 logger = logging.getLogger("sbobinai.subjects")
 
 router = APIRouter(prefix="/subjects", tags=["Subjects"])
+
+AUDIO_EXTENSIONS = (".mp3", ".wav", ".m4a", ".aac", ".ogg")
+
+
+def _safe_filename(raw: str | None) -> str:
+    """
+    Riduce un nome file fornito dal client al solo basename (niente '../', percorsi
+    assoluti o separatori Windows/Unix), rifiutando nomi riservati.
+    """
+    name = os.path.basename((raw or "").replace("\\", "/")).strip()
+    if not name or name in (".", "..") or name.startswith(".") or name == "InfoCorso.md" or name.endswith(".meta.json"):
+        raise HTTPException(status_code=400, detail="Nome file non valido.")
+    return name
 
 
 
@@ -105,7 +119,16 @@ def update_subject(subject_id: int, payload: SubjectUpdate, db: Session = Depend
     subject = db.query(Subject).filter(Subject.id == subject_id).first()
     if not subject:
         raise HTTPException(status_code=404, detail="Materia non trovata.")
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    changes = payload.model_dump(exclude_unset=True)
+    # name e color non possono essere null; description/keywords null = svuota il campo
+    for required in ("name", "color"):
+        if required in changes and changes[required] is None:
+            changes.pop(required)
+    if "name" in changes:
+        clash = db.query(Subject).filter(Subject.name == changes["name"], Subject.id != subject_id).first()
+        if clash:
+            raise HTTPException(status_code=409, detail=f"Materia '{changes['name']}' già esistente.")
+    for field, value in changes.items():
         setattr(subject, field, value)
     db.commit()
     db.refresh(subject)
@@ -300,22 +323,15 @@ def _process_imported_audio_bg(subject_id: int, audio_path: str, orig_filename: 
     5. Indicizza trascrizione e appunti in LanceDB.
     """
     try:
-        logger.info(f"[Audio Ingest] Inizio trascrizione mlx-whisper per: {orig_filename} ({audio_path})")
-        import mlx_whisper
-        from transcriber import TARGET_HF_REPO, get_local_snapshot_dir
-        model_target = get_local_snapshot_dir(TARGET_HF_REPO) or TARGET_HF_REPO
+        # Non contendere GPU/memoria con una lezione live in corso: attendi che finisca
+        from live_session import has_active_sessions
+        while has_active_sessions():
+            time.sleep(10)
 
-        result = mlx_whisper.transcribe(
-            audio_path,
-            path_or_hf_repo=model_target,
-            language="it",
-            temperature=(0.0,),
-            condition_on_previous_text=False,
-            fp16=True,
-        )
-        transcript = result.get("text", "").strip()
-        segments = result.get("segments", [])
-        duration_sec = float(segments[-1].get("end", 0.0)) if segments else 0.0
+        logger.info(f"[Audio Ingest] Inizio trascrizione Whisper per: {orig_filename} ({audio_path})")
+        from transcriber import transcribe_file
+        transcript, duration_sec = transcribe_file(audio_path, language="it")
+        transcript = (transcript or "").strip()
 
         clean_title = os.path.splitext(orig_filename)[0].replace("_", " ").strip()
         clean_title = clean_title[0].upper() + clean_title[1:] if clean_title else "Lezione Importata"
@@ -323,14 +339,13 @@ def _process_imported_audio_bg(subject_id: int, audio_path: str, orig_filename: 
         # Genera schema e appunti strutturati con Qwen 3.5 se presente
         notes = None
         from llm_engine import generate_lecture_chapter, is_model_downloaded, DEFAULT_LLM_MODEL
-        if is_model_downloaded(DEFAULT_LLM_MODEL) and transcript:
+        from config import load_settings
+        llm_model = load_settings().get("llm_model") or DEFAULT_LLM_MODEL
+        if is_model_downloaded(llm_model) and transcript:
             try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                notes = loop.run_until_complete(
-                    generate_lecture_chapter(title=clean_title, transcript=transcript)
+                notes = asyncio.run(
+                    generate_lecture_chapter(title=clean_title, transcript=transcript, model_id=llm_model)
                 )
-                loop.close()
             except Exception as e:
                 logger.warning(f"[Audio Ingest] Sintesi automatica non riuscita: {e}")
 
@@ -379,7 +394,7 @@ def _process_imported_audio_bg(subject_id: int, audio_path: str, orig_filename: 
 
 
 @router.post("/{subject_id}/materials/upload", response_model=MaterialOut, status_code=status.HTTP_201_CREATED)
-async def upload_material_file(
+def upload_material_file(
     subject_id: int,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
@@ -388,6 +403,8 @@ async def upload_material_file(
     Carica un file (PDF, Slide, Appunti, Audio) nella memoria della materia:
     - Per PDF/Testi: estrae il testo pagina per pagina con PyMuPDF e indicizza subito in LanceDB.
     - Per Audio (.wav, .mp3, .m4a): lancia un worker in background che trascrive con Whisper e genera il Quaderno.
+    Handler sincrono: FastAPI lo esegue nel threadpool, così copia, estrazione PDF ed embedding
+    non bloccano l'event loop (e quindi la lezione live via WebSocket).
     """
     subject = db.query(Subject).filter(Subject.id == subject_id).first()
     if not subject:
@@ -396,7 +413,7 @@ async def upload_material_file(
     subj_dir = os.path.join(get_uploads_dir(), f"subject_{subject_id}")
     os.makedirs(subj_dir, exist_ok=True)
 
-    filename = file.filename or "file_senza_nome"
+    filename = _safe_filename(file.filename)
     fpath = os.path.join(subj_dir, filename)
 
     with open(fpath, "wb") as buffer:
@@ -409,7 +426,7 @@ async def upload_material_file(
     ftype = (
         "slide" if ext in (".ppt", ".pptx", ".key")
         else "pdf" if ext == ".pdf"
-        else "audio" if ext in (".mp3", ".wav", ".m4a", ".aac", ".ogg")
+        else "audio" if ext in AUDIO_EXTENSIONS
         else "doc"
     )
 
@@ -470,7 +487,7 @@ async def upload_material_file(
             logger.error(f"[Material Upload] Errore lettura testo '{filename}': {exc}")
 
     # 2. Registrazioni Audio Esterne (.wav, .mp3, .m4a): Background Task Whisper + Qwen3.5
-    elif ext in (".mp3", ".wav", ".m4a", ".aac", ".ogg"):
+    elif ext in AUDIO_EXTENSIONS:
         logger.info(f"[Material Upload] Rilevato audio esterno '{filename}'. Avvio worker Whisper in background...")
         threading.Thread(
             target=_process_imported_audio_bg,
@@ -496,13 +513,25 @@ async def upload_material_file(
 
 
 @router.delete("/{subject_id}/materials/{filename}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_material_file(subject_id: int, filename: str):
+def delete_material_file(subject_id: int, filename: str, db: Session = Depends(get_db)):
     """
     Elimina un file caricato da disco e rimuove a cascata i relativi vettori da LanceDB.
     """
     from cleaner import get_all_uploads_directories
 
+    filename = _safe_filename(filename)
     folder_name = f"subject_{subject_id}"
+
+    # Un audio importato è anche il file della lezione generata: non rompere il player
+    for udir in get_all_uploads_directories():
+        candidate = os.path.abspath(os.path.join(udir, folder_name, filename))
+        linked = db.query(Lecture).filter(Lecture.audio_path == candidate).first()
+        if linked:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Il file è l'audio della lezione '{linked.title}'. Elimina la lezione per rimuoverlo.",
+            )
+
     for udir in get_all_uploads_directories():
         fpath = os.path.join(udir, folder_name, filename)
         if os.path.exists(fpath) and os.path.isfile(fpath):

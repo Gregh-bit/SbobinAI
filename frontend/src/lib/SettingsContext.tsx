@@ -15,8 +15,8 @@ export interface AppSettings {
 
 interface SettingsContextType {
   settings: AppSettings;
-  updateSettings: (newSettings: Partial<AppSettings>) => void;
-  completeSetup: (customSettings?: Partial<AppSettings>) => void;
+  updateSettings: (newSettings: Partial<AppSettings>) => Promise<void>;
+  completeSetup: (customSettings?: Partial<AppSettings>) => Promise<void>;
   resetSetup: () => void;
 }
 
@@ -115,11 +115,15 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     }
   }, [settings]);
 
-  const updateSettings = (partial: Partial<AppSettings>) => {
+  const updateSettings = async (partial: Partial<AppSettings>) => {
+    // Il percorso di archiviazione si cambia SOLO tramite POST /settings/storage (migrazione dati),
+    // mai dentro il PATCH /settings. In caso di errore viene propagato al chiamante.
+    if (partial.storagePath) {
+      await api.settings.setStorage(partial.storagePath);
+    }
     setSettings((prev) => ({ ...prev, ...partial }));
     // Sincronizza anche con il backend
     const backendPayload: Record<string, any> = {};
-    if (partial.storagePath !== undefined) backendPayload.storage_path = partial.storagePath;
     if (partial.whisperModel !== undefined) backendPayload.whisper_model = partial.whisperModel;
     if (partial.llmModel !== undefined) {
       backendPayload.llm_model = partial.llmModel;
@@ -133,24 +137,30 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     if (partial.modelsDownloaded !== undefined) backendPayload.models_downloaded = partial.modelsDownloaded;
 
     if (Object.keys(backendPayload).length > 0) {
-      api.settings.update(backendPayload).catch((e) => {
+      try {
+        await api.settings.update(backendPayload);
+      } catch (e) {
         console.warn('[SettingsContext] Errore updateSettings backend:', e);
-      });
+      }
     }
   };
 
-  const completeSetup = (customSettings?: Partial<AppSettings>) => {
+  const completeSetup = async (customSettings?: Partial<AppSettings>) => {
     const updated = {
       ...settings,
       ...customSettings,
       setupComplete: true,
     };
     setSettings(updated);
+    // Prima il percorso di archiviazione (POST dedicato, atteso), poi il resto via PATCH
     if (customSettings?.storagePath) {
-      api.settings.setStorage(customSettings.storagePath).catch(() => {});
+      try {
+        await api.settings.setStorage(customSettings.storagePath);
+      } catch (e) {
+        console.warn('[SettingsContext] Errore impostazione percorso archiviazione:', e);
+      }
     }
     const backendPayload: Record<string, any> = {};
-    if (updated.storagePath) backendPayload.storage_path = updated.storagePath;
     if (updated.whisperModel) backendPayload.whisper_model = updated.whisperModel;
     if (updated.llmModel) {
       backendPayload.llm_model = updated.llmModel;
@@ -162,7 +172,11 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     if (updated.embeddingModel) backendPayload.embedding_model = updated.embeddingModel;
     if (updated.vadSensitivity) backendPayload.vad_sensitivity = updated.vadSensitivity;
     backendPayload.models_downloaded = updated.modelsDownloaded;
-    api.settings.update(backendPayload).catch(() => {});
+    try {
+      await api.settings.update(backendPayload);
+    } catch (e) {
+      console.warn('[SettingsContext] Errore completeSetup backend:', e);
+    }
   };
 
   const resetSetup = () => {

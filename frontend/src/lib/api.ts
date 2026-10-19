@@ -3,14 +3,32 @@
 const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1';
 const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000';
 
+// Estrae un messaggio leggibile dal campo `detail` di FastAPI (stringa o array di errori 422)
+function formatErrorDetail(detail: unknown, status: number): string {
+  if (typeof detail === 'string' && detail) return detail;
+  if (Array.isArray(detail)) {
+    const msgs = detail
+      .map((d) => (d && typeof d === 'object' && 'msg' in d ? String((d as { msg: unknown }).msg) : String(d)))
+      .filter(Boolean);
+    if (msgs.length > 0) return msgs.join('; ');
+  }
+  return `HTTP ${status}`;
+}
+
+async function throwResponseError(res: Response): Promise<never> {
+  const err = await res.json().catch(() => ({ detail: res.statusText }));
+  throw new Error(formatErrorDetail(err?.detail, res.status));
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const headers = new Headers(options?.headers);
+  if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
   const res = await fetch(`${BASE_URL}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
     ...options,
+    headers,
   });
   if (!res.ok) {
-    const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || `HTTP ${res.status}`);
+    await throwResponseError(res);
   }
   if (res.status === 204) return undefined as T;
   return res.json();
@@ -22,7 +40,7 @@ export const api = {
     list: () => request<import('../types').Subject[]>('/subjects/'),
     create: (data: { name: string; description?: string; whisper_prompt_keywords?: string; color?: string }) =>
       request<import('../types').Subject>('/subjects/', { method: 'POST', body: JSON.stringify(data) }),
-    update: (id: number, data: Partial<{ name: string; description: string; whisper_prompt_keywords: string; color: string }>) =>
+    update: (id: number, data: Partial<{ name: string; description: string | null; whisper_prompt_keywords: string | null; color: string }>) =>
       request<import('../types').Subject>(`/subjects/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
     delete: (id: number) => request<void>(`/subjects/${id}`, { method: 'DELETE' }),
     getMaterials: (id: number) => request<import('../types').CourseMaterial[]>(`/subjects/${id}/materials`),
@@ -47,28 +65,34 @@ export const api = {
         signal: options?.signal,
       });
       if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: res.statusText }));
-        throw new Error(err.detail || `HTTP ${res.status}`);
+        await throwResponseError(res);
       }
       const reader = res.body?.getReader();
       if (!reader) return;
       const decoder = new TextDecoder();
+      const HEADER = '__CONTEXT_USED__:';
       let buffer = '';
       let isHeaderParsed = false;
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-        buffer += chunk;
+        // A fine stream svuota il decoder (eventuali byte UTF-8 residui)
+        buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
         if (!isHeaderParsed) {
-          if (buffer.startsWith('__CONTEXT_USED__:')) {
+          if (buffer.startsWith(HEADER)) {
             const sep = buffer.indexOf('\n\n');
             if (sep !== -1) {
-              const ctx = buffer.substring('__CONTEXT_USED__:'.length, sep);
+              const ctx = buffer.substring(HEADER.length, sep);
               buffer = buffer.substring(sep + 2);
               isHeaderParsed = true;
               yield { context_used: ctx };
+            } else if (done) {
+              // Stream terminato senza separatore: solo header, nessun token
+              isHeaderParsed = true;
+              yield { context_used: buffer.substring(HEADER.length) };
+              buffer = '';
             }
+          } else if (!done && HEADER.startsWith(buffer)) {
+            // Il buffer è ancora un prefisso dell'header: continua a leggere
           } else {
             isHeaderParsed = true;
           }
@@ -77,6 +101,7 @@ export const api = {
           yield { token: buffer };
           buffer = '';
         }
+        if (done) break;
       }
     },
     reindex: (subjectId: number) =>
@@ -91,8 +116,7 @@ export const api = {
         body: formData,
       });
       if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: res.statusText }));
-        throw new Error(err.detail || `HTTP ${res.status}`);
+        await throwResponseError(res);
       }
       return res.json();
     },
@@ -218,7 +242,9 @@ export const api = {
       modelId?: string
     ): Promise<import('../types').OralEvaluationResult> => {
       const formData = new FormData();
-      formData.append('audio', audioBlob, 'oral_answer.wav');
+      const mime = audioBlob.type || '';
+      const ext = mime.includes('mp4') ? 'm4a' : mime.includes('ogg') ? 'ogg' : mime.includes('wav') ? 'wav' : 'webm';
+      formData.append('audio', audioBlob, `oral_answer.${ext}`);
       formData.append('question', question);
       if (modelId) formData.append('model_id', modelId);
 
@@ -227,8 +253,7 @@ export const api = {
         body: formData,
       });
       if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: res.statusText }));
-        throw new Error(err.detail || `HTTP ${res.status}`);
+        await throwResponseError(res);
       }
       return res.json();
     },

@@ -99,22 +99,8 @@ export default function AddMaterialModal({
         if (!selectedFile) {
           throw new Error('Seleziona un file PDF o presentazione per procedere.');
         }
-        let uploadedMat: CourseMaterial;
-        try {
-          uploadedMat = await api.subjects.uploadMaterialFile(subject.id, selectedFile);
-        } catch {
-          // Fallback locale se backend non è stato riavviato
-          const f_kb = selectedFile.size / 1024;
-          uploadedMat = {
-            id: selectedFile.name,
-            name: customTitle ? `${customTitle}.${selectedFile.name.split('.').pop()}` : selectedFile.name,
-            type: selectedFile.name.endsWith('.pdf') ? 'pdf' : 'slide',
-            size: f_kb > 1024 ? `${(f_kb / 1024).toFixed(1)} MB` : `${f_kb.toFixed(1)} KB`,
-            uploadedAt: 'Oggi',
-            pageCount: 1,
-            isAutoImported: false,
-          };
-        }
+        // Un errore di caricamento viene mostrato all'utente (nessun materiale fittizio)
+        const uploadedMat = await api.subjects.uploadMaterialFile(subject.id, selectedFile);
         onMaterialAdded(uploadedMat);
         onClose();
         return;
@@ -170,13 +156,15 @@ export default function AddMaterialModal({
         const durationSec = audioDurationMinutes ? parseInt(audioDurationMinutes, 10) * 60 : undefined;
 
         if (selectedFile) {
-          try {
-            await api.subjects.uploadMaterialFile(subject.id, selectedFile);
-          } catch {
-            // Ignora se non riavviato
-          }
+          // Il backend crea da solo la lezione (trascrizione Whisper in background):
+          // non creiamo un'altra lezione qui per evitare duplicati
+          const uploadedMat = await api.subjects.uploadMaterialFile(subject.id, selectedFile);
+          onMaterialAdded(uploadedMat);
+          onClose();
+          return;
         }
 
+        // Nessun file: registra solo la lezione esterna come voce del corso
         const newLecture = await api.lectures.create({
           subject_id: subject.id,
           title,

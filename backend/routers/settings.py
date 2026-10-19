@@ -6,14 +6,40 @@ e la sincronizzazione delle preferenze tra frontend e backend.
 from __future__ import annotations
 
 import os
+import threading
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
 
-from config import get_storage_path, load_settings, save_settings, update_storage_path
+from config import SETTINGS_LOCK, get_storage_path, load_settings, save_settings, update_storage_path
 
 router = APIRouter(prefix="/settings", tags=["Settings"])
+
+# Evita due migrazioni dello storage in parallelo (copytree concorrenti → cartelle a metà)
+_storage_lock = threading.Lock()
+
+_LEGACY_WHISPER_IDS = ("dual-tier-whisper", "large-v3-turbo", "base-mlx", "small-mlx")
+
+
+def _normalize_whisper_state(current: Dict[str, Any]) -> bool:
+    """Migra id Whisper obsoleti e marca models_downloaded se il modello è su disco. True se cambiato."""
+    changed = False
+    try:
+        from routers.models import WHISPER_MODELS, is_whisper_downloaded
+        curr_whisper = current.get("whisper_model", "large-v3-turbo-q4")
+        if curr_whisper in _LEGACY_WHISPER_IDS:
+            curr_whisper = "large-v3-turbo-q4"
+            current["whisper_model"] = curr_whisper
+            changed = True
+        if curr_whisper in WHISPER_MODELS and curr_whisper != "mock_mode":
+            is_dl, _ = is_whisper_downloaded(WHISPER_MODELS[curr_whisper])
+            if is_dl and not current.get("models_downloaded"):
+                current["models_downloaded"] = True
+                changed = True
+    except Exception:
+        pass
+    return changed
 
 
 class StoragePathRequest(BaseModel):
@@ -33,20 +59,10 @@ class SettingsUpdateRequest(BaseModel):
 @router.get("/")
 def get_current_settings():
     """Restituisce le impostazioni correnti del backend verificando lo stato reale su disco."""
-    current = load_settings()
-    try:
-        from routers.models import WHISPER_MODELS, is_whisper_downloaded
-        curr_whisper = current.get("whisper_model", "large-v3-turbo-q4")
-        if curr_whisper in ("dual-tier-whisper", "large-v3-turbo", "base-mlx", "small-mlx"):
-            curr_whisper = "large-v3-turbo-q4"
-            current["whisper_model"] = "large-v3-turbo-q4"
-        if curr_whisper in WHISPER_MODELS and curr_whisper != "mock_mode":
-            is_dl, _ = is_whisper_downloaded(WHISPER_MODELS[curr_whisper])
-            if is_dl:
-                current["models_downloaded"] = True
+    with SETTINGS_LOCK:
+        current = load_settings()
+        if _normalize_whisper_state(current):
             save_settings(current)
-    except Exception:
-        pass
     return current
 
 
@@ -64,7 +80,8 @@ def set_storage_path(payload: StoragePathRequest):
         )
 
     try:
-        result = update_storage_path(path, migrate_data=True)
+        with _storage_lock:
+            result = update_storage_path(path, migrate_data=True)
         return result
     except Exception as exc:
         raise HTTPException(
@@ -76,31 +93,21 @@ def set_storage_path(payload: StoragePathRequest):
 @router.patch("/")
 def update_settings(payload: SettingsUpdateRequest):
     """Aggiorna parzialmente le impostazioni nel backend."""
-    current = load_settings()
-    data = payload.model_dump(exclude_unset=True)
+    data = payload.model_dump(exclude_unset=True, exclude_none=True)
+    data.pop("ollama_model", None)
 
-    if "storage_path" in data and data["storage_path"]:
-        update_storage_path(data["storage_path"], migrate_data=True)
+    new_storage = (data.pop("storage_path", None) or "").strip()
+    if new_storage:
+        with _storage_lock:
+            update_storage_path(new_storage, migrate_data=True)
 
-    for k, v in data.items():
-        if k != "storage_path":
-            current[k] = v
-
-    # Se un modello Whisper reale è fisicamente presente su disco, models_downloaded deve rimanere True
-    try:
-        from routers.models import WHISPER_MODELS, is_whisper_downloaded
-        curr_whisper = current.get("whisper_model", "large-v3-turbo-q4")
-        if curr_whisper in ("dual-tier-whisper", "large-v3-turbo", "base-mlx", "small-mlx"):
-            curr_whisper = "large-v3-turbo-q4"
-            current["whisper_model"] = "large-v3-turbo-q4"
-        if curr_whisper in WHISPER_MODELS and curr_whisper != "mock_mode":
-            is_dl, _ = is_whisper_downloaded(WHISPER_MODELS[curr_whisper])
-            if is_dl:
-                current["models_downloaded"] = True
-    except Exception:
-        pass
-
-    saved = save_settings(current)
+    # Ricarica DOPO l'eventuale cambio storage, altrimenti si riscriverebbe il vecchio storage_path
+    with SETTINGS_LOCK:
+        current = load_settings()
+        current.update(data)
+        # Se un modello Whisper reale è fisicamente presente su disco, models_downloaded deve rimanere True
+        _normalize_whisper_state(current)
+        saved = save_settings(current)
     return saved
 
 

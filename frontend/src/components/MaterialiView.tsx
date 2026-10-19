@@ -1,5 +1,5 @@
 // components/MaterialiView.tsx — Sezione Materiali: Tutta la memoria del database del corso (File + Registrazioni + InfoCorso)
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { 
   Upload, FileText, Presentation, File, Trash2, Plus, 
   Search, Sparkles, X, Info, Mic, RotateCcw
@@ -30,13 +30,28 @@ export default function MaterialiView({
   const [showAddModal, setShowAddModal] = useState(false);
   const [itemToDelete, setItemToDelete] = useState<CourseMaterial | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  // Guardia contro risposte obsolete (dismount o richieste superate)
+  const isMountedRef = useRef(true);
+  const loadSeqRef = useRef(0);
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   const loadMaterials = useCallback(async () => {
+    const seq = ++loadSeqRef.current;
+    const isStale = () => !isMountedRef.current || seq !== loadSeqRef.current;
     setLoading(true);
     try {
       const data = await api.subjects.getMaterials(subject.id);
+      if (isStale()) return;
       setMaterials(data);
     } catch {
+      if (isStale()) return;
       // Fallback locale
       const fallbackInfo: CourseMaterial = {
         id: `infocorso-${subject.id}`,
@@ -50,7 +65,7 @@ export default function MaterialiView({
       };
       setMaterials([fallbackInfo]);
     } finally {
-      setLoading(false);
+      if (!isStale()) setLoading(false);
     }
   }, [subject]);
 
@@ -64,12 +79,14 @@ export default function MaterialiView({
 
   const handleDeleteItem = (mat: CourseMaterial, e: React.MouseEvent) => {
     e.stopPropagation();
+    setDeleteError(null);
     setItemToDelete(mat);
   };
 
   const confirmDeleteItem = async () => {
     if (!itemToDelete) return;
     setIsDeleting(true);
+    setDeleteError(null);
     try {
       if (itemToDelete.lecture_id) {
         if (onDeleteLecturePermanently) {
@@ -78,15 +95,14 @@ export default function MaterialiView({
           await api.lectures.delete(itemToDelete.lecture_id);
         }
       } else if (!itemToDelete.isAutoImported) {
-        try {
-          await api.subjects.deleteMaterialFile(subject.id, itemToDelete.name);
-        } catch {
-          // Ignora se non ancora presente fisicamente
-        }
+        // In caso di errore il materiale NON viene rimosso dalla lista
+        await api.subjects.deleteMaterialFile(subject.id, itemToDelete.name);
       }
       setMaterials((prev) => prev.filter((m) => m.id !== itemToDelete.id));
       if (previewMaterial?.id === itemToDelete.id) setPreviewMaterial(null);
       setItemToDelete(null);
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : String(err));
     } finally {
       setIsDeleting(false);
     }
@@ -391,6 +407,12 @@ export default function MaterialiView({
                 ? 'Eliminare definitivamente questa lezione dalla memoria del corso? Verrà rimossa sia da Materiali che dal Quaderno.'
                 : `Eliminare definitivamente "${itemToDelete.name}" dal disco e dalla memoria del corso?`}
             </p>
+
+            {deleteError && (
+              <p className="text-xs leading-relaxed text-red-300 bg-red-500/10 border border-red-500/25 rounded-xl px-3 py-2">
+                Eliminazione non riuscita: {deleteError}
+              </p>
+            )}
 
             <div className="flex items-center justify-end gap-2 pt-2">
               <button

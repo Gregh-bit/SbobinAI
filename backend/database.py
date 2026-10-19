@@ -115,12 +115,21 @@ class Bookmark(Base):
 def init_db() -> None:
     """Crea tutte le tabelle se non esistono."""
     Base.metadata.create_all(bind=engine)
+    # Migrazioni leggere per DB creati da versioni precedenti (es. unicopilot.db)
+    migrations = [
+        ("detected_questions", "TEXT"),
+        ("source_type", "VARCHAR(50) DEFAULT 'recorded'"),
+        ("in_quaderno", "BOOLEAN DEFAULT 1"),
+    ]
     with engine.connect() as conn:
-        try:
-            conn.execute(text("ALTER TABLE lectures ADD COLUMN detected_questions TEXT"))
-            conn.commit()
-        except Exception:
-            pass
+        existing = {row[1] for row in conn.execute(text("PRAGMA table_info(lectures)"))}
+        for col, ddl in migrations:
+            if col not in existing:
+                try:
+                    conn.execute(text(f"ALTER TABLE lectures ADD COLUMN {col} {ddl}"))
+                    conn.commit()
+                except Exception:
+                    pass
     print(f"[DB] Database inizializzato → {DB_PATH}")
 
 

@@ -48,6 +48,9 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
   const audioChunksRef = useRef<Blob[]>([]);
   const timerIntervalRef = useRef<any>(null);
 
+  // Modello LLM scelto dall'utente nelle Impostazioni
+  const llmModelId = settings.llmModel || settings.ollamaModel || undefined;
+
   // Seleziona di default tutte le lezioni
   useEffect(() => {
     if (lectures.length > 0 && selectedLectureIds.length === 0) {
@@ -55,12 +58,29 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
     }
   }, [lectures]);
 
-  // Cleanup timer registrazione al dismount
+  // Solo id di lezioni ancora esistenti (evita id obsoleti dopo eliminazioni)
+  const getValidLectureIds = (): number[] | undefined => {
+    const valid = selectedLectureIds.filter((id) => lectures.some((l) => l.id === id));
+    return valid.length > 0 ? valid : undefined;
+  };
+
+  // Cleanup timer e microfono al dismount (senza inviare l'audio)
   useEffect(() => {
     return () => {
       if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
-        mediaRecorderRef.current.stop();
+      const rec = mediaRecorderRef.current;
+      if (rec) {
+        rec.onstop = null;
+        rec.ondataavailable = null;
+        if (rec.state !== 'inactive') {
+          try {
+            rec.stop();
+          } catch {
+            // ignore
+          }
+        }
+        rec.stream.getTracks().forEach((track) => track.stop());
+        mediaRecorderRef.current = null;
       }
     };
   }, []);
@@ -81,7 +101,8 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
     setIsGeneratingQuiz(true);
     try {
       const res = await api.study.generateQuiz(subject.id, {
-        lecture_ids: selectedLectureIds.length > 0 ? selectedLectureIds : undefined,
+        lecture_ids: getValidLectureIds(),
+        model_id: llmModelId,
       });
 
       if (res?.questions && res.questions.length > 0) {
@@ -143,7 +164,8 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
     setOralResult(null);
     try {
       const res = await api.study.getOralQuestion(subject.id, {
-        lecture_ids: selectedLectureIds.length > 0 ? selectedLectureIds : undefined,
+        lecture_ids: getValidLectureIds(),
+        model_id: llmModelId,
       });
       if (res?.question) {
         setOralQuestion(res.question);
@@ -159,10 +181,18 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
   const handleStartVoiceRecording = async () => {
     setOralError(null);
     setOralResult(null);
+    let stream: MediaStream | null = null;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const activeStream = stream;
       audioChunksRef.current = [];
-      const mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+      // Scegli un formato supportato dalla webview (WebKit non supporta audio/webm)
+      const mimeType = ['audio/webm', 'audio/mp4'].find(
+        (type) => typeof MediaRecorder.isTypeSupported === 'function' && MediaRecorder.isTypeSupported(type)
+      );
+      const mediaRecorder = mimeType
+        ? new MediaRecorder(activeStream, { mimeType })
+        : new MediaRecorder(activeStream);
       mediaRecorderRef.current = mediaRecorder;
 
       mediaRecorder.ondataavailable = (event) => {
@@ -172,8 +202,9 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
       };
 
       mediaRecorder.onstop = async () => {
-        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
-        stream.getTracks().forEach((track) => track.stop());
+        const audioBlob = new Blob(audioChunksRef.current, { type: mediaRecorder.mimeType || mimeType || '' });
+        activeStream.getTracks().forEach((track) => track.stop());
+        mediaRecorderRef.current = null;
         await handleSendOralAudio(audioBlob);
       };
 
@@ -185,6 +216,9 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
         setRecordingElapsed((prev) => prev + 1);
       }, 1000);
     } catch (err: any) {
+      // Rilascia il microfono se la registrazione non è partita
+      stream?.getTracks().forEach((track) => track.stop());
+      mediaRecorderRef.current = null;
       setOralError('Impossibile accedere al microfono: ' + (err?.message || 'Permesso negato'));
     }
   };
@@ -201,7 +235,7 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
     setIsEvaluatingOral(true);
     setOralError(null);
     try {
-      const result = await api.study.evaluateOral(subject.id, blob, oralQuestion);
+      const result = await api.study.evaluateOral(subject.id, blob, oralQuestion, llmModelId);
       setOralResult(result);
     } catch (err: any) {
       setOralError(err?.message || 'Errore durante la valutazione della risposta orale con Whisper e Qwen.');

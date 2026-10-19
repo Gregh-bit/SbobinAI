@@ -12,14 +12,16 @@ interface Props {
   onUpdate?: (id: number, data: { name: string; description: string; keywords: string; color: string }) => Promise<void>;
   onDelete?: (id: number) => Promise<void>;
   isLoading: boolean;
+  isRecording?: boolean;
   onOpenSettings?: () => void;
 }
 
-export default function Sidebar({ subjects, selectedId, onSelect, onAdd, onUpdate, onDelete, onOpenSettings }: Props) {
+export default function Sidebar({ subjects, selectedId, onSelect, onAdd, onUpdate, onDelete, isRecording = false, onOpenSettings }: Props) {
   const [showModal, setShowModal] = useState(false);
   const [subjectToEdit, setSubjectToEdit] = useState<Subject | null>(null);
   const [subjectToDelete, setSubjectToDelete] = useState<Subject | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   return (
     <>
@@ -54,12 +56,19 @@ export default function Sidebar({ subjects, selectedId, onSelect, onAdd, onUpdat
           ) : (
             subjects.map((s) => {
               const isSelected = selectedId === s.id;
+              // Durante una registrazione live il corso non può essere cambiato
+              const isLocked = isRecording && !isSelected;
               return (
                 <div
                   key={s.id}
-                  onClick={() => onSelect(s)}
+                  onClick={() => {
+                    if (!isLocked) onSelect(s);
+                  }}
+                  title={isLocked ? 'Termina la registrazione per cambiare corso' : undefined}
+                  aria-disabled={isLocked || undefined}
                   className={clsx(
-                    'w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-left transition-all duration-150 group cursor-pointer',
+                    'w-full flex items-center gap-2.5 px-3 py-2 rounded-xl text-left transition-all duration-150 group',
+                    isLocked ? 'cursor-not-allowed opacity-40' : 'cursor-pointer',
                     isSelected
                       ? 'bg-white/[0.12] text-white shadow-liquid-sm border border-white/[0.14]'
                       : 'text-white/70 hover:bg-white/[0.05] hover:text-white/95 border border-transparent'
@@ -76,12 +85,12 @@ export default function Sidebar({ subjects, selectedId, onSelect, onAdd, onUpdat
                     <span className={clsx(
                       'text-[11px] font-mono px-2 py-0.5 rounded-md flex-shrink-0 transition-opacity',
                       isSelected ? 'bg-white/20 text-white' : 'text-white/40 group-hover:text-white/60',
-                      (onDelete || onUpdate) && 'group-hover:hidden'
+                      (onDelete || onUpdate) && !isRecording && 'group-hover:hidden'
                     )}>
                       {s.lecture_count}
                     </span>
                   )}
-                  <div className="hidden group-hover:flex items-center gap-1 flex-shrink-0">
+                  <div className={clsx('hidden items-center gap-1 flex-shrink-0', !isRecording && 'group-hover:flex')}>
                     {onUpdate && (
                       <button
                         type="button"
@@ -100,6 +109,7 @@ export default function Sidebar({ subjects, selectedId, onSelect, onAdd, onUpdat
                         type="button"
                         onClick={(e) => {
                           e.stopPropagation();
+                          setDeleteError(null);
                           setSubjectToDelete(s);
                         }}
                         title={`Elimina ${s.name}`}
@@ -179,6 +189,12 @@ export default function Sidebar({ subjects, selectedId, onSelect, onAdd, onUpdat
               Sei sicuro di voler eliminare questo corso? Verranno rimossi tutti i materiali, appunti e registrazioni associati.
             </p>
 
+            {deleteError && (
+              <p className="text-xs leading-relaxed text-red-300 bg-red-500/10 border border-red-500/25 rounded-xl px-3 py-2">
+                Impossibile eliminare il corso: {deleteError}
+              </p>
+            )}
+
             <div className="flex items-center justify-end gap-2 pt-2">
               <button
                 type="button"
@@ -193,9 +209,12 @@ export default function Sidebar({ subjects, selectedId, onSelect, onAdd, onUpdat
                 onClick={async () => {
                   if (!onDelete || !subjectToDelete) return;
                   setIsDeleting(true);
+                  setDeleteError(null);
                   try {
                     await onDelete(subjectToDelete.id);
                     setSubjectToDelete(null);
+                  } catch (err) {
+                    setDeleteError(err instanceof Error ? err.message : String(err));
                   } finally {
                     setIsDeleting(false);
                   }

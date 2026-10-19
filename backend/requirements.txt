@@ -1,8 +1,12 @@
 # ==============================================================================
-# SbobinAI — Backend Requirements (Pure Apple Silicon Metal Stack 2026)
+# SbobinAI — Backend Requirements (macOS Apple Silicon MLX + Windows/Linux portable)
+#   pip install -r requirements.txt
+# Il backend IA viene scelto a runtime (platform_utils.py):
+#   - macOS arm64        → MLX (mlx-whisper, mlx-lm, mlx-embeddings)
+#   - Windows / Linux    → faster-whisper (CTranslate2) + llama-cpp-python (GGUF)
 # ==============================================================================
 
-# ── 1. API & Real-Time ────────────────────────────────────────────────────────
+# ── 1. API & Real-Time ─────────────────────────────────────────────────────────
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.6
 websockets>=13.1
@@ -14,19 +18,32 @@ python-dotenv>=1.0.1
 requests>=2.32.3
 httpx>=0.27.2
 
-# ── 2. Vector DB & RAG (Pure MLX & LanceDB) ───────────────────────────────────
+# ── 2. Vector DB & RAG ─────────────────────────────────────────────────────────
 lancedb>=0.40.0
-pyarrow>=26.0.0
-mlx-embeddings>=0.1.0
+# pyarrow 26 è bloccato da Windows Smart App Control su alcune macchine: range ampio
+pyarrow>=16.0.0,<27
 pymupdf>=1.24.0
+mlx-embeddings>=0.1.0; sys_platform == 'darwin' and platform_machine == 'arm64'
 
-# ── 3. Audio Capture & Processing ─────────────────────────────────────────────
+# ── 3. Audio Capture & Processing ──────────────────────────────────────────────
 sounddevice>=0.5.0
 numpy>=1.26.0
 scipy>=1.11.0
-webrtcvad>=2.0.10
+# webrtcvad non ha wheel Windows: webrtcvad-wheels fornisce lo stesso modulo `webrtcvad`
+webrtcvad>=2.0.10; sys_platform == 'darwin'
+webrtcvad-wheels>=2.0.14; sys_platform != 'darwin'
 huggingface-hub>=0.23.0
-mlx-whisper>=0.4.1; sys_platform == 'darwin' and platform_machine == 'arm64'
+tqdm>=4.66.0
 
-# ── 4. Local LLM (Pure MLX Metal Native) ──────────────────────────────────────
-mlx-lm>=0.32.0
+# ── 4. Speech-to-Text ──────────────────────────────────────────────────────────
+mlx-whisper>=0.4.1; sys_platform == 'darwin' and platform_machine == 'arm64'
+# Windows/Linux: CTranslate2 (CUDA 12 + cuDNN 9 per la GPU NVIDIA, altrimenti CPU int8)
+faster-whisper>=1.1.0; sys_platform != 'darwin' or platform_machine != 'arm64'
+
+# ── 5. Local LLM + Embeddings ──────────────────────────────────────────────────
+mlx-lm>=0.32.0; sys_platform == 'darwin' and platform_machine == 'arm64'
+# Windows/Linux: llama.cpp (LLM GGUF + Qwen3-Embedding GGUF). >=0.3.36 per l'architettura Qwen 3.5.
+#   Wheel CPU precompilata: --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+#   GPU NVIDIA: compilare con CMAKE_ARGS="-DGGML_CUDA=on" (vedi README, sezione Windows)
+llama-cpp-python>=0.3.36; sys_platform != 'darwin' or platform_machine != 'arm64'
+jinja2>=3.1.0

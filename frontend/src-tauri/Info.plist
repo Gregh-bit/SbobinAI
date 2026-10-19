@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>SbobinAI usa il microfono per registrare e trascrivere le lezioni e le tue risposte nelle simulazioni d'esame orale. L'audio viene elaborato esclusivamente sul tuo Mac.</string>
+  <key>NSSpeechRecognitionUsageDescription</key>
+  <string>SbobinAI trascrive il parlato delle lezioni e delle interrogazioni con modelli di riconoscimento vocale eseguiti interamente in locale sul tuo Mac.</string>
+</dict>
+</plist>

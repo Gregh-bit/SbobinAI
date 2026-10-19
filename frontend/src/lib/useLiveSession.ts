@@ -23,6 +23,13 @@ function generateId(): string {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
+function normalizeQuestion(text: string): string {
+  return text.toLowerCase().replace(/[\?\.\,\s]/g, '');
+}
+
+// Tempo massimo di attesa del messaggio 'stopped' dal backend dopo l'invio di 'stop'
+const STOP_ACK_TIMEOUT_MS = 10000;
+
 interface UseLiveSessionProps {
   subject: Subject;
   lecture: Lecture | null;
@@ -47,9 +54,29 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
   const [chatInput, setChatInput] = useState('');
   const [isSendingChat, setIsSendingChat] = useState(false);
 
+  // Stato connessione / errori della registrazione
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [isStopping, setIsStopping] = useState(false);
+
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const elapsedRef = useRef(0);
   const isPausedRef = useRef(isPaused);
+  // Domande eliminate dall'utente: ignorate se arrivano di nuovo (es. con la risposta flash)
+  const deletedQuestionIdsRef = useRef<Set<string>>(new Set());
+  const deletedQuestionTextsRef = useRef<Set<string>>(new Set());
+  // Chat live: query attiva e numero di risposte di richieste annullate ancora da scartare
+  const activeChatQueryRef = useRef<string | null>(null);
+  const cancelledChatResponsesRef = useRef(0);
+  // Attesa del messaggio 'stopped' dopo l'invio di 'stop'
+  const stopResolverRef = useRef<((acknowledged: boolean) => void) | null>(null);
+  const isStoppingRef = useRef(false);
+
+  const stopTimer = () => {
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+      timerRef.current = null;
+    }
+  };
 
   useEffect(() => {
     isPausedRef.current = isPaused;
@@ -66,6 +93,14 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
     setIsPaused(false);
     isPausedRef.current = false;
     setAudioStatus('idle');
+    setConnectionError(null);
+    setIsStopping(false);
+    setIsSendingChat(false);
+    isStoppingRef.current = false;
+    deletedQuestionIdsRef.current = new Set();
+    deletedQuestionTextsRef.current = new Set();
+    activeChatQueryRef.current = null;
+    cancelledChatResponsesRef.current = 0;
   }, [lecture?.id]);
 
   // ── Handle incoming WS messages ─────────────────────────────────────────────
@@ -132,6 +167,10 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
       case 'chat_chunk': {
         const chunk = (msg.payload.chunk as string) || '';
         if (!chunk) break;
+        // Scarta i frammenti di richieste annullate o non corrispondenti alla richiesta attiva
+        if (cancelledChatResponsesRef.current > 0 || activeChatQueryRef.current === null) break;
+        const chunkQuery = msg.payload.query as string | undefined;
+        if (chunkQuery !== undefined && chunkQuery !== activeChatQueryRef.current) break;
         setChatMessages((prev) => {
           if (prev.length === 0 || prev[prev.length - 1].role !== 'assistant') {
             const newAssistant: ChatMessage = {
@@ -153,6 +192,13 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
       }
 
       case 'chat_response': {
+        // Risposta finale di una richiesta annullata (il backend ne invia sempre una per richiesta)
+        if (cancelledChatResponsesRef.current > 0) {
+          cancelledChatResponsesRef.current -= 1;
+          break;
+        }
+        if (activeChatQueryRef.current === null) break;
+        activeChatQueryRef.current = null;
         const fullAnswer = (msg.payload.answer as string) || '';
         const contextUsed = msg.payload.context_used as string | undefined;
         setChatMessages((prev) => {
@@ -181,6 +227,13 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
       case 'question_detected': {
         const qText = (msg.payload.question as string) || '';
         if (!qText.trim()) break;
+        const incomingId = msg.payload.id as string | undefined;
+        if (
+          (incomingId && deletedQuestionIdsRef.current.has(String(incomingId))) ||
+          deletedQuestionTextsRef.current.has(normalizeQuestion(qText))
+        ) {
+          break;
+        }
 
         const q: DetectedQuestion = {
           id: (msg.payload.id as string) || generateId(),
@@ -193,9 +246,9 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
         };
 
         setDetectedQuestions((prev) => {
-          const cleanQ = qText.toLowerCase().replace(/[\?\.\,\s]/g, '');
+          const cleanQ = normalizeQuestion(qText);
           const existingIdx = prev.findIndex((item) => {
-            const itemClean = item.question.toLowerCase().replace(/[\?\.\,\s]/g, '');
+            const itemClean = normalizeQuestion(item.question);
             return itemClean === cleanQ || (cleanQ.length > 15 && itemClean.includes(cleanQ)) || (itemClean.length > 15 && cleanQ.includes(itemClean));
           });
           if (existingIdx >= 0) {
@@ -220,10 +273,27 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
         break;
 
       case 'stopped':
-        if (timerRef.current) clearInterval(timerRef.current);
+        stopTimer();
         setAudioStatus('idle');
-        onStop();
+        if (stopResolverRef.current) {
+          // handleStop è in attesa di questa conferma: sarà lui a chiamare onStop
+          stopResolverRef.current(true);
+        } else if (!isStoppingRef.current) {
+          onStop();
+        }
         break;
+
+      case 'error': {
+        const message = (msg.payload?.message as string) || 'Errore sconosciuto del motore di registrazione.';
+        console.warn('[LiveSession] Errore dal backend:', message);
+        setConnectionError(message);
+        // Un errore durante la chat non deve lasciare il pulsante bloccato
+        if (activeChatQueryRef.current !== null) {
+          activeChatQueryRef.current = null;
+          setIsSendingChat(false);
+        }
+        break;
+      }
     }
   }, [onStop]);
 
@@ -233,14 +303,18 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
   }, [handleWSMessage]);
 
   // ── WebSocket Lifecycle ─────────────────────────────────────────────────────
+  // Il corso della WebSocket è quello della lezione in registrazione (fissato all'avvio)
+  const sessionSubjectId = lecture?.subject_id ?? subject.id;
+
   useEffect(() => {
     if (!lecture) return;
 
-    const ws = api.ws.liveLecture(subject.id);
+    const ws = api.ws.liveLecture(sessionSubjectId);
     wsRef.current = ws;
 
     ws.onopen = () => {
       setIsConnected(true);
+      setConnectionError(null);
       ws.send(JSON.stringify({
         type: 'start',
         payload: {
@@ -261,14 +335,36 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
       }
     };
 
-    ws.onclose = () => setIsConnected(false);
-    ws.onerror = () => setIsConnected(false);
+    ws.onclose = () => {
+      setIsConnected(false);
+      stopTimer();
+      if (wsRef.current === ws) wsRef.current = null;
+      // Sblocca un'eventuale attesa di 'stopped' e una richiesta chat in corso
+      if (stopResolverRef.current) stopResolverRef.current(false);
+      if (activeChatQueryRef.current !== null) {
+        activeChatQueryRef.current = null;
+        setIsSendingChat(false);
+      }
+      if (!isStoppingRef.current) {
+        setConnectionError((prev) => prev || 'Connessione con il motore di registrazione interrotta.');
+      }
+    };
+    ws.onerror = () => {
+      setIsConnected(false);
+      if (!isStoppingRef.current) {
+        setConnectionError('Impossibile connettersi al motore di registrazione. Verifica che il backend sia attivo.');
+      }
+    };
 
     return () => {
+      ws.onclose = null;
+      ws.onerror = null;
+      ws.onmessage = null;
       ws.close();
-      if (timerRef.current) clearInterval(timerRef.current);
+      if (wsRef.current === ws) wsRef.current = null;
+      stopTimer();
     };
-  }, [subject.id, lecture?.id]);
+  }, [sessionSubjectId, lecture?.id]);
 
   // ── Actions ─────────────────────────────────────────────────────────────────
   const handleBookmark = useCallback(() => {
@@ -281,27 +377,54 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
   }, []);
 
   const handleStop = useCallback(async () => {
-    if (timerRef.current) clearInterval(timerRef.current);
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+    if (isStoppingRef.current) return;
+    isStoppingRef.current = true;
+    setIsStopping(true);
+    stopTimer();
+
+    // Attende la conferma 'stopped' (il backend ha salvato trascrizione e audio) oppure il timeout
+    let acknowledged = false;
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
       try {
-        wsRef.current.send(JSON.stringify({ type: 'stop', payload: {} }));
+        const ackPromise = new Promise<boolean>((resolve) => {
+          const timeout = setTimeout(() => resolve(false), STOP_ACK_TIMEOUT_MS);
+          stopResolverRef.current = (ack: boolean) => {
+            clearTimeout(timeout);
+            resolve(ack);
+          };
+        });
+        ws.send(JSON.stringify({ type: 'stop', payload: {} }));
+        acknowledged = await ackPromise;
       } catch (err) {
         console.warn('Errore invio stop WebSocket:', err);
+      } finally {
+        stopResolverRef.current = null;
       }
     }
-    if (lecture) {
-      api.lectures.update(lecture.id, {
-        duration_seconds: elapsedRef.current,
-        detected_questions: detectedQuestions.length > 0 ? JSON.stringify(detectedQuestions) : null,
-      }).catch(() => {});
+
+    // Fallback: se il backend non ha confermato, salva almeno durata e domande lato client
+    if (!acknowledged && lecture) {
+      try {
+        await api.lectures.update(lecture.id, {
+          duration_seconds: elapsedRef.current,
+          detected_questions: detectedQuestions.length > 0 ? JSON.stringify(detectedQuestions) : null,
+        });
+      } catch {
+        // ignore
+      }
     }
-    // Ritorna subito al Quaderno senza ritardi o schermate bloccate
     onStop();
   }, [lecture, onStop, detectedQuestions]);
 
   const handleChatSend = useCallback((textToSend?: string) => {
     const q = (textToSend || chatInput).trim();
     if (!q || isSendingChat) return;
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setConnectionError("Connessione non disponibile: impossibile inviare la domanda all'assistente.");
+      return;
+    }
 
     const userMsg: ChatMessage = {
       id: generateId(),
@@ -312,14 +435,26 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
     setChatMessages((prev) => [...prev, userMsg]);
     setChatInput('');
     setIsSendingChat(true);
+    activeChatQueryRef.current = q;
 
-    wsRef.current?.send(JSON.stringify({
-      type: 'chat',
-      payload: { query: q, context_minutes: 5 }
-    }));
+    try {
+      ws.send(JSON.stringify({
+        type: 'chat',
+        payload: { query: q, context_minutes: 5 }
+      }));
+    } catch (err) {
+      console.warn('Errore invio chat WebSocket:', err);
+      activeChatQueryRef.current = null;
+      setIsSendingChat(false);
+    }
   }, [chatInput, isSendingChat]);
 
   const handleCancelChat = useCallback(async () => {
+    // La risposta della richiesta annullata arriverà comunque: va scartata
+    if (activeChatQueryRef.current !== null) {
+      cancelledChatResponsesRef.current += 1;
+      activeChatQueryRef.current = null;
+    }
     setIsSendingChat(false);
     try {
       await api.ai.stop(true);
@@ -329,7 +464,12 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
   }, []);
 
   const handleDeleteQuestion = useCallback((questionId: string) => {
-    setDetectedQuestions((prev) => prev.filter((q) => q.id !== questionId));
+    deletedQuestionIdsRef.current.add(String(questionId));
+    setDetectedQuestions((prev) => {
+      const removed = prev.find((q) => q.id === questionId);
+      if (removed) deletedQuestionTextsRef.current.add(normalizeQuestion(removed.question));
+      return prev.filter((q) => q.id !== questionId);
+    });
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({
         type: 'delete_question',
@@ -368,6 +508,8 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
 
   return {
     isConnected,
+    connectionError,
+    isStopping,
     isPaused,
     setIsPaused,
     audioStatus,

@@ -118,10 +118,8 @@ export default function Wizard() {
     try {
       const selected = await pickFolder(storagePath);
       if (selected) {
+        // Il percorso viene inviato al backend una sola volta al completamento del setup
         setStoragePath(selected);
-        api.settings.setStorage(selected).catch((err) => {
-          console.warn('[Wizard] Errore salvataggio storage backend:', err);
-        });
       }
     } finally {
       setIsSelectingFolder(false);
@@ -189,24 +187,13 @@ export default function Wizard() {
   };
 
   // Completamento del Wizard ed ingresso all'app
-  const handleFinishSetup = () => {
+  const handleFinishSetup = async () => {
     const finalWhisper = CORE_WHISPER_ID;
     const finalEmbedding = CORE_EMBEDDING_ID;
     const finalLlm = llmModel === 'later' ? 'mlx-community/Qwen3.5-4B-MLX-4bit' : llmModel;
 
-    api.settings.setStorage(storagePath).catch((err) => {
-      console.warn('[Wizard] Errore sincronizzazione percorso backend:', err);
-    });
-
-    api.settings.update({
-      whisper_model: finalWhisper,
-      embedding_model: finalEmbedding,
-      llm_model: finalLlm,
-      ollama_model: finalLlm,
-      models_downloaded: true,
-    }).catch(() => {});
-
-    completeSetup({
+    // completeSetup esegue in sequenza: POST /settings/storage (atteso) e poi PATCH /settings
+    await completeSetup({
       storagePath,
       whisperModel: finalWhisper,
       embeddingModel: finalEmbedding,

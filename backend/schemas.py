@@ -47,8 +47,8 @@ class LectureCreate(BaseModel):
     raw_transcript: Optional[str] = None
     processed_notes: Optional[str] = None
     duration_seconds: Optional[float] = None
-    source_type: Optional[str] = "recorded"
-    in_quaderno: Optional[bool] = True
+    source_type: str = "recorded"
+    in_quaderno: bool = True
     detected_questions: Optional[str] = None
 
 
@@ -72,8 +72,8 @@ class LectureOut(BaseModel):
     processed_notes: Optional[str]
     audio_path: Optional[str]
     duration_seconds: Optional[float]
-    source_type: str = "recorded"
-    in_quaderno: bool = True
+    source_type: Optional[str] = "recorded"
+    in_quaderno: Optional[bool] = True
     detected_questions: Optional[str] = None
     created_at: datetime
 

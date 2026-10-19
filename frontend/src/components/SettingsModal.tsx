@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { 
   X, Folder, Cpu, Mic, HardDrive, Check, 
   RotateCcw, Sliders, Trash2, Download, Loader2,
@@ -21,6 +21,11 @@ type ModelFilterType = 'system_core' | 'llm';
 
 export default function SettingsModal({ isOpen, onClose }: Props) {
   const { settings, updateSettings, resetSetup } = useSettings();
+  // Ref per leggere le impostazioni correnti senza far ri-eseguire gli effetti a ogni aggiornamento
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+  const updateSettingsRef = useRef(updateSettings);
+  updateSettingsRef.current = updateSettings;
 
   const [activeTab, setActiveTab] = useState<TabType>('models');
   const [modelFilter, setModelFilter] = useState<ModelFilterType>('system_core');
@@ -89,8 +94,8 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       const res = await api.models.status();
       setModelsStatus(res);
       const hasReal = res.whisper?.some((m: any) => m.id !== 'mock_mode' && m.downloaded);
-      if (hasReal && !settings.modelsDownloaded) {
-        updateSettings({ modelsDownloaded: true });
+      if (hasReal && !settingsRef.current.modelsDownloaded) {
+        updateSettingsRef.current({ modelsDownloaded: true });
       }
     } catch (err) {
       console.warn('[SettingsModal] Errore verifica modelli:', err);
@@ -99,14 +104,15 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
     }
   }, []);
 
-  // Sincronizza lo stato quando il modale si apre
+  // Sincronizza lo stato solo all'apertura del modale (non a ogni modifica delle impostazioni)
   useEffect(() => {
     if (isOpen) {
-      setStoragePath(settings.storagePath);
-      setWhisperModel(settings.whisperModel);
-      setLlmModel(settings.llmModel);
-      setEmbeddingModel(settings.embeddingModel);
-      setVadSensitivity(settings.vadSensitivity);
+      const current = settingsRef.current;
+      setStoragePath(current.storagePath);
+      setWhisperModel(current.whisperModel);
+      setLlmModel(current.llmModel);
+      setEmbeddingModel(current.embeddingModel);
+      setVadSensitivity(current.vadSensitivity);
       setConfirmReset(false);
       setConfirmDeleteAll(false);
       setConfirmDeleteModelId(null);
@@ -114,7 +120,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       fetchModelsStatus();
       fetchStorageStats();
     }
-  }, [isOpen, settings, fetchModelsStatus, fetchStorageStats]);
+  }, [isOpen]);
 
   // Polling automatico attivo se un modello è in fase di download
   useEffect(() => {
@@ -248,12 +254,17 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
   const handlePickFolder = async () => {
     const selected = await pickFolder(storagePath);
     if (selected) {
+      const previous = storagePath;
       setStoragePath(selected);
-      updateSettings({ storagePath: selected });
-      api.settings.setStorage(selected).catch((err) => {
-        console.warn('Errore salvataggio storage:', err);
-      });
-      showNotification(`Cartella di archiviazione aggiornata nel Finder.`, 'success');
+      try {
+        // POST /settings/storage (una sola volta, atteso) gestito da updateSettings
+        await updateSettings({ storagePath: selected });
+        showNotification(`Cartella di archiviazione aggiornata nel Finder.`, 'success');
+        fetchStorageStats();
+      } catch (err: any) {
+        setStoragePath(previous);
+        showNotification(`Errore aggiornamento cartella: ${err?.message || err}`, 'error');
+      }
     }
   };
 

@@ -21,20 +21,17 @@ from config import (
     get_storage_path,
     get_uploads_dir,
 )
-from database import Lecture, Subject, engine
+import database
+from database import Lecture, Subject
 
 logger = logging.getLogger("sbobinai.cleaner")
 
 
 def get_all_audio_directories() -> List[str]:
     """Restituisce tutte le cartelle note in cui possono trovarsi file audio."""
-    dirs = [
-        get_audio_dir(),
-        os.path.join(REPO_DATA_DIR, "audio"),
-        os.path.join(REPO_DATA_DIR, "storage", "audio"),
-        os.path.expanduser("~/Documents/UniCoPilot/audio"),
-        os.path.expanduser("~/Documents/SbobinAI/audio"),
-    ]
+    # Solo la cartella dello storage attivo: le cartelle di altre radici (default,
+    # legacy UniCoPilot, data/ del repo) possono appartenere a un altro DB e non vanno toccate.
+    dirs = [get_audio_dir()]
     # Restituisce solo cartelle esistenti e uniche
     seen = set()
     valid_dirs = []
@@ -48,13 +45,7 @@ def get_all_audio_directories() -> List[str]:
 
 def get_all_uploads_directories() -> List[str]:
     """Restituisce tutte le cartelle note in cui possono trovarsi materiali e upload."""
-    dirs = [
-        get_uploads_dir(),
-        os.path.join(REPO_DATA_DIR, "uploads"),
-        os.path.join(REPO_DATA_DIR, "storage", "uploads"),
-        os.path.expanduser("~/Documents/UniCoPilot/uploads"),
-        os.path.expanduser("~/Documents/SbobinAI/uploads"),
-    ]
+    dirs = [get_uploads_dir()]
     seen = set()
     valid_dirs = []
     for d in dirs:
@@ -68,7 +59,7 @@ def get_all_uploads_directories() -> List[str]:
 def vacuum_sqlite() -> bool:
     """Esegue VACUUM su SQLite per deframmentare il file e restituire i blocchi al filesystem."""
     try:
-        with engine.connect() as conn:
+        with database.engine.connect() as conn:
             conn.execute(text("VACUUM;"))
             conn.commit()
         logger.info("[Cleaner] VACUUM SQLite eseguito con successo.")
@@ -130,6 +121,22 @@ def cleanup_orphan_files(db: Session = None) -> Dict[str, Any]:
                 valid_audio_basenames.add(os.path.basename(norm_p))
 
         valid_subject_ids: Set[int] = {s.id for s in subjects}
+
+        # Salvaguardia: con un DB vuoto (nuovo storage, DB non leggibile, fallback di percorso)
+        # ogni file sembrerebbe orfano → non cancellare nulla.
+        if not valid_subject_ids:
+            logger.warning("[Cleaner] Nessuna materia nel DB: bonifica file saltata per sicurezza.")
+            return {
+                "status": "skipped",
+                "freed_bytes": 0,
+                "freed_mb": 0.0,
+                "deleted_audio_files": [],
+                "deleted_upload_dirs": [],
+                "deleted_db_files": [],
+                "vacuum_executed": False,
+                "lancedb_optimized": False,
+                "message": "Database vuoto: pulizia dei file saltata per sicurezza.",
+            }
 
         logger.info(
             f"[Cleaner] Inizio scansione file orfani: {len(valid_lecture_ids)} lezioni attive, "

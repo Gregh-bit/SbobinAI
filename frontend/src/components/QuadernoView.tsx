@@ -41,6 +41,8 @@ interface Props {
   ) => Promise<Lecture>;
   onOpenAddMaterialModal?: () => void;
   onOpenSettings?: () => void;
+  /** Aggiorna solo lo stato locale di una lezione (il backend ha già persistito la modifica) */
+  onLocalLectureUpdate?: (id: number, updater: (lecture: Lecture) => Lecture) => void;
 }
 
 function formatDate(dateStr: string): string {
@@ -82,6 +84,7 @@ export default function QuadernoView({
   onUpdateLecture,
   onOpenAddMaterialModal,
   onOpenSettings,
+  onLocalLectureUpdate,
 }: Props) {
   const { settings } = useSettings();
   const [selectedLectureId, setSelectedLectureId] = useState<number | null>(
@@ -138,18 +141,27 @@ export default function QuadernoView({
 
   const handleAnswerQuestion = async (questionId: string) => {
     if (!selectedLecture) return;
+    const lectureId = selectedLecture.id;
     setAnsweringQuestionId(questionId);
     try {
-      const res = await api.lectures.answerQuestion(selectedLecture.id, questionId);
-      if (res?.question) {
-        const updatedQuestions = parsedQuestions.map((q, idx) => {
-          if (q.id === questionId || `q-${idx}` === questionId) {
-            return { ...q, suggestedAnswer: res.answer };
+      const res = await api.lectures.answerQuestion(lectureId, questionId);
+      if (res?.question && onLocalLectureUpdate) {
+        // Il backend ha già salvato la risposta: aggiorniamo solo lo stato locale,
+        // partendo dallo stato più recente della lezione (nessun PATCH da stato obsoleto)
+        onLocalLectureUpdate(lectureId, (lecture) => {
+          let list: DetectedQuestion[] = [];
+          try {
+            const parsed = lecture.detected_questions ? JSON.parse(lecture.detected_questions) : [];
+            list = Array.isArray(parsed) ? parsed : [];
+          } catch {
+            list = [];
           }
-          return q;
-        });
-        await onUpdateLecture(selectedLecture.id, {
-          detected_questions: JSON.stringify(updatedQuestions),
+          const merged = list.map((q, idx) =>
+            (q.id ? String(q.id) === questionId : String(idx) === questionId)
+              ? { ...q, ...res.question, suggestedAnswer: res.answer || res.question.suggestedAnswer }
+              : q
+          );
+          return { ...lecture, detected_questions: JSON.stringify(merged) };
         });
       }
     } catch (err: any) {
@@ -231,16 +243,25 @@ export default function QuadernoView({
 
   // Carica i segnalibri quando cambia la lezione selezionata
   useEffect(() => {
+    // Ignora risposte arrivate dopo il cambio di lezione
+    let alive = true;
     if (selectedLecture?.id) {
       api.bookmarks.listByLecture(selectedLecture.id)
-        .then((bms) => setBookmarks(Array.isArray(bms) ? bms : []))
-        .catch(() => setBookmarks([]));
+        .then((bms) => {
+          if (alive) setBookmarks(Array.isArray(bms) ? bms : []);
+        })
+        .catch(() => {
+          if (alive) setBookmarks([]);
+        });
     } else {
       setBookmarks([]);
     }
     setIsPlaying(false);
     setCurrentTime(0);
     setAudioDuration(selectedLecture?.duration_seconds || 0);
+    return () => {
+      alive = false;
+    };
   }, [selectedLecture?.id]);
 
   const toggleAudioPlay = () => {
@@ -394,7 +415,7 @@ export default function QuadernoView({
 
   const handleDeleteSavedQuestion = async (targetId: string) => {
     if (!selectedLecture) return;
-    const updated = parsedQuestions.filter((q, idx) => (q.id || `q-${idx}`) !== targetId);
+    const updated = parsedQuestions.filter((q, idx) => (q.id || String(idx)) !== targetId);
     try {
       await onUpdateLecture(selectedLecture.id, {
         detected_questions: updated.length > 0 ? JSON.stringify(updated) : null,
@@ -894,7 +915,8 @@ export default function QuadernoView({
                       {parsedQuestions.map((q, idx) => {
                         const hasModel = Boolean(settings.modelsDownloaded);
                         const isPending = isPlaceholderAnswer(q.suggestedAnswer);
-                        const qKey = q.id || `q-${idx}`;
+                        // Fallback sull'indice: il backend riconosce le domande anche per posizione
+                        const qKey = q.id || String(idx);
                         const isAnswering = answeringQuestionId === qKey;
 
                         return (
@@ -1205,8 +1227,12 @@ export default function QuadernoView({
               {/* Opzione 2: Elimina definitivamente */}
               <button
                 onClick={async () => {
-                  await onDeletePermanently(selectedLecture.id);
-                  setShowDeleteModal(false);
+                  try {
+                    await onDeletePermanently(selectedLecture.id);
+                    setShowDeleteModal(false);
+                  } catch (err) {
+                    console.error('Impossibile eliminare la lezione:', err);
+                  }
                 }}
                 className="w-full p-3.5 rounded-2xl bg-red-500/10 hover:bg-red-500/15 border border-red-500/20 text-left transition-all group flex items-start gap-3"
               >

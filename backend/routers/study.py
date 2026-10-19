@@ -24,8 +24,10 @@ from sqlalchemy.orm import Session
 
 from config import get_uploads_dir
 from database import Lecture, Subject, get_db
-from llm_engine import DEFAULT_LLM_MODEL, _cancel_generation_event, _clean_thinking_artifacts, _format_chat_prompt, clear_metal_cache, get_or_load_model, is_model_downloaded
-from rag import query_context
+import llm_engine
+import rag
+from config import load_settings
+from llm_engine import DEFAULT_LLM_MODEL, clear_metal_cache, is_model_downloaded
 
 logger = logging.getLogger("sbobinai")
 
@@ -54,6 +56,20 @@ class QuizQuestionItem(BaseModel):
     source_lecture: str
 
 
+def _resolve_llm_model(requested: Optional[str]) -> str:
+    """Modello richiesto dal client, altrimenti quello scelto nelle impostazioni, altrimenti il default."""
+    return requested or load_settings().get("llm_model") or DEFAULT_LLM_MODEL
+
+
+def _as_index(value, default: int = 0) -> int:
+    """L'LLM restituisce spesso l'indice come stringa ("2"): accettalo."""
+    try:
+        idx = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return idx if 0 <= idx <= 3 else default
+
+
 # ── 1. Generatore Quiz a Scelta Multipla ───────────────────────────────────────
 
 @router.post("/{subject_id}/generate-quiz")
@@ -70,7 +86,7 @@ async def generate_quiz_endpoint(
     if not subject:
         raise HTTPException(status_code=404, detail="Materia non trovata.")
 
-    llm_model = payload.model_id or DEFAULT_LLM_MODEL
+    llm_model = _resolve_llm_model(payload.model_id)
     if not is_model_downloaded(llm_model):
         raise HTTPException(
             status_code=400,
@@ -104,13 +120,15 @@ async def generate_quiz_endpoint(
     if not full_context:
         full_context = f"Corso: {subject.name}. {subject.description or ''}"
 
+    n_q = max(1, min(10, int(payload.num_questions or 5)))
+    ids_hint = ", ".join(f'"q{i + 1}"' for i in range(n_q))
     system_prompt = (
-        "Sei un docente universitario. Formula 5 domande a risposta multipla rigorose per preparare lo studente all'esame.\n"
+        f"Sei un docente universitario. Formula {n_q} domande a risposta multipla rigorose per preparare lo studente all'esame.\n"
         "REGOLE ASSOLUTE:\n"
-        "1. Restituisci ESCLUSIVAMENTE un array JSON valido con 5 oggetti.\n"
+        f"1. Restituisci ESCLUSIVAMENTE un array JSON valido con {n_q} oggetti.\n"
         "2. Nessun testo prima o dopo il JSON, nessun convenevole, nessun blocco <think>.\n"
         "3. Struttura esatta di ogni oggetto:\n"
-        '   - "id": "q1", "q2", "q3", "q4", "q5"\n'
+        f'   - "id": {ids_hint}\n'
         '   - "question": testo chiaro della domanda\n'
         '   - "options": 4 opzioni plausibili di risposta\n'
         '   - "correct_index": intero da 0 a 3 che indica l\'opzione esatta\n'
@@ -121,56 +139,22 @@ async def generate_quiz_endpoint(
     user_prompt = (
         f"Materia: {subject.name}\n"
         f"Contesto riassuntivo del corso:\n{full_context}\n\n"
-        "Genera le 5 domande del quiz in formato JSON ora:"
+        f"Genera le {n_q} domande del quiz in formato JSON ora:"
     )
 
-    def _run_inference() -> str:
-        import mlx_lm
-        import llm_engine
-        llm_engine._cancel_generation_event.clear()
-        llm_engine._is_generating = True
-        llm_engine._current_task = f"Quiz: {subject.name}"
-        try:
-            model, tokenizer = get_or_load_model(llm_model)
-
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ]
-            prompt_str = _format_chat_prompt(
-                tokenizer,
-                messages,
-                fallback_str=f"{system_prompt}\n\n{user_prompt}\n\n```json\n["
-            )
-            if prompt_str.endswith("assistant\n") or prompt_str.endswith("<|im_start|>assistant\n"):
-                prompt_str += "```json\n["
-            elif not prompt_str.endswith("["):
-                prompt_str += "\n```json\n["
-
-            logger.info(f"[Study Quiz] Avvio stream_generate per quiz su '{subject.name}' (max_tokens=650)...")
-            full_text = "["
-            for response in mlx_lm.stream_generate(
-                model=model,
-                tokenizer=tokenizer,
-                prompt=prompt_str,
-                max_tokens=650,
-                kv_bits=4,
-                kv_group_size=64,
-            ):
-                if llm_engine._cancel_generation_event.is_set():
-                    break
-                full_text += response.text
-
-            clear_metal_cache()
-            logger.info(f"[Study Quiz] Generazione completata ({len(full_text)} caratteri).")
-            return _clean_thinking_artifacts(full_text)
-        finally:
-            llm_engine._is_generating = False
-            llm_engine._current_task = ""
-
     try:
-        loop = asyncio.get_running_loop()
-        raw_output = await loop.run_in_executor(None, _run_inference)
+        # generate_text include il prefisso "```json\n[" nel testo restituito
+        raw_output = await asyncio.to_thread(
+            llm_engine.generate_text,
+            system_prompt,
+            user_prompt,
+            model_id=llm_model,
+            max_tokens=650 if n_q <= 5 else 130 * n_q,
+            assistant_prefix="```json\n[",
+            task_label=f"Quiz: {subject.name}",
+            kv_bits=4,
+        )
+        logger.info(f"[Study Quiz] Generazione completata ({len(raw_output)} caratteri).")
 
         # Pulizia JSON
         clean_json = raw_output.strip()
@@ -219,16 +203,17 @@ async def generate_quiz_endpoint(
         # Normalizza campi
         formatted_questions = []
         for i, item in enumerate(questions):
+            if not isinstance(item, dict):
+                continue
             opts = item.get("options", [])
             if not isinstance(opts, list) or len(opts) < 2:
                 continue
+            opts = [str(o) for o in opts]
             while len(opts) < 4:
                 opts.append(f"Opzione alternativa {len(opts) + 1}")
             opts = opts[:4]
 
-            corr_idx = item.get("correct_index", 0)
-            if not isinstance(corr_idx, int) or corr_idx < 0 or corr_idx > 3:
-                corr_idx = 0
+            corr_idx = _as_index(item.get("correct_index", 0))
 
             formatted_questions.append({
                 "id": str(item.get("id") or f"q-{i+1}"),
@@ -241,6 +226,7 @@ async def generate_quiz_endpoint(
 
         if not formatted_questions:
             raise ValueError("Nessuna domanda valida estratta.")
+        formatted_questions = formatted_questions[:n_q]
 
         return {
             "status": "success",
@@ -269,9 +255,10 @@ async def generate_quiz_endpoint(
             })
 
         return {
-            "status": "success",
+            "status": "fallback",
             "subject_id": subject_id,
             "questions": fallback_qs,
+            "warning": "Il modello non ha prodotto un quiz valido: mostro domande guida generiche sulle lezioni.",
         }
 
 
@@ -290,7 +277,7 @@ async def generate_oral_question_endpoint(
     if not subject:
         raise HTTPException(status_code=404, detail="Materia non trovata.")
 
-    llm_model = payload.model_id or DEFAULT_LLM_MODEL
+    llm_model = _resolve_llm_model(payload.model_id)
     if not is_model_downloaded(llm_model):
         raise HTTPException(
             status_code=400,
@@ -311,33 +298,15 @@ async def generate_oral_question_endpoint(
 
     user_prompt = f"Materia: {subject.name}\nArgomenti trattati a lezione: {topics_str}\n\nFormula la domanda per il colloquio orale:"
 
-    def _run() -> str:
-        import mlx_lm
-        import llm_engine
-        llm_engine._cancel_generation_event.clear()
-        llm_engine._is_generating = True
-        llm_engine._current_task = f"Domanda Orale: {subject.name}"
-        try:
-            model, tokenizer = get_or_load_model(llm_model)
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ]
-            prompt_str = _format_chat_prompt(tokenizer, messages, fallback_str=f"{system_prompt}\n\n{user_prompt}")
-            full = ""
-            for resp in mlx_lm.stream_generate(model=model, tokenizer=tokenizer, prompt=prompt_str, max_tokens=120):
-                if llm_engine._cancel_generation_event.is_set():
-                    break
-                full += resp.text
-            clear_metal_cache()
-            return _clean_thinking_artifacts(full).strip()
-        finally:
-            llm_engine._is_generating = False
-            llm_engine._current_task = ""
-
     try:
-        loop = asyncio.get_running_loop()
-        question = await loop.run_in_executor(None, _run)
+        question = await asyncio.to_thread(
+            llm_engine.generate_text,
+            system_prompt,
+            user_prompt,
+            model_id=llm_model,
+            max_tokens=120,
+            task_label=f"Domanda Orale: {subject.name}",
+        )
         question = question.strip(' "\'\n')
         return {
             "status": "success",
@@ -356,6 +325,11 @@ async def generate_oral_question_endpoint(
 
 # ── 3. Valutazione Risposta Vocale (Colloquio Orale) ───────────────────────────
 
+def _save_upload(upload: UploadFile, path: str) -> None:
+    with open(path, "wb") as bf:
+        shutil.copyfileobj(upload.file, bf)
+
+
 @router.post("/{subject_id}/evaluate-oral")
 async def evaluate_oral_answer_endpoint(
     subject_id: int,
@@ -373,7 +347,7 @@ async def evaluate_oral_answer_endpoint(
     if not subject:
         raise HTTPException(status_code=404, detail="Materia non trovata.")
 
-    llm_model = model_id or DEFAULT_LLM_MODEL
+    llm_model = _resolve_llm_model(model_id)
     if not is_model_downloaded(llm_model):
         raise HTTPException(
             status_code=400,
@@ -382,26 +356,19 @@ async def evaluate_oral_answer_endpoint(
 
     # 1. Salva file audio temporaneo
     temp_dir = tempfile.gettempdir()
-    temp_audio_path = os.path.join(temp_dir, f"oral_answer_{uuid.uuid4().hex[:8]}.wav")
-    with open(temp_audio_path, "wb") as bf:
-        shutil.copyfileobj(audio.file, bf)
+    ext = os.path.splitext(audio.filename or "")[1].lower()
+    if ext not in (".wav", ".webm", ".m4a", ".mp4", ".ogg", ".mp3"):
+        ext = ".wav"
+    temp_audio_path = os.path.join(temp_dir, f"oral_answer_{uuid.uuid4().hex[:8]}{ext}")
+    await asyncio.to_thread(_save_upload, audio, temp_audio_path)
 
     # 2. Trascrizione con mlx-whisper (Greedy decoding, language 'it')
     student_transcript = ""
     try:
-        import mlx_whisper
-        from transcriber import TARGET_HF_REPO, get_local_snapshot_dir
-        model_target = get_local_snapshot_dir(TARGET_HF_REPO) or TARGET_HF_REPO
-
-        logger.info(f"[Oral Evaluation] Trascrizione vocale studente con {model_target}...")
-        whisper_res = mlx_whisper.transcribe(
-            temp_audio_path,
-            path_or_hf_repo=model_target,
-            language="it",
-            temperature=(0.0,),
-            fp16=True,
-        )
-        student_transcript = whisper_res.get("text", "").strip()
+        from transcriber import transcribe_file
+        logger.info("[Oral Evaluation] Trascrizione vocale studente...")
+        student_transcript, _dur = await asyncio.to_thread(transcribe_file, temp_audio_path, "it")
+        student_transcript = (student_transcript or "").strip()
     except Exception as exc:
         logger.error(f"[Oral Evaluation] Errore trascrizione Whisper: {exc}")
     finally:
@@ -423,7 +390,8 @@ async def evaluate_oral_answer_endpoint(
         }
 
     # 3. Recupera contesto ufficiale da LanceDB e SQLite
-    official_context = query_context(
+    official_context = await asyncio.to_thread(
+        rag.query_context,
         subject_id=subject_id,
         query=f"{question}\n{student_transcript}",
         top_k=3,
@@ -461,35 +429,17 @@ RISPOSTA ORALE DELLO STUDENTE:
 
 Fornisci ora la scheda di valutazione in JSON:"""
 
-    def _run_eval() -> str:
-        import mlx_lm
-        import llm_engine
-        llm_engine._cancel_generation_event.clear()
-        llm_engine._is_generating = True
-        llm_engine._current_task = f"Valutazione Orale: {subject.name}"
-        try:
-            model, tokenizer = get_or_load_model(llm_model)
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ]
-            prompt_str = _format_chat_prompt(tokenizer, messages, fallback_str=f"{system_prompt}\n\n{user_prompt}\n\n```json\n")
-            if prompt_str.endswith("assistant\n") or prompt_str.endswith("<|im_start|>assistant\n"):
-                prompt_str += "```json\n"
-            full = ""
-            for resp in mlx_lm.stream_generate(model=model, tokenizer=tokenizer, prompt=prompt_str, max_tokens=650, kv_bits=4):
-                if llm_engine._cancel_generation_event.is_set():
-                    break
-                full += resp.text
-            clear_metal_cache()
-            return _clean_thinking_artifacts(full).strip()
-        finally:
-            llm_engine._is_generating = False
-            llm_engine._current_task = ""
-
     try:
-        loop = asyncio.get_running_loop()
-        eval_raw = await loop.run_in_executor(None, _run_eval)
+        eval_raw = await asyncio.to_thread(
+            llm_engine.generate_text,
+            system_prompt,
+            user_prompt,
+            model_id=llm_model,
+            max_tokens=650,
+            assistant_prefix="```json\n",
+            task_label=f"Valutazione Orale: {subject.name}",
+            kv_bits=4,
+        )
 
         # Pulizia JSON
         clean_json = eval_raw.strip()
@@ -504,6 +454,13 @@ Fornisci ora la scheda di valutazione in JSON:"""
             clean_json = clean_json[start_idx : end_idx + 1]
 
         eval_data = json.loads(clean_json)
+        if not isinstance(eval_data, dict):
+            raise ValueError("Valutazione non in formato oggetto JSON")
+        try:
+            score = max(0, min(30, int(eval_data.get("score_num", 25))))
+        except (TypeError, ValueError):
+            score = 25
+        eval_data["score_num"] = score
 
         return {
             "status": "success",
@@ -517,12 +474,14 @@ Fornisci ora la scheda di valutazione in JSON:"""
     except Exception as exc:
         logger.error(f"[Oral Evaluation] Errore inferenza valutazione: {exc}", exc_info=True)
         clear_metal_cache()
+        # Nessun voto inventato: lo studente deve sapere che la valutazione non è stata generata
         return {
-            "status": "success",
+            "status": "fallback",
             "student_transcript": student_transcript,
-            "grade": "24/30",
-            "score_num": 24,
-            "good_points": "Hai risposto in modo comprensibile affrontando l'argomento richiesto.",
-            "missing_or_errors": "Integrare con riferimenti formali specifici dal Quaderno della lezione.",
+            "grade": "N.C.",
+            "score_num": 0,
+            "good_points": "Valutazione automatica non disponibile: il modello non ha prodotto una scheda valida.",
+            "missing_or_errors": "Riprova la valutazione; se il problema persiste verifica il modello LLM nelle Impostazioni.",
             "ideal_formulation": "Definire prima il contesto generale, citare la distinzione teorica principale e concludere con un esempio concreto.",
+            "warning": f"Valutazione non generata: {exc}",
         }

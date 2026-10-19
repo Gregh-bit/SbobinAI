@@ -13,6 +13,7 @@
   "dependencies": {
     "@tauri-apps/plugin-dialog": "^2.8.3",
     "clsx": "^2.1.1",
+    "dompurify": "^3.4.17",
     "framer-motion": "^14.3.0",
     "lucide-react": "^0.441.0",
     "marked": "^18.1.1",

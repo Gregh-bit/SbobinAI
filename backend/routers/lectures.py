@@ -15,6 +15,9 @@ from rag import delete_lecture_vectors
 
 router = APIRouter(prefix="/lectures", tags=["Lectures"])
 
+# Colonne NOT NULL / con default: un null esplicito dal client va ignorato, non scritto
+_NON_NULLABLE_FIELDS = ("title", "date", "source_type", "in_quaderno")
+
 
 # ── Lectures ───────────────────────────────────────────────────────────────────
 
@@ -33,7 +36,11 @@ def create_lecture(payload: LectureCreate, db: Session = Depends(get_db)):
     subject = db.query(Subject).filter(Subject.id == payload.subject_id).first()
     if not subject:
         raise HTTPException(status_code=404, detail="Materia non trovata.")
-    lecture = Lecture(**payload.model_dump())
+    data = payload.model_dump()
+    for f in _NON_NULLABLE_FIELDS:
+        if data.get(f) is None:
+            data.pop(f, None)
+    lecture = Lecture(**data)
     db.add(lecture)
     db.commit()
     db.refresh(lecture)
@@ -54,6 +61,8 @@ def update_lecture(lecture_id: int, payload: LectureUpdate, db: Session = Depend
     if not lecture:
         raise HTTPException(status_code=404, detail="Lezione non trovata.")
     for field, value in payload.model_dump(exclude_unset=True).items():
+        if value is None and field in _NON_NULLABLE_FIELDS:
+            continue
         setattr(lecture, field, value)
     db.commit()
     db.refresh(lecture)

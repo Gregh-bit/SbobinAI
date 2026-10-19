@@ -52,6 +52,8 @@ class LiveSession:
         self.started_at = time.time()
         self.is_active: bool = True
         self.is_paused: bool = False
+        # True quando la sessione è stata chiusa e persistita (evita doppio salvataggio)
+        self.finalized: bool = False
         self._pause_started_at: float = 0.0
         self._total_paused_duration: float = 0.0
 
@@ -212,10 +214,22 @@ def get_session(subject_id: int) -> Optional[LiveSession]:
     return _active_sessions.get(subject_id)
 
 
-def end_session(subject_id: int) -> Optional[tuple[LiveSession, Optional[str]]]:
-    """Termina la sessione, salva il file audio ed elimina la sessione dal registry."""
-    session = _active_sessions.pop(subject_id, None)
-    if session:
-        audio_path = session.stop()
-        return session, audio_path
-    return None
+def has_active_sessions() -> bool:
+    """True se almeno una registrazione live è in corso (su qualsiasi materia)."""
+    return any(s.is_active for s in _active_sessions.values())
+
+
+def end_session(
+    subject_id: int, session: Optional[LiveSession] = None
+) -> Optional[tuple[LiveSession, Optional[str]]]:
+    """
+    Termina la sessione, salva il file audio ed elimina la sessione dal registry.
+    Se `session` è indicata, termina solo se è ancora quella registrata per la materia
+    (evita che la disconnessione di un socket vecchio chiuda la sessione di uno nuovo).
+    """
+    current = _active_sessions.get(subject_id)
+    if current is None or (session is not None and current is not session):
+        return None
+    _active_sessions.pop(subject_id, None)
+    audio_path = current.stop()
+    return current, audio_path

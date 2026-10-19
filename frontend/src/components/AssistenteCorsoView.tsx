@@ -59,22 +59,8 @@ export default function AssistenteCorsoView({ subject }: Props) {
     }
   }, [messages, chatStorageKey]);
 
-  // Se l'utente seleziona una materia diversa, carica la chat di quella specifica materia
-  useEffect(() => {
-    try {
-      const saved = localStorage.getItem(`sbobinai_chat_subject_${subject.id}`);
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          setMessages(parsed);
-          return;
-        }
-      }
-    } catch {
-      // ignore
-    }
-    setMessages(INITIAL_MESSAGES.default);
-  }, [subject.id]);
+  // Nota: al cambio di materia il componente viene rimontato (key={subject.id}),
+  // quindi la chat della nuova materia viene caricata dall'inizializzatore di useState.
 
   const handleClearChat = () => {
     try {
@@ -91,6 +77,8 @@ export default function AssistenteCorsoView({ subject }: Props) {
 
   useEffect(() => {
     return () => {
+      // Interrompe lo streaming in corso se la vista viene smontata (es. cambio materia)
+      abortControllerRef.current?.abort();
       if (recognitionRef.current) {
         try {
           recognitionRef.current.stop();

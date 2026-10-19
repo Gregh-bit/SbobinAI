@@ -19,6 +19,7 @@ function MainApp() {
   const [, setActiveLecture] = useState<Lecture | null>(null);
   const [loadingSubjects, setLoadingSubjects] = useState(true);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
 
   const loadSubjects = useCallback(async () => {
     setLoadingSubjects(true);
@@ -58,10 +59,11 @@ function MainApp() {
     form: { name: string; description: string; keywords: string; color: string }
   ) => {
     try {
+      // null (e non undefined) per permettere di svuotare descrizione e parole chiave
       const updated = await api.subjects.update(id, {
         name: form.name,
-        description: form.description || undefined,
-        whisper_prompt_keywords: form.keywords || undefined,
+        description: form.description.trim() ? form.description : null,
+        whisper_prompt_keywords: form.keywords.trim() ? form.keywords : null,
         color: form.color,
       });
       setSubjects((prev) => prev.map((s) => (s.id === id ? { ...s, ...updated } : s)));
@@ -75,11 +77,8 @@ function MainApp() {
   };
 
   const handleDeleteSubject = async (id: number) => {
-    try {
-      await api.subjects.delete(id);
-    } catch {
-      // Procedi con la rimozione locale
-    }
+    // Se l'eliminazione fallisce l'errore viene propagato (mostrato nella Sidebar) e il corso resta in lista
+    await api.subjects.delete(id);
     const remaining = subjects.filter((s) => s.id !== id);
     setSubjects(remaining);
     if (selectedSubject?.id === id) {
@@ -89,6 +88,8 @@ function MainApp() {
   };
 
   const handleSelectSubject = (subject: Subject) => {
+    // Durante una registrazione live non è possibile cambiare corso
+    if (isRecording && subject.id !== selectedSubject?.id) return;
     setSelectedSubject(subject);
     setActiveLecture(null);
   };
@@ -115,13 +116,16 @@ function MainApp() {
             onUpdate={handleUpdateSubject}
             onDelete={handleDeleteSubject}
             isLoading={loadingSubjects}
+            isRecording={isRecording}
             onOpenSettings={() => setShowSettingsModal(true)}
           />
 
           <main className="flex-1 flex flex-col overflow-hidden relative">
             {selectedSubject ? (
               <SubjectDashboard
+                key={selectedSubject.id}
                 subject={selectedSubject}
+                onRecordingChange={setIsRecording}
                 onStartLecture={handleStartLecture}
                 onOpenSettings={() => setShowSettingsModal(true)}
               />

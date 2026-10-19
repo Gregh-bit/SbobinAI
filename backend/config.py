@@ -9,14 +9,51 @@ import json
 import logging
 import os
 import shutil
+import sys
+import threading
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger("sbobinai.config")
 
+
+def _documents_dir() -> str:
+    """
+    Cartella Documenti dell'utente. Su Windows usa la Known Folder di sistema,
+    che può essere reindirizzata (es. OneDrive/Documents) e non coincidere con ~/Documents.
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            import uuid
+
+            class _GUID(ctypes.Structure):
+                _fields_ = [("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+                            ("Data3", wintypes.WORD), ("Data4", wintypes.BYTE * 8)]
+
+            u = uuid.UUID("{FDD39AD0-238F-46AF-ADB4-6C85480369C7}")  # FOLDERID_Documents
+            guid = _GUID(u.fields[0], u.fields[1], u.fields[2], (wintypes.BYTE * 8)(*u.bytes[8:]))
+            out = ctypes.c_wchar_p()
+            if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None, ctypes.byref(out)) == 0:
+                path = out.value
+                ctypes.windll.ole32.CoTaskMemFree(out)
+                if path:
+                    return path
+        except Exception:
+            pass
+    return os.path.expanduser(os.path.join("~", "Documents"))
+
+
+def _same_path(a: str, b: str) -> bool:
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
-DEFAULT_STORAGE_ROOT = os.path.expanduser("~/Documents/SbobinAI")
-LEGACY_STORAGE_ROOT = os.path.expanduser("~/Documents/UniCoPilot")
+# SBOBINAI_SETTINGS_FILE permette di usare un file alternativo (test, profili separati)
+SETTINGS_FILE = os.environ.get("SBOBINAI_SETTINGS_FILE") or os.path.join(BASE_DIR, "settings.json")
+DOCUMENTS_DIR = _documents_dir()
+DEFAULT_STORAGE_ROOT = os.path.join(DOCUMENTS_DIR, "SbobinAI")
+LEGACY_STORAGE_ROOT = os.path.join(DOCUMENTS_DIR, "UniCoPilot")
 REPO_DATA_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "data"))
 
 DEFAULT_SETTINGS: Dict[str, Any] = {
@@ -29,15 +66,26 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
 }
 
 
+# Serializza letture/scritture di settings.json tra i thread del server
+SETTINGS_LOCK = threading.RLock()
+
+
 def load_settings() -> Dict[str, Any]:
     """Carica le impostazioni da settings.json o crea il file con valori di default."""
-    if not os.path.exists(SETTINGS_FILE):
-        save_settings(DEFAULT_SETTINGS)
-        return dict(DEFAULT_SETTINGS)
+    with SETTINGS_LOCK:
+        if not os.path.exists(SETTINGS_FILE):
+            save_settings(DEFAULT_SETTINGS)
+            return dict(DEFAULT_SETTINGS)
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            logger.error(f"[Config] Errore lettura {SETTINGS_FILE}: {e}. Uso defaults.")
+            return dict(DEFAULT_SETTINGS)
 
     try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("settings.json non contiene un oggetto JSON")
         merged = dict(DEFAULT_SETTINGS)
         merged.update(data)
         # Migrazione da vecchio ollama_model a llm_model puro MLX
@@ -56,7 +104,7 @@ def load_settings() -> Dict[str, Any]:
         # Normalizza storage_path e migra da UniCoPilot a SbobinAI
         if "storage_path" in merged and merged["storage_path"]:
             sp = os.path.abspath(os.path.expanduser(merged["storage_path"]))
-            if sp.endswith("/Documents/UniCoPilot"):
+            if _same_path(sp, LEGACY_STORAGE_ROOT):
                 sp = DEFAULT_STORAGE_ROOT
             merged["storage_path"] = sp
         return merged
@@ -66,14 +114,26 @@ def load_settings() -> Dict[str, Any]:
 
 
 def save_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
-    """Salva le impostazioni nel file settings.json."""
-    try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(settings, f, indent=2, ensure_ascii=False)
-        logger.info(f"[Config] Impostazioni salvate in {SETTINGS_FILE}")
-    except Exception as e:
-        logger.error(f"[Config] Impossibile salvare {SETTINGS_FILE}: {e}")
+    """Salva le impostazioni nel file settings.json (scrittura atomica)."""
+    with SETTINGS_LOCK:
+        tmp = SETTINGS_FILE + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(settings, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, SETTINGS_FILE)
+            logger.info(f"[Config] Impostazioni salvate in {SETTINGS_FILE}")
+        except Exception as e:
+            logger.error(f"[Config] Impossibile salvare {SETTINGS_FILE}: {e}")
     return settings
+
+
+def update_settings(changes: Dict[str, Any]) -> Dict[str, Any]:
+    """Applica `changes` a settings.json in modo atomico (load → merge → save sotto lock)."""
+    with SETTINGS_LOCK:
+        current = load_settings()
+        current.update(changes)
+        save_settings(current)
+        return current
 
 
 _active_storage_root: Optional[str] = None
@@ -90,7 +150,7 @@ def get_storage_path() -> str:
     expanded = os.path.abspath(os.path.expanduser(path))
 
     # Se punta a SbobinAI ma non esiste e UniCoPilot esiste, migra la directory
-    if (expanded == DEFAULT_STORAGE_ROOT or expanded.endswith("/Documents/SbobinAI")) and not os.path.exists(expanded):
+    if _same_path(expanded, DEFAULT_STORAGE_ROOT) and not os.path.exists(expanded):
         if os.path.exists(LEGACY_STORAGE_ROOT):
             try:
                 shutil.copytree(LEGACY_STORAGE_ROOT, expanded)
@@ -198,10 +258,11 @@ def update_storage_path(new_path: str, migrate_data: bool = True) -> Dict[str, A
     Aggiorna il percorso di archiviazione scelto dall'utente.
     Se richiesto, sposta il database e i file audio/uploads esistenti nella nuova directory.
     """
+    global _active_storage_root
     old_root = get_storage_path()
     expanded_new = os.path.abspath(os.path.expanduser(new_path))
 
-    if old_root == expanded_new:
+    if _same_path(old_root, expanded_new):
         dirs = ensure_storage_dirs()
         return {"status": "unchanged", "storage_path": expanded_new, "dirs": dirs}
 
@@ -288,9 +349,7 @@ def update_storage_path(new_path: str, migrate_data: bool = True) -> Dict[str, A
                         logger.warning(f"[Config] Errore copia lancedb {item}: {e}")
 
     # Salva le nuove impostazioni
-    settings = load_settings()
-    settings["storage_path"] = expanded_new
-    save_settings(settings)
+    update_settings({"storage_path": expanded_new})
 
     # Re-bind del database SQLAlchemy
     try:
@@ -298,6 +357,14 @@ def update_storage_path(new_path: str, migrate_data: bool = True) -> Dict[str, A
         rebind_database()
     except Exception as e:
         logger.warning(f"[Config] Rebind database: {e}")
+
+    # Riapre LanceDB sulla nuova cartella
+    try:
+        import rag
+        if hasattr(rag, "reset_connection"):
+            rag.reset_connection()
+    except Exception as e:
+        logger.warning(f"[Config] Reset connessione LanceDB: {e}")
 
     return {
         "status": "success",
