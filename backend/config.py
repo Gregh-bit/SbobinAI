@@ -1,0 +1,313 @@
+"""
+config.py — SbobinAI Configuration & Storage Management
+Gestisce la persistenza delle impostazioni locali in settings.json
+e calcola dinamicamente i percorsi di archiviazione per SQLite, Audio e Uploads.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import shutil
+from typing import Any, Dict, Optional
+
+logger = logging.getLogger("sbobinai.config")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SETTINGS_FILE = os.path.join(BASE_DIR, "settings.json")
+DEFAULT_STORAGE_ROOT = os.path.expanduser("~/Documents/SbobinAI")
+LEGACY_STORAGE_ROOT = os.path.expanduser("~/Documents/UniCoPilot")
+REPO_DATA_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "data"))
+
+DEFAULT_SETTINGS: Dict[str, Any] = {
+    "storage_path": DEFAULT_STORAGE_ROOT,
+    "whisper_model": "large-v3-turbo-q4",
+    "llm_model": "mlx-community/Qwen3.5-4B-MLX-4bit",
+    "embedding_model": "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ",
+    "vad_sensitivity": 2,
+    "models_downloaded": False,
+}
+
+
+def load_settings() -> Dict[str, Any]:
+    """Carica le impostazioni da settings.json o crea il file con valori di default."""
+    if not os.path.exists(SETTINGS_FILE):
+        save_settings(DEFAULT_SETTINGS)
+        return dict(DEFAULT_SETTINGS)
+
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        merged = dict(DEFAULT_SETTINGS)
+        merged.update(data)
+        # Migrazione da vecchio ollama_model a llm_model puro MLX
+        if "ollama_model" in merged:
+            if "llm_model" not in data:
+                merged["llm_model"] = "mlx-community/Qwen3.5-4B-MLX-4bit"
+            merged.pop("ollama_model", None)
+        # Migrazione modello embedding a Qwen3-Embedding-0.6B-4bit-DWQ (1024 dim)
+        if merged.get("embedding_model") in (
+            "mlx-community/bge-small-en-v1.5-mlx",
+            "mlx-community/multilingual-e5-small-mlx",
+            "bge-small-en",
+            "multilingual-e5-small",
+        ):
+            merged["embedding_model"] = "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"
+        # Normalizza storage_path e migra da UniCoPilot a SbobinAI
+        if "storage_path" in merged and merged["storage_path"]:
+            sp = os.path.abspath(os.path.expanduser(merged["storage_path"]))
+            if sp.endswith("/Documents/UniCoPilot"):
+                sp = DEFAULT_STORAGE_ROOT
+            merged["storage_path"] = sp
+        return merged
+    except Exception as e:
+        logger.error(f"[Config] Errore lettura {SETTINGS_FILE}: {e}. Uso defaults.")
+        return dict(DEFAULT_SETTINGS)
+
+
+def save_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
+    """Salva le impostazioni nel file settings.json."""
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2, ensure_ascii=False)
+        logger.info(f"[Config] Impostazioni salvate in {SETTINGS_FILE}")
+    except Exception as e:
+        logger.error(f"[Config] Impossibile salvare {SETTINGS_FILE}: {e}")
+    return settings
+
+
+_active_storage_root: Optional[str] = None
+
+
+def get_storage_path() -> str:
+    """Restituisce il percorso root di archiviazione configurato dall'utente."""
+    global _active_storage_root
+    if _active_storage_root:
+        return _active_storage_root
+
+    settings = load_settings()
+    path = settings.get("storage_path") or DEFAULT_STORAGE_ROOT
+    expanded = os.path.abspath(os.path.expanduser(path))
+
+    # Se punta a SbobinAI ma non esiste e UniCoPilot esiste, migra la directory
+    if (expanded == DEFAULT_STORAGE_ROOT or expanded.endswith("/Documents/SbobinAI")) and not os.path.exists(expanded):
+        if os.path.exists(LEGACY_STORAGE_ROOT):
+            try:
+                shutil.copytree(LEGACY_STORAGE_ROOT, expanded)
+                logger.info(f"[Config] Cartella legacy migrata con successo: {LEGACY_STORAGE_ROOT} -> {expanded}")
+            except Exception as e:
+                logger.warning(f"[Config] Errore migrazione automatica cartella legacy {LEGACY_STORAGE_ROOT}: {e}")
+
+    # Prova di accesso
+    try:
+        os.makedirs(expanded, exist_ok=True)
+        _active_storage_root = expanded
+        return expanded
+    except (PermissionError, OSError) as e:
+        logger.warning(f"[Config] Cartella '{expanded}' non accessibile ({e}). Fallback in /data/storage.")
+        fallback = os.path.join(REPO_DATA_DIR, "storage")
+        try:
+            os.makedirs(fallback, exist_ok=True)
+        except Exception:
+            pass
+        _active_storage_root = fallback
+        return fallback
+
+
+def get_sqlite_dir() -> str:
+    """Directory contenente il database sbobinai.db."""
+    return os.path.join(get_storage_path(), "sqlite")
+
+
+def get_audio_dir() -> str:
+    """Directory contenente le registrazioni audio .wav."""
+    return os.path.join(get_storage_path(), "audio")
+
+
+def get_uploads_dir() -> str:
+    """Directory contenente i materiali, PDF e appunti del corso."""
+    return os.path.join(get_storage_path(), "uploads")
+
+
+def get_lancedb_dir() -> str:
+    """Directory contenente il vector database LanceDB per il RAG."""
+    return os.path.join(get_storage_path(), "lancedb")
+
+
+def get_db_path() -> str:
+    """Percorso assoluto del file SQLite sbobinai.db."""
+    return os.path.join(get_sqlite_dir(), "sbobinai.db")
+
+
+def ensure_storage_dirs() -> Dict[str, str]:
+    """
+    Assicura che la root di archiviazione e tutte le sottocartelle
+    (sqlite, audio, uploads, lancedb) esistano fisicamente sul disco.
+    """
+    root = get_storage_path()
+    sqlite_dir = get_sqlite_dir()
+    audio_dir = get_audio_dir()
+    uploads_dir = get_uploads_dir()
+    lancedb_dir = get_lancedb_dir()
+
+    os.makedirs(root, exist_ok=True)
+    os.makedirs(sqlite_dir, exist_ok=True)
+    os.makedirs(audio_dir, exist_ok=True)
+    os.makedirs(uploads_dir, exist_ok=True)
+    os.makedirs(lancedb_dir, exist_ok=True)
+
+    # Gestione file database sbobinai.db con migrazione trasparente da unicopilot.db
+    target_db = os.path.join(sqlite_dir, "sbobinai.db")
+    if not os.path.exists(target_db):
+        old_local_db = os.path.join(sqlite_dir, "unicopilot.db")
+        if os.path.exists(old_local_db):
+            try:
+                shutil.copy2(old_local_db, target_db)
+                logger.info(f"[Config] DB migrato da {old_local_db} -> {target_db}")
+            except Exception as e:
+                logger.warning(f"[Config] Impossibile copiare DB locale: {e}")
+        else:
+            legacy_doc_db = os.path.join(LEGACY_STORAGE_ROOT, "sqlite", "unicopilot.db")
+            if os.path.exists(legacy_doc_db):
+                try:
+                    shutil.copy2(legacy_doc_db, target_db)
+                    logger.info(f"[Config] DB migrato da {legacy_doc_db} -> {target_db}")
+                except Exception as e:
+                    logger.warning(f"[Config] Impossibile copiare DB legacy: {e}")
+            else:
+                old_repo_db = os.path.join(REPO_DATA_DIR, "sqlite", "unicopilot.db")
+                if os.path.exists(old_repo_db):
+                    try:
+                        shutil.copy2(old_repo_db, target_db)
+                        logger.info(f"[Config] DB iniziale copiato da {old_repo_db} -> {target_db}")
+                    except Exception as e:
+                        logger.warning(f"[Config] Impossibile copiare DB iniziale: {e}")
+
+    return {
+        "root": root,
+        "sqlite": sqlite_dir,
+        "audio": audio_dir,
+        "uploads": uploads_dir,
+        "lancedb": lancedb_dir,
+        "db_path": target_db,
+    }
+
+
+def update_storage_path(new_path: str, migrate_data: bool = True) -> Dict[str, Any]:
+    """
+    Aggiorna il percorso di archiviazione scelto dall'utente.
+    Se richiesto, sposta il database e i file audio/uploads esistenti nella nuova directory.
+    """
+    old_root = get_storage_path()
+    expanded_new = os.path.abspath(os.path.expanduser(new_path))
+
+    if old_root == expanded_new:
+        dirs = ensure_storage_dirs()
+        return {"status": "unchanged", "storage_path": expanded_new, "dirs": dirs}
+
+    logger.info(f"[Config] Migrazione storage: {old_root} -> {expanded_new}")
+
+    # Assicura le nuove directory con gestione permessi
+    try:
+        new_sqlite = os.path.join(expanded_new, "sqlite")
+        new_audio = os.path.join(expanded_new, "audio")
+        new_uploads = os.path.join(expanded_new, "uploads")
+        new_lancedb = os.path.join(expanded_new, "lancedb")
+        os.makedirs(new_sqlite, exist_ok=True)
+        os.makedirs(new_audio, exist_ok=True)
+        os.makedirs(new_uploads, exist_ok=True)
+        os.makedirs(new_lancedb, exist_ok=True)
+        _active_storage_root = expanded_new
+    except (PermissionError, OSError) as e:
+        logger.warning(f"[Config] Cartella '{expanded_new}' non accessibile ({e}). Uso fallback in data/storage.")
+        expanded_new = os.path.join(REPO_DATA_DIR, "storage")
+        new_sqlite = os.path.join(expanded_new, "sqlite")
+        new_audio = os.path.join(expanded_new, "audio")
+        new_uploads = os.path.join(expanded_new, "uploads")
+        new_lancedb = os.path.join(expanded_new, "lancedb")
+        os.makedirs(new_sqlite, exist_ok=True)
+        os.makedirs(new_audio, exist_ok=True)
+        os.makedirs(new_uploads, exist_ok=True)
+        os.makedirs(new_lancedb, exist_ok=True)
+        _active_storage_root = expanded_new
+
+    # Migrazione se abilitata
+    if migrate_data and os.path.exists(old_root):
+        # 1. DB SQLite
+        old_db = os.path.join(old_root, "sqlite", "sbobinai.db")
+        if not os.path.exists(old_db):
+            old_db = os.path.join(old_root, "sqlite", "unicopilot.db")
+        new_db = os.path.join(new_sqlite, "sbobinai.db")
+        if os.path.exists(old_db) and not os.path.exists(new_db):
+            try:
+                shutil.copy2(old_db, new_db)
+                logger.info(f"[Config] Database spostato in {new_db}")
+            except Exception as e:
+                logger.error(f"[Config] Errore copia DB: {e}")
+
+        # 2. Cartella Audio
+        old_audio = os.path.join(old_root, "audio")
+        if os.path.exists(old_audio):
+            for fname in os.listdir(old_audio):
+                src = os.path.join(old_audio, fname)
+                dst = os.path.join(new_audio, fname)
+                if os.path.isfile(src) and not os.path.exists(dst):
+                    try:
+                        shutil.copy2(src, dst)
+                    except Exception as e:
+                        logger.warning(f"[Config] Errore copia file audio {fname}: {e}")
+
+        # 3. Cartella Uploads
+        old_uploads = os.path.join(old_root, "uploads")
+        if os.path.exists(old_uploads):
+            for item in os.listdir(old_uploads):
+                src = os.path.join(old_uploads, item)
+                dst = os.path.join(new_uploads, item)
+                if not os.path.exists(dst):
+                    try:
+                        if os.path.isdir(src):
+                            shutil.copytree(src, dst)
+                        else:
+                            shutil.copy2(src, dst)
+                    except Exception as e:
+                        logger.warning(f"[Config] Errore copia uploads {item}: {e}")
+
+        # 4. Cartella LanceDB
+        old_lancedb = os.path.join(old_root, "lancedb")
+        if os.path.exists(old_lancedb):
+            for item in os.listdir(old_lancedb):
+                src = os.path.join(old_lancedb, item)
+                dst = os.path.join(new_lancedb, item)
+                if not os.path.exists(dst):
+                    try:
+                        if os.path.isdir(src):
+                            shutil.copytree(src, dst)
+                        else:
+                            shutil.copy2(src, dst)
+                    except Exception as e:
+                        logger.warning(f"[Config] Errore copia lancedb {item}: {e}")
+
+    # Salva le nuove impostazioni
+    settings = load_settings()
+    settings["storage_path"] = expanded_new
+    save_settings(settings)
+
+    # Re-bind del database SQLAlchemy
+    try:
+        from database import rebind_database
+        rebind_database()
+    except Exception as e:
+        logger.warning(f"[Config] Rebind database: {e}")
+
+    return {
+        "status": "success",
+        "storage_path": expanded_new,
+        "dirs": {
+            "root": expanded_new,
+            "sqlite": new_sqlite,
+            "audio": new_audio,
+            "uploads": new_uploads,
+            "lancedb": new_lancedb,
+            "db_path": os.path.join(new_sqlite, "sbobinai.db"),
+        }
+    }

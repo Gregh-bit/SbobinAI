@@ -1,0 +1,262 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  * {
+    border-color: rgba(255, 255, 255, 0.08);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: transparent !important;
+    color: rgba(255, 255, 255, 0.92);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", sans-serif;
+    user-select: none;
+    overflow: hidden;
+  }
+
+  #root {
+    width: 100%;
+    height: 100%;
+    border-radius: 12px;
+    overflow: hidden;
+    background-color: rgba(13, 16, 23, 0.95);
+    background-image: 
+      radial-gradient(ellipse 90% 60% at 20% -10%, rgba(25, 34, 52, 0.5), transparent 70%),
+      radial-gradient(ellipse 70% 50% at 85% 100%, rgba(18, 25, 38, 0.55), transparent 70%);
+    contain: paint;
+    transform: translateZ(0);
+  }
+
+  /* Custom ultra-clean macOS scrollbar */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.12);
+    border-radius: 9999px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.22);
+  }
+}
+
+@layer utilities {
+  /* Liquid Glass Surface (High-Performance macOS Native — GPU Optimized) */
+  .liquid-glass {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.11);
+    box-shadow: 0 4px 20px 0 rgba(0, 0, 0, 0.35), inset 0 1px 0 0 rgba(255, 255, 255, 0.14);
+    transform: translateZ(0);
+  }
+
+  .liquid-glass-subtle {
+    background: rgba(255, 255, 255, 0.025);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    box-shadow: 0 2px 8px 0 rgba(0, 0, 0, 0.2), inset 0 1px 0 0 rgba(255, 255, 255, 0.08);
+  }
+
+  .liquid-glass-pill {
+    background: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    box-shadow: 0 2px 8px 0 rgba(0, 0, 0, 0.2), inset 0 1px 0 0 rgba(255, 255, 255, 0.18);
+  }
+
+  .liquid-capsule {
+    background: rgba(18, 22, 32, 0.92);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6), 0 2px 6px rgba(0, 0, 0, 0.3), inset 0 1px 0 0 rgba(255, 255, 255, 0.22);
+    transform: translateZ(0);
+  }
+
+  .liquid-input {
+    background: rgba(255, 255, 255, 0.035);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.25);
+  }
+  .liquid-input:focus {
+    background: rgba(255, 255, 255, 0.055);
+    border-color: rgba(255, 255, 255, 0.28);
+    box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.06), inset 0 1px 2px rgba(0, 0, 0, 0.2);
+  }
+
+  /* Solid Opaque Document & Reading Canvas (eliminates glass-on-glass fatigue & gives crisp readability) */
+  .content-canvas {
+    background-color: rgba(13, 16, 23, 0.94);
+  }
+
+  /* Nasconde la scrollbar mantenendo lo scorrimento */
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}
+
+/* Stili Tipografici Eleganti per Contenuti Markdown (Chat & Quaderno) */
+.markdown-body {
+  color: rgba(255, 255, 255, 0.90);
+  line-height: 1.65;
+  font-size: 0.8125rem;
+}
+.markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4 {
+  font-weight: 700;
+  color: #ffffff;
+  letter-spacing: -0.015em;
+}
+.markdown-body h1 {
+  font-size: 1.15rem;
+  margin-top: 1.1rem;
+  margin-bottom: 0.5rem;
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+}
+.markdown-body h2 {
+  font-size: 1.025rem;
+  margin-top: 0.9rem;
+  margin-bottom: 0.4rem;
+}
+.markdown-body h3 {
+  font-size: 0.9rem;
+  color: rgba(255, 255, 255, 0.96);
+  margin-top: 0.75rem;
+  margin-bottom: 0.35rem;
+}
+.markdown-body h4 {
+  font-size: 0.825rem;
+  margin-top: 0.6rem;
+  margin-bottom: 0.25rem;
+}
+.markdown-body p {
+  margin-top: 0.35rem;
+  margin-bottom: 0.45rem;
+}
+.markdown-body p:first-child {
+  margin-top: 0;
+}
+.markdown-body p:last-child {
+  margin-bottom: 0;
+}
+.markdown-body strong {
+  color: #ffffff;
+  font-weight: 600;
+}
+.markdown-body em {
+  font-style: italic;
+  color: rgba(255, 255, 255, 0.85);
+}
+.markdown-body ul {
+  list-style-type: disc;
+  padding-left: 1.25rem;
+  margin-top: 0.3rem;
+  margin-bottom: 0.45rem;
+}
+.markdown-body ol {
+  list-style-type: decimal;
+  padding-left: 1.25rem;
+  margin-top: 0.3rem;
+  margin-bottom: 0.45rem;
+}
+.markdown-body li {
+  margin-top: 0.15rem;
+  margin-bottom: 0.15rem;
+  line-height: 1.6;
+}
+.markdown-body blockquote {
+  border-left: 3px solid rgba(129, 140, 248, 0.75);
+  background: rgba(255, 255, 255, 0.04);
+  padding: 0.4rem 0.8rem;
+  margin: 0.55rem 0;
+  border-radius: 0 0.5rem 0.5rem 0;
+  font-style: italic;
+  color: rgba(255, 255, 255, 0.86);
+}
+.markdown-body code {
+  background: rgba(255, 255, 255, 0.08);
+  padding: 0.12rem 0.35rem;
+  border-radius: 0.3rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.775rem;
+  color: #a5b4fc;
+}
+.markdown-body pre {
+  background: rgba(0, 0, 0, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  padding: 0.75rem;
+  border-radius: 0.75rem;
+  overflow-x: auto;
+  margin: 0.6rem 0;
+}
+.markdown-body pre code {
+  background: transparent;
+  padding: 0;
+  color: rgba(255, 255, 255, 0.92);
+}
+.markdown-body hr {
+  border: 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+  margin: 0.8rem 0;
+}
+.markdown-body table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.85rem 0;
+  font-size: 0.8125rem;
+  overflow: hidden;
+  border-radius: 0.5rem;
+}
+.markdown-body th, .markdown-body td {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  text-align: left;
+}
+.markdown-body th {
+  background: rgba(255, 255, 255, 0.08);
+  font-weight: 600;
+  color: #ffffff;
+}
+.markdown-body tr:nth-child(even) {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+/* Stili specifici per il Quaderno di studio (Capitoli di Lezione) */
+.quaderno-markdown {
+  font-size: 0.875rem;
+  line-height: 1.75;
+  color: rgba(255, 255, 255, 0.92);
+}
+.quaderno-markdown h1 {
+  font-size: 1.35rem;
+  margin-top: 1.4rem;
+  margin-bottom: 0.7rem;
+  color: #ffffff;
+}
+.quaderno-markdown h2 {
+  font-size: 1.15rem;
+  margin-top: 1.2rem;
+  margin-bottom: 0.55rem;
+  color: rgba(255, 255, 255, 0.98);
+}
+.quaderno-markdown h3 {
+  font-size: 1.0rem;
+  margin-top: 1.0rem;
+  margin-bottom: 0.45rem;
+  color: rgba(255, 255, 255, 0.92);
+}
+

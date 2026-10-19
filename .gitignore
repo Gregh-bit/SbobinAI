@@ -1,0 +1,87 @@
+# ==============================================================================
+# SbobinAI — .gitignore (macOS, Python, Node, Tauri/Rust, MLX Local Storage)
+# ==============================================================================
+
+# ── macOS & OS Artifacts ──────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ── Local User Data & Storage (MAI COMMETTERE) ─────────────────────────────────
+data/
+**/data/
+*.wav
+*.mp3
+*.m4a
+*.aac
+*.ogg
+*.flac
+*.webm
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+*.lance/
+*.lance
+
+# ── Local Runtime Configuration ───────────────────────────────────────────────
+backend/settings.json
+backend/.env
+backend/.env.*
+frontend/.env
+frontend/.env.local
+frontend/.env.*.local
+
+# ── Python / MLX Backend ──────────────────────────────────────────────────────
+venv/
+**/venv/
+.venv/
+**/.venv/
+env/
+**/env/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# ── Hugging Face & ML Cache ───────────────────────────────────────────────────
+.cache/
+**/.cache/
+
+# ── Node / Frontend ───────────────────────────────────────────────────────────
+node_modules/
+**/node_modules/
+frontend/dist/
+frontend/build/
+.npm
+.eslintcache
+
+# ── Rust / Tauri Build Artifacts ──────────────────────────────────────────────
+frontend/src-tauri/target/
+target/
+**/target/
+frontend/src-tauri/gen/
+**/*.rs.bk
+
+# ── IDEs & Editors ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
