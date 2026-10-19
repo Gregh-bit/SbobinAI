@@ -222,13 +222,8 @@ export default function Wizard() {
         data-tauri-drag-region
         className="h-14 px-6 flex items-center justify-between border-b border-white/[0.08] liquid-glass flex-shrink-0 z-40"
       >
-        <div className="flex items-center gap-2.5 min-w-[200px]">
-          <div className="w-[72px] h-4 pointer-events-none" />
-          <img
-            src="/logo-wordmark.png"
-            alt="SbobinAI"
-            className="h-4.5 w-auto object-contain pointer-events-none select-none opacity-90"
-          />
+        <div className="flex items-center min-w-[200px]">
+          <div className="w-[72px] h-4 pointer-events-none flex-shrink-0" />
         </div>
 
         {isDownloadingScreen ? (
@@ -290,9 +285,11 @@ export default function Wizard() {
         {/* ── STEP 1: BENVENUTO ── */}
         {step === 1 && (
           <div className="animate-fade-in space-y-8 text-center w-full max-w-2xl my-auto">
-            <div className="w-20 h-20 mx-auto rounded-3xl overflow-hidden shadow-liquid-lg flex items-center justify-center">
-              <img src="/logo-icon.png" alt="SbobinAI" className="w-full h-full object-cover" />
-            </div>
+            <img
+              src="/logo-icon.png"
+              alt="SbobinAI"
+              className="w-24 h-24 mx-auto object-contain select-none pointer-events-none drop-shadow-2xl"
+            />
 
             <div className="space-y-3">
               <h1 className="text-3xl font-bold tracking-tight text-white sm:text-4xl">
