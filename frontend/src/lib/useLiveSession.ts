@@ -368,9 +368,13 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
   }, [sessionSubjectId, lecture?.id]);
 
   // ── Actions ─────────────────────────────────────────────────────────────────
+  const lastBookmarkTimeRef = useRef(0);
   const handleBookmark = useCallback(() => {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-    setLastBookmarkPinned(Date.now());
+    const now = Date.now();
+    if (now - lastBookmarkTimeRef.current < 400) return;
+    lastBookmarkTimeRef.current = now;
+    setLastBookmarkPinned(now);
     wsRef.current.send(JSON.stringify({
       type: 'bookmark',
       payload: { note: `Segnalibro @ ${formatElapsed(elapsedRef.current)}` }
@@ -493,13 +497,19 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
     }
   }, []);
 
-  // Keyboard shortcut ⌘B per Segnalibro
+  // Keyboard shortcut ⌘B e ⌘⇧B per Segnalibro
   useEffect(() => {
     if (!lecture) return;
 
     const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'b') {
+      const target = e.target as HTMLElement | null;
+      const isInput = target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
+
+      if ((e.metaKey || e.ctrlKey) && (e.key.toLowerCase() === 'b' || e.code === 'KeyB')) {
+        // Se l'utente sta scrivendo in un campo di testo ed è solo Cmd+B (senza Shift), non intercettare
+        if (isInput && !e.shiftKey) return;
         e.preventDefault();
+        e.stopPropagation();
         handleBookmark();
       }
     };

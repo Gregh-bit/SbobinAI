@@ -23,6 +23,15 @@ fn has_main(dir: &Path) -> bool {
     dir.join("main.py").is_file()
 }
 
+fn has_venv(dir: &Path) -> bool {
+    let rel: &[&str] = if cfg!(windows) {
+        &["venv/Scripts/python.exe", ".venv/Scripts/python.exe"]
+    } else {
+        &["venv/bin/python", ".venv/bin/python"]
+    };
+    rel.iter().any(|r| dir.join(r).is_file())
+}
+
 fn resolve_backend_dir(app: &tauri::App) -> Option<PathBuf> {
     if let Ok(p) = std::env::var("SBOBINAI_BACKEND_DIR") {
         let p = PathBuf::from(p);
@@ -30,10 +39,40 @@ fn resolve_backend_dir(app: &tauri::App) -> Option<PathBuf> {
             return Some(p);
         }
     }
+
+    // 1. In dev/workspace cerca prima negli antenati una directory backend dotata di venv
+    if let Ok(cwd) = std::env::current_dir() {
+        for anc in cwd.ancestors().take(6) {
+            let p = anc.join("backend");
+            if has_main(&p) && has_venv(&p) {
+                return Some(p);
+            }
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for anc in exe.ancestors().skip(1).take(8) {
+            let p = anc.join("backend");
+            if has_main(&p) && has_venv(&p) {
+                return Some(p);
+            }
+        }
+    }
+
+    // 2. Se pacchettizzata (es. App bundle), controlla la cartella risorse
     if let Ok(res) = app.path().resource_dir() {
         let p = res.join("backend");
         if has_main(&p) {
             return Some(p);
+        }
+    }
+
+    // 3. Fallback: qualunque directory backend che contenga main.py
+    if let Ok(cwd) = std::env::current_dir() {
+        for anc in cwd.ancestors().take(6) {
+            let p = anc.join("backend");
+            if has_main(&p) {
+                return Some(p);
+            }
         }
     }
     if let Ok(exe) = std::env::current_exe() {
@@ -48,6 +87,12 @@ fn resolve_backend_dir(app: &tauri::App) -> Option<PathBuf> {
 }
 
 fn resolve_python(backend_dir: &Path) -> PathBuf {
+    if let Ok(p) = std::env::var("SBOBINAI_PYTHON") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return p;
+        }
+    }
     let rel: &[&str] = if cfg!(windows) {
         &["venv/Scripts/python.exe", ".venv/Scripts/python.exe"]
     } else {
@@ -55,6 +100,13 @@ fn resolve_python(backend_dir: &Path) -> PathBuf {
     };
     for r in rel {
         let p = backend_dir.join(r);
+        if p.is_file() {
+            return p;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    for fallback in &["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"] {
+        let p = PathBuf::from(fallback);
         if p.is_file() {
             return p;
         }
@@ -75,14 +127,23 @@ fn spawn_backend(app: &tauri::App) -> Option<Child> {
         }
     };
     let python = resolve_python(&dir);
+    log::info!("spawning backend with python {:?} in {:?}", python, dir);
     let mut cmd = Command::new(&python);
     cmd.args([
         "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8000",
     ])
     .current_dir(&dir)
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::null());
+    .stdin(Stdio::null());
+
+    #[cfg(debug_assertions)]
+    {
+        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

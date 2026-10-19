@@ -46,7 +46,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQzQThBODlGQzJCRjVFNzcKUldSM1hyL0NuNmlvUS9SVkRCbEdaYlpXMU9PQXlnV3cvWERXVzNTd3crVEc5ZXFaWUlncm5xZUgK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVFRUMzREIwMkU0MjcyQjgKUldTNGNrSXVzRDNzWGx6cEYxQ3ZHNmJ1NnJ0MmU4KzNESFE4Q1dwTnI3aTg0TnVaR1M4aVFzYkcK",
       "endpoints": [
         "https://github.com/Gregh-bit/SbobinAI/releases/latest/download/latest.json"
       ],

@@ -22,14 +22,17 @@ function MainApp() {
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
 
-  const loadSubjects = useCallback(async () => {
+  const loadSubjects = useCallback(async (retries = 5) => {
     setLoadingSubjects(true);
     try {
       const data = await api.subjects.list();
       setSubjects(data);
       setSelectedSubject((prev) => (prev ? prev : (data[0] || null)));
     } catch {
-      // Backend non disponibile
+      // Backend in fase di avvio: riprova ogni secondo per 5 volte
+      if (retries > 0) {
+        setTimeout(() => loadSubjects(retries - 1), 1000);
+      }
     } finally {
       setLoadingSubjects(false);
     }
