@@ -90,3 +90,7 @@ frontend/src-tauri/gen/
 *.key
 *.pem
 *.pub
+
+# Raw Logo Design Source
+inter.png
+Inter.png

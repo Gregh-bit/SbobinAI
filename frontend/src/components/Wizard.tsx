@@ -222,11 +222,13 @@ export default function Wizard() {
         data-tauri-drag-region
         className="h-14 px-6 flex items-center justify-between border-b border-white/[0.08] liquid-glass flex-shrink-0 z-40"
       >
-        <div className="flex items-center gap-2 min-w-[200px]">
+        <div className="flex items-center gap-2.5 min-w-[200px]">
           <div className="w-[72px] h-4 pointer-events-none" />
-          <span className="text-[11px] font-medium tracking-tight text-white/35 uppercase font-mono pointer-events-none">
-            SbobinAI
-          </span>
+          <img
+            src="/logo-wordmark.png"
+            alt="SbobinAI"
+            className="h-4.5 w-auto object-contain pointer-events-none select-none opacity-90"
+          />
         </div>
 
         {isDownloadingScreen ? (
@@ -288,8 +290,8 @@ export default function Wizard() {
         {/* ── STEP 1: BENVENUTO ── */}
         {step === 1 && (
           <div className="animate-fade-in space-y-8 text-center w-full max-w-2xl my-auto">
-            <div className="w-20 h-20 mx-auto rounded-3xl liquid-glass flex items-center justify-center border border-white/20 shadow-liquid-lg">
-              <Sparkles size={40} className="text-white drop-shadow-[0_0_16px_rgba(255,255,255,0.7)]" />
+            <div className="w-20 h-20 mx-auto rounded-3xl overflow-hidden shadow-liquid-lg flex items-center justify-center">
+              <img src="/logo-icon.png" alt="SbobinAI" className="w-full h-full object-cover" />
             </div>
 
             <div className="space-y-3">

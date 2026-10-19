@@ -27,12 +27,14 @@ export default function Sidebar({ subjects, selectedId, onSelect, onAdd, onUpdat
     <>
       <aside className="w-64 h-full flex flex-col flex-shrink-0 liquid-glass border-r border-white/[0.08] select-none [contain:paint]">
         {/* macOS Native Window Controls Drag Region */}
-        <div data-tauri-drag-region className="h-14 px-4 flex items-center gap-2 flex-shrink-0">
+        <div data-tauri-drag-region className="h-14 px-4 flex items-center gap-2.5 flex-shrink-0">
           {/* Spazio riservato ai Traffic Lights nativi macOS (72px) */}
           <div className="w-[72px] h-4 pointer-events-none" />
-          <span className="text-[11px] font-semibold tracking-wider text-white/40 uppercase pointer-events-none font-mono">
-            SbobinAI
-          </span>
+          <img
+            src="/logo-wordmark.png"
+            alt="SbobinAI"
+            className="h-4.5 w-auto object-contain pointer-events-none select-none opacity-90 hover:opacity-100 transition-opacity"
+          />
         </div>
 
         {/* Section Header */}
