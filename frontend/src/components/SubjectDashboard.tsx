@@ -22,9 +22,9 @@ const LiveRecordingWorkspace = lazy(() => import('./LiveRecordingWorkspace'));
 
 interface Props {
   subject: Subject;
-  onStartLecture?: (lecture: Lecture) => void;
   onOpenSettings?: () => void;
   onRecordingChange?: (isRecording: boolean) => void;
+  [key: string]: any;
 }
 
 // Polling delle lezioni dopo lo stop finché il backend non ha generato gli appunti
@@ -305,7 +305,7 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
                       <span className={clsx('w-0.5 bg-red-400 rounded-full', !liveSession.isPaused && 'animate-wave')} style={{ height: '12px', animationDelay: '200ms' }} />
                       <span className={clsx('w-0.5 bg-red-400 rounded-full', !liveSession.isPaused && 'animate-wave')} style={{ height: '7px', animationDelay: '400ms' }} />
                     </div>
-                    <span className="font-semibold tracking-tight">{formatElapsed(liveSession.elapsed)}</span>
+                    <span className="font-semibold tracking-tight tabular-nums">{formatElapsed(liveSession.elapsed)}</span>
                   </div>
 
                   {/* Quick Bookmark (⌘⇧B / Ctrl+Shift+B) Button */}

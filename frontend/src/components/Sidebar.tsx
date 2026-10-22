@@ -11,9 +11,9 @@ interface Props {
   onAdd: (data: { name: string; description: string; keywords: string; color: string }) => Promise<void>;
   onUpdate?: (id: number, data: { name: string; description: string; keywords: string; color: string }) => Promise<void>;
   onDelete?: (id: number) => Promise<void>;
-  isLoading: boolean;
   isRecording?: boolean;
   onOpenSettings?: () => void;
+  [key: string]: any;
 }
 
 export default function Sidebar({ subjects, selectedId, onSelect, onAdd, onUpdate, onDelete, isRecording = false, onOpenSettings }: Props) {
@@ -27,9 +27,7 @@ export default function Sidebar({ subjects, selectedId, onSelect, onAdd, onUpdat
     <>
       <aside className="w-64 h-full flex flex-col flex-shrink-0 liquid-glass border-r border-white/[0.08] select-none [contain:paint]">
         {/* macOS Native Window Controls Drag Region */}
-        <div data-tauri-drag-region className="h-14 px-4 flex items-center gap-3 flex-shrink-0">
-          {/* Spazio riservato ai Traffic Lights nativi macOS (72px) */}
-          <div className="w-[72px] h-4 pointer-events-none flex-shrink-0" />
+        <div data-tauri-drag-region className="h-14 relative flex items-center justify-center flex-shrink-0 px-4">
           <img
             src="/logo-wordmark.png"
             alt="SbobinAI"

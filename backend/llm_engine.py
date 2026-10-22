@@ -172,11 +172,14 @@ def clear_metal_cache() -> None:
             import mlx.core as mx
             if hasattr(mx, "clear_cache"):
                 mx.clear_cache()
-            elif hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
+            if hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
                 mx.metal.clear_cache()
         except Exception as exc:
             logger.debug(f"[LLM Engine] clear_cache: {exc}")
     gc.collect()
+
+
+release_metal_cache = clear_metal_cache
 
 
 def _touch_model_usage() -> None:
@@ -287,6 +290,20 @@ def is_model_downloaded(model_id: str) -> bool:
         return check_repo_downloaded(model_id)[0]
     except Exception:
         return get_local_snapshot_dir(model_id) is not None
+
+
+def resolve_llm_model(model_id: Optional[str] = None) -> str:
+    """Risolve il modello LLM da utilizzare: model_id esplicito -> impostazioni utente -> DEFAULT_LLM_MODEL."""
+    if model_id:
+        return model_id
+    try:
+        from config import load_settings
+        settings_model = load_settings().get("llm_model")
+        if settings_model:
+            return str(settings_model)
+    except Exception:
+        pass
+    return DEFAULT_LLM_MODEL
 
 
 def _resolve_model_path(target_id: str) -> Tuple[str, Optional[str]]:
@@ -402,7 +419,7 @@ def get_or_load_model(model_id: Optional[str] = None) -> Tuple[Any, Any]:
     """
     global _loaded_model, _loaded_tokenizer, _loaded_model_id
 
-    target_id = model_id or DEFAULT_LLM_MODEL
+    target_id = resolve_llm_model(model_id)
     cache_key, local_path = _resolve_model_path(target_id)
 
     with _model_lock:
@@ -590,7 +607,7 @@ def generate_text(
     Solleva LLMModelNotDownloadedError (FileNotFoundError) se il modello non è scaricato,
     LLMGenerationError per errori del motore.
     """
-    target = model_id or DEFAULT_LLM_MODEL
+    target = resolve_llm_model(model_id)
     if not is_model_downloaded(target):
         raise LLMModelNotDownloadedError(
             f"Il modello '{target}' non è ancora stato scaricato in locale. "
@@ -629,7 +646,8 @@ async def generate_flash_answer(
     Genera una risposta flash in massimo 3 punti elenco chiari per la domanda rilevata.
     Modalità thinking disattivata per latenza minima.
     """
-    if not is_model_downloaded(model_id or DEFAULT_LLM_MODEL):
+    target = resolve_llm_model(model_id)
+    if not is_model_downloaded(target):
         return (
             "• Risposta non disponibile: modello LLM non ancora scaricato.\n"
             "• Scarica Qwen 3.5 4B dalle Impostazioni per attivare le risposte flash.\n"
@@ -655,7 +673,7 @@ async def generate_flash_answer(
         with generation_session("Risposta Flash") as epoch:
             full_text = _generate_blocking(
                 messages,
-                model_id=model_id,
+                model_id=target,
                 max_tokens=180,
                 fallback_str=f"{system_prompt}\n\nDomanda:\n{user_prompt}\n\nRisposta Flash:",
                 epoch=epoch,
@@ -684,7 +702,8 @@ async def stream_chat_response(
     Genera la spiegazione in streaming token-by-token per la chat live o la vista assistente.
     Il worker si ferma se il consumatore chiude lo stream (es. disconnessione WebSocket).
     """
-    if not is_model_downloaded(model_id or DEFAULT_LLM_MODEL):
+    target = resolve_llm_model(model_id)
+    if not is_model_downloaded(target):
         yield (
             "Il modello LLM Qwen 3.5 4B non è ancora stato scaricato in locale.\n\n"
             "Apri le **Impostazioni** (rotellina in basso a sinistra) e premi **Scarica** "
@@ -720,7 +739,7 @@ async def stream_chat_response(
             with generation_session("Chat Assistente") as epoch:
                 if stop_flag.is_set() or is_cancelled(epoch):
                     return
-                model, tokenizer = get_or_load_model(model_id)
+                model, tokenizer = get_or_load_model(target)
                 messages = [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
@@ -783,7 +802,8 @@ async def generate_lecture_chapter(
     - Errore del motore o output vuoto → solleva LLMGenerationError (sottoclasse di RuntimeError):
       i chiamanti NON devono sovrascrivere appunti esistenti in questo caso.
     """
-    if not is_model_downloaded(model_id or DEFAULT_LLM_MODEL):
+    target = resolve_llm_model(model_id)
+    if not is_model_downloaded(target):
         return (
             f"# {title} — Appunti di Lezione\n\n"
             "> [!NOTE]\n"
@@ -846,7 +866,7 @@ STRUTTURA OBBLIGATORIA DEL CAPITOLO (in Markdown):
             ]
             full_chapter = _generate_blocking(
                 messages,
-                model_id=model_id,
+                model_id=target,
                 max_tokens=1200,
                 fallback_str=f"{system_prompt}\n\n{user_prompt}\n\n# {title} — Capitolo di Studio\n",
                 epoch=epoch,

@@ -9,6 +9,8 @@ import logging
 import os
 import re
 import shutil
+import threading
+import time
 from typing import Any, Dict, List, Set
 
 from sqlalchemy import text
@@ -92,7 +94,8 @@ def cleanup_orphan_files(db: Session = None) -> Dict[str, Any]:
     4. Rimuove file .tmp, .part e vecchi database 'unicopilot.db' orfani.
     5. Esegue VACUUM SQLite e compattazione LanceDB.
     """
-    from database import SessionLocal
+    from database import SessionLocal, init_db
+    init_db()
 
     owns_session = False
     if db is None:
@@ -118,9 +121,30 @@ def cleanup_orphan_files(db: Session = None) -> Dict[str, Any]:
             if lec.audio_path:
                 norm_p = os.path.abspath(os.path.normpath(lec.audio_path))
                 valid_audio_paths.add(norm_p)
+                valid_audio_paths.add(os.path.realpath(norm_p))
                 valid_audio_basenames.add(os.path.basename(norm_p))
 
         valid_subject_ids: Set[int] = {s.id for s in subjects}
+
+        # Rileva sessioni live attive e importazioni audio in corso per evitare cancellazioni premature
+        active_lecture_ids: Set[int] = set()
+        try:
+            import live_session
+            for s in list(getattr(live_session, "_active_sessions", {}).values()):
+                if getattr(s, "is_active", False):
+                    lid = getattr(s, "lecture_id", None)
+                    if lid is not None:
+                        active_lecture_ids.add(lid)
+        except Exception:
+            pass
+
+        active_import_names: Set[str] = set()
+        try:
+            for t in threading.enumerate():
+                if t.name.startswith("audio-import-"):
+                    active_import_names.add(t.name[len("audio-import-"):])
+        except Exception:
+            pass
 
         # Salvaguardia: con un DB vuoto (nuovo storage, DB non leggibile, fallback di percorso)
         # ogni file sembrerebbe orfano → non cancellare nulla.
@@ -140,7 +164,7 @@ def cleanup_orphan_files(db: Session = None) -> Dict[str, Any]:
 
         logger.info(
             f"[Cleaner] Inizio scansione file orfani: {len(valid_lecture_ids)} lezioni attive, "
-            f"{len(valid_subject_ids)} materie attive."
+            f"{len(valid_subject_ids)} materie attive, {len(active_lecture_ids)} sessioni live."
         )
 
         # 2. Bonifica file audio orfani
@@ -157,14 +181,53 @@ def cleanup_orphan_files(db: Session = None) -> Dict[str, Any]:
                     ext = os.path.splitext(fname)[1].lower()
                     if ext in audio_extensions or ext in {".tmp", ".part"}:
                         norm_fpath = os.path.abspath(os.path.normpath(fpath))
+                        real_fpath = os.path.realpath(norm_fpath)
                         is_orphan = False
 
-                        # Se è un file temporaneo/parziale, è orfano
+                        # 1. File parziali o temporanei (.tmp, .part)
                         if ext in {".tmp", ".part"}:
+                            try:
+                                file_age = time.time() - os.path.getmtime(fpath)
+                            except OSError:
+                                file_age = 9999
+                            # Non cancellare se una sessione è attiva o se il file è stato modificato di recente (< 300 secondi)
+                            if file_age < 300 or len(active_lecture_ids) > 0:
+                                continue
                             is_orphan = True
-                        # Se il percorso e il nome non corrispondono ad alcuna lezione registrata
-                        elif norm_fpath not in valid_audio_paths and fname not in valid_audio_basenames:
-                            is_orphan = True
+
+                        # 2. File audio
+                        else:
+                            is_known = (
+                                norm_fpath in valid_audio_paths
+                                or real_fpath in valid_audio_paths
+                                or fname in valid_audio_basenames
+                            )
+
+                            if is_known:
+                                is_orphan = False
+                            else:
+                                # Proteggi se appartiene a una sessione live in corso o a una lezione registrata
+                                m = re.match(r"^lecture_(\d+)_", fname)
+                                is_live = False
+                                if m:
+                                    try:
+                                        lec_id = int(m.group(1))
+                                        if lec_id in active_lecture_ids or lec_id in valid_lecture_ids:
+                                            is_live = True
+                                    except ValueError:
+                                        pass
+
+                                # Proteggi se appartiene a una lezione in importazione in background
+                                is_importing = any(
+                                    imp in fname or fname in imp
+                                    for imp in active_import_names
+                                    if imp
+                                )
+
+                                if is_live or is_importing:
+                                    continue
+                                else:
+                                    is_orphan = True
 
                         if is_orphan:
                             try:
@@ -291,4 +354,72 @@ def get_storage_breakdown() -> Dict[str, Any]:
         "lancedb_mb": round(lancedb_mb, 2),
         "total_mb": total_mb,
     }
+
+
+def compress_archive_audio() -> Dict[str, Any]:
+    """
+    Scansiona tutte le lezioni memorizzate nel DB SQLite.
+    Se una lezione ha un file audio in formato WAV (.wav) esistente sul disco,
+    lo converte in formato M4A (AAC a 48 kbps) liberando circa l'85% dello spazio,
+    aggiorna il percorso `audio_path` della lezione su SQLite e trasferisce l'eventuale
+    file cache dei timestamp (.timestamps.json).
+    
+    Restituisce un riepilogo con:
+      - status: "success"
+      - converted_count: numero di file convertiti
+      - freed_mb: megabyte liberati
+      - total_audio_mb: dimensione totale attuale dell'archivio audio
+      - message: messaggio leggibile per l'utente
+    """
+    from audio_engine import compress_wav_to_m4a
+    from database import Lecture, SessionLocal
+
+    db = SessionLocal()
+    converted_count = 0
+    freed_bytes = 0
+
+    try:
+        lectures = db.query(Lecture).all()
+        for lec in lectures:
+            if not lec.audio_path:
+                continue
+            path = os.path.abspath(lec.audio_path)
+            if not path.lower().endswith(".wav") or not os.path.isfile(path):
+                continue
+
+            orig_size = os.path.getsize(path)
+            new_path = compress_wav_to_m4a(path, bitrate=48000, remove_original=True)
+
+            if new_path != path and os.path.isfile(new_path):
+                new_size = os.path.getsize(new_path)
+                freed_bytes += max(0, orig_size - new_size)
+                lec.audio_path = new_path
+                converted_count += 1
+                logger.info(f"[Cleaner] Lezione ID {lec.id} compressa con successo in M4A: {new_path}")
+
+        if converted_count > 0:
+            db.commit()
+    except Exception as exc:
+        logger.error(f"[Cleaner] Errore compressione archivio audio: {exc}")
+        db.rollback()
+    finally:
+        db.close()
+
+    freed_mb = round(freed_bytes / (1024 * 1024), 2)
+    stats = get_storage_breakdown()
+    total_audio_mb = stats.get("audio_mb", 0.0)
+
+    if converted_count > 0:
+        msg = f"Compressione completata: convertite {converted_count} lezioni in M4A, liberati {freed_mb} MB!"
+    else:
+        msg = "Tutte le registrazioni audio sono già ottimizzate in formato compresso salva-spazio (M4A)."
+
+    return {
+        "status": "success",
+        "converted_count": converted_count,
+        "freed_mb": freed_mb,
+        "total_audio_mb": total_audio_mb,
+        "message": msg,
+    }
+
 

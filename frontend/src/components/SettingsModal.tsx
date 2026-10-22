@@ -3,7 +3,7 @@ import {
   X, Folder, Cpu, Mic, HardDrive, Check, 
   RotateCcw, Sliders, Trash2, Download, Loader2,
   RefreshCw, CheckCircle2, ShieldCheck, Database, FileAudio, 
-  Layers, AlertTriangle
+  Layers, AlertTriangle, Sparkles, Volume2, Shield, Copy
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import { useSettings } from '../lib/SettingsContext';
@@ -12,6 +12,7 @@ import { osBadge } from '../lib/platform';
 import { useUpdater } from '../lib/useUpdater';
 import { api } from '../lib/api';
 import type { ModelsStatusResponse, ModelInfo } from '../types';
+import { motion, AnimatePresence } from 'framer-motion';
 
 interface Props {
   isOpen: boolean;
@@ -20,6 +21,39 @@ interface Props {
 
 type TabType = 'storage' | 'models' | 'audio' | 'system';
 type ModelFilterType = 'system_core' | 'llm';
+
+const defaultLlms: ModelInfo[] = [
+  {
+    id: 'mlx-community/Qwen3.5-4B-MLX-4bit',
+    name: 'Qwen 3.5 4B (MLX 4-bit)',
+    type: 'llm',
+    approx_size: '~2.8 GB',
+    description: 'Modello linguistico consigliato: compatto, veloce e ottimizzato con MLX 4-bit per Apple Silicon. Basso consumo di memoria RAM (~2.8 GB).',
+    downloaded: false,
+    status: 'idle',
+    disk_size_mb: null,
+  },
+  {
+    id: 'mlx-community/Qwen3.5-2B-MLX-4bit',
+    name: 'Qwen 3.5 2B (MLX 4-bit ultraleggero)',
+    type: 'llm',
+    approx_size: '~1.4 GB',
+    description: 'Versione ultraleggera a bassissimo impatto di memoria RAM (~1.4 GB). Ideale per MacBook con 8 GB di memoria unificata.',
+    downloaded: false,
+    status: 'idle',
+    disk_size_mb: null,
+  },
+  {
+    id: 'mlx-community/Qwen3.5-8B-MLX-4bit',
+    name: 'Qwen 3.5 8B (MLX 4-bit alta capacità)',
+    type: 'llm',
+    approx_size: '~5.5 GB',
+    description: 'Modello ad altissima capacità di ragionamento e sintesi concettuale (~5.5 GB in RAM). Consigliato per MacBook con 16 GB o più.',
+    downloaded: false,
+    status: 'idle',
+    disk_size_mb: null,
+  },
+];
 
 export default function SettingsModal({ isOpen, onClose }: Props) {
   const { settings, updateSettings, resetSetup } = useSettings();
@@ -39,6 +73,8 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
   const [llmModel, setLlmModel] = useState(settings.llmModel || 'mlx-community/Qwen3.5-4B-MLX-4bit');
   const [embeddingModel, setEmbeddingModel] = useState(settings.embeddingModel || 'mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ');
   const [vadSensitivity, setVadSensitivity] = useState(settings.vadSensitivity);
+  const [audioFormat, setAudioFormat] = useState<'m4a' | 'wav'>(settings.audioFormat || 'm4a');
+  const [isCompressingArchive, setIsCompressingArchive] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
   const [confirmDeleteModelId, setConfirmDeleteModelId] = useState<string | null>(null);
@@ -58,6 +94,25 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
     total_mb: number;
   } | null>(null);
   const [isCleaningOrphans, setIsCleaningOrphans] = useState(false);
+  const [copyTooltip, setCopyTooltip] = useState<{ x: number; y: number } | null>(null);
+
+  const handleCopyPath = async (e: React.MouseEvent, path: string) => {
+    e.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(path);
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = path;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }
+    setCopyTooltip({ x: e.clientX, y: e.clientY });
+    setTimeout(() => {
+      setCopyTooltip(null);
+    }, 1400);
+  };
 
   const showNotification = (message: string, type: 'success' | 'error' | 'info' = 'info') => {
     setNotification({ type, message });
@@ -107,6 +162,12 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
     }
   }, []);
 
+  // Pre-caricamento in background all'avvio per eliminare layout shift e attese all'apertura
+  useEffect(() => {
+    fetchModelsStatus(true);
+    fetchStorageStats();
+  }, [fetchModelsStatus, fetchStorageStats]);
+
   // Sincronizza lo stato solo all'apertura del modale (non a ogni modifica delle impostazioni)
   useEffect(() => {
     if (isOpen) {
@@ -120,10 +181,10 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       setConfirmDeleteAll(false);
       setConfirmDeleteModelId(null);
       setNotification(null);
-      fetchModelsStatus();
+      fetchModelsStatus(true);
       fetchStorageStats();
     }
-  }, [isOpen]);
+  }, [isOpen, fetchModelsStatus, fetchStorageStats]);
 
   // Polling automatico attivo se un modello è in fase di download
   useEffect(() => {
@@ -224,6 +285,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
         updateSettings({ embeddingModel: 'mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ' });
       }
       await fetchModelsStatus();
+      await fetchStorageStats();
     } catch (err: any) {
       showNotification(`Errore eliminazione: ${err?.message || err}`, 'error');
     } finally {
@@ -241,6 +303,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       setWhisperModel('mock_mode');
       updateSettings({ whisperModel: 'mock_mode', modelsDownloaded: false });
       await fetchModelsStatus();
+      await fetchStorageStats();
     } catch (err: any) {
       showNotification(`Errore eliminazione totale: ${err?.message || err}`, 'error');
     } finally {
@@ -271,9 +334,43 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
     }
   };
 
+  useEffect(() => {
+    if (settings.audioFormat) {
+      setAudioFormat(settings.audioFormat);
+    }
+  }, [settings.audioFormat]);
+
   const handleVadChange = (newVal: number) => {
     setVadSensitivity(newVal);
     updateSettings({ vadSensitivity: newVal });
+  };
+
+  const handleAudioFormatChange = async (newFormat: 'm4a' | 'wav') => {
+    setAudioFormat(newFormat);
+    try {
+      await updateSettings({ audioFormat: newFormat });
+      showNotification(
+        newFormat === 'm4a'
+          ? 'Formato impostato su M4A compresso AAC (~18 MB/h, -85% di spazio sul disco).'
+          : 'Formato impostato su WAV originale PCM non compresso (~115 MB/h).',
+        'success'
+      );
+    } catch (err: any) {
+      showNotification(`Errore salvataggio formato audio: ${err?.message || err}`, 'error');
+    }
+  };
+
+  const handleCompressArchive = async () => {
+    try {
+      setIsCompressingArchive(true);
+      const res = await api.settings.compressArchive();
+      showNotification(res.message, res.converted_count > 0 ? 'success' : 'info');
+      await fetchStorageStats();
+    } catch (err: any) {
+      showNotification(err?.message || 'Errore durante la compressione dell\'archivio audio.', 'error');
+    } finally {
+      setIsCompressingArchive(false);
+    }
   };
 
   const handleResetWizard = () => {
@@ -289,6 +386,114 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
   if (!isOpen) return null;
 
   const totalInstalledMb = modelsStatus?.total_installed_mb ?? 0;
+  const audioMb = storageStats?.audio_mb ?? 0;
+  const sqliteMb = storageStats?.sqlite_mb ?? 0;
+  const lancedbMb = storageStats?.lancedb_mb ?? 0;
+  const uploadsMb = storageStats?.uploads_mb ?? 0;
+  const combinedTotalMb = Math.round((audioMb + totalInstalledMb + sqliteMb + lancedbMb + uploadsMb) * 100) / 100;
+
+  const downloadedModelsCount =
+    (modelsStatus?.whisper?.filter((m) => m.downloaded && m.id !== 'mock_mode')?.length ?? 0) +
+    (modelsStatus?.llm?.filter((m) => m.downloaded)?.length ?? 0) +
+    (modelsStatus?.embedding?.filter((m) => m.downloaded)?.length ?? 0);
+
+  const formatSize = (mb: number): string => {
+    if (mb >= 1024) {
+      return `${(mb / 1024).toFixed(2)} GB`;
+    }
+    return `${mb.toFixed(1)} MB`;
+  };
+
+  const getBarWidth = (valMb: number) => {
+    if (combinedTotalMb <= 0 || valMb <= 0) return 0;
+    const pct = (valMb / combinedTotalMb) * 100;
+    return Math.max(1.8, pct);
+  };
+
+  const formatPct = (valMb: number) => {
+    if (combinedTotalMb <= 0 || valMb <= 0) return '0%';
+    const pct = (valMb / combinedTotalMb) * 100;
+    if (pct < 1) return '<1%';
+    return `${Math.round(pct)}%`;
+  };
+
+  const storageCategories = [
+    {
+      id: 'models',
+      label: 'Modelli IA',
+      shortLabel: 'Modelli IA',
+      sizeMb: totalInstalledMb,
+      color: 'bg-[#BF5AF2]',
+      dotColor: 'bg-[#BF5AF2]',
+      badgeBg: 'bg-[#BF5AF2]/15',
+      badgeBorder: 'border-[#BF5AF2]/30',
+      badgeText: 'text-[#D087FF]',
+      icon: Cpu,
+      path: '~/.cache/huggingface/hub',
+      desc: 'Pesi neurali quantizzati 4-bit per Whisper, Qwen LLM ed Embedding RAG.',
+      details: `${downloadedModelsCount} ${downloadedModelsCount === 1 ? 'modello installato' : 'modelli installati'}`,
+    },
+    {
+      id: 'audio',
+      label: 'Registrazioni Master Audio',
+      shortLabel: 'Audio Lezioni',
+      sizeMb: audioMb,
+      color: 'bg-[#0A84FF]',
+      dotColor: 'bg-[#0A84FF]',
+      badgeBg: 'bg-[#0A84FF]/15',
+      badgeBorder: 'border-[#0A84FF]/30',
+      badgeText: 'text-[#5AC8FA]',
+      icon: FileAudio,
+      path: `${storagePath}/audio`,
+      desc: 'File master ad alta risoluzione 16-bit PCM 16kHz per trascrizione e ascolto.',
+      details: 'Audio fedele non compresso',
+    },
+    {
+      id: 'sqlite',
+      label: 'Database Relazionale',
+      shortLabel: 'Database SQLite',
+      sizeMb: sqliteMb,
+      color: 'bg-[#30D158]',
+      dotColor: 'bg-[#30D158]',
+      badgeBg: 'bg-[#30D158]/15',
+      badgeBorder: 'border-[#30D158]/30',
+      badgeText: 'text-[#6EE7B7]',
+      icon: Database,
+      path: `${storagePath}/sqlite/sbobinai.db`,
+      desc: 'Corsi, trascrizioni parola per parola con timestamp, flashcard e note.',
+      details: 'Transazionale WAL / VACUUM',
+    },
+    {
+      id: 'lancedb',
+      label: 'Indice Vettoriale RAG',
+      shortLabel: 'LanceDB',
+      sizeMb: lancedbMb,
+      color: 'bg-[#FF9F0A]',
+      dotColor: 'bg-[#FF9F0A]',
+      badgeBg: 'bg-[#FF9F0A]/15',
+      badgeBorder: 'border-[#FF9F0A]/30',
+      badgeText: 'text-[#FDBA74]',
+      icon: Layers,
+      path: `${storagePath}/lancedb`,
+      desc: 'Embeddings a 1024 dimensioni per ricerca semantica e quiz intelligente.',
+      details: 'Vector DB zero-copy locale',
+    },
+    {
+      id: 'uploads',
+      label: 'Materiali & Documenti',
+      shortLabel: 'Uploads',
+      sizeMb: uploadsMb,
+      color: 'bg-[#FF375F]',
+      dotColor: 'bg-[#FF375F]',
+      badgeBg: 'bg-[#FF375F]/15',
+      badgeBorder: 'border-[#FF375F]/30',
+      badgeText: 'text-[#FDA4AF]',
+      icon: Folder,
+      path: `${storagePath}/uploads`,
+      desc: 'Slide PDF, appunti in PDF e allegati di supporto caricati per i corsi.',
+      details: 'Dispense universitarie',
+    },
+  ];
 
   return (
     <div 
@@ -296,7 +501,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       onClick={onClose}
     >
       <div 
-        className="relative w-full max-w-4xl rounded-3xl liquid-glass border border-white/[0.14] shadow-liquid-lg overflow-hidden flex flex-col h-[640px] animate-slide-up"
+        className="relative w-[880px] max-w-[94vw] h-[640px] max-h-[90vh] rounded-3xl liquid-glass border border-white/[0.14] shadow-liquid-lg overflow-hidden flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
         {/* ── Modal Header ── */}
@@ -340,7 +545,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                 <span>Archiviazione</span>
               </button>
 
-              {/* Tab 2: Modelli & Cache IA (Senza badge numerico) */}
+              {/* Tab 2: Modelli */}
               <button
                 onClick={() => setActiveTab('models')}
                 className={clsx(
@@ -351,7 +556,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                 )}
               >
                 <Cpu size={15} className="text-white/70" />
-                <span>Modelli IA & Cache</span>
+                <span>Modelli</span>
               </button>
 
               {/* Tab 3: Motore Audio */}
@@ -392,7 +597,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
           </div>
 
           {/* ── Main Tab Content Panel con scroll fluido e spaziatura corretta ── */}
-          <div className="flex-1 p-6 pb-12 overflow-y-auto space-y-6">
+          <div className="flex-1 p-6 pb-12 overflow-y-auto space-y-6 [scrollbar-gutter:stable]">
             
             {/* Banner Notifica Azione / Toast */}
             {notification && (
@@ -419,203 +624,404 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
             )}
 
             {/* ══════════════════════════════════════════════════════════════════
-                TAB 1: ARCHIVIAZIONE & DATI LOCALI (Sincronizzata con Wizard)
+                TAB 1: ARCHIVIAZIONE & MEMORIA LOCALE (Stile Apple Storage)
             ══════════════════════════════════════════════════════════════════ */}
             {activeTab === 'storage' && (
               <div className="space-y-6 animate-fade-in">
                 <div>
-                  <h3 className="text-sm font-bold text-white">Cartella di Archiviazione Principale</h3>
+                  <h3 className="text-sm font-bold text-white">Archiviazione & Memoria Locale</h3>
                   <p className="text-xs text-white/50 mt-1 leading-relaxed">
-                    Questa è la cartella scelta durante il Wizard o aggiornata di seguito. Contiene i tuoi appunti, file master WAV e il database SQLite.
+                    Monitora lo spazio occupato su disco da registrazioni master, database, indici vettoriali e modelli di intelligenza artificiale.
                   </p>
                 </div>
 
-                <div className="p-4 rounded-3xl liquid-glass border border-white/[0.10] shadow-liquid-sm space-y-3">
-                  <label className="text-xs font-semibold text-white/70 block">Percorso Libreria Corsi sul computer</label>
-                  <div className="flex items-center gap-3">
-                    <div className="flex-1 px-4 py-2.5 rounded-2xl liquid-input font-mono text-xs text-white/95 truncate">
-                      {storagePath}
+                {/* ── Apple-style Storage Overview Card ── */}
+                <div className="p-5 rounded-3xl liquid-glass border border-white/[0.12] shadow-liquid-sm space-y-4">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div>
+                      <span className="text-[11px] font-semibold uppercase tracking-wider text-white/45 block">
+                        Utilizzo Spazio Disco SbobinAI
+                      </span>
+                      <div className="flex items-baseline gap-2.5 mt-0.5">
+                        <h4 className="text-2xl font-bold font-mono text-white tracking-tight">
+                          {formatSize(combinedTotalMb)}
+                        </h4>
+                        <span className="text-xs text-white/50">
+                          totali impiegati sul Mac
+                        </span>
+                      </div>
                     </div>
+
+                    {/* Tasti Azione: Ottimizza & Pulisci + Comprimi Archivio + Ricalcola */}
+                    <div className="flex items-center gap-2 self-start sm:self-center">
+                      <button
+                        type="button"
+                        onClick={handleCompressArchive}
+                        disabled={isCompressingArchive}
+                        className={clsx(
+                          "px-3 py-1.5 rounded-xl border text-xs font-semibold transition-all flex items-center gap-1.5 cursor-pointer shadow-liquid-sm whitespace-nowrap",
+                          isCompressingArchive
+                            ? "bg-emerald-500/20 text-emerald-200 border-emerald-500/30 cursor-wait"
+                            : "bg-white/[0.08] hover:bg-white/[0.14] border-white/14 text-white/80 hover:text-white"
+                        )}
+                        title="Converte tutte le registrazioni WAV non compresse in M4A AAC (-85% di spazio sul disco)"
+                      >
+                        {isCompressingArchive ? (
+                          <>
+                            <Loader2 size={13} className="animate-spin text-emerald-300" />
+                            <span>Compressione...</span>
+                          </>
+                        ) : (
+                          <>
+                            <FileAudio size={13} className="text-emerald-400" />
+                            <span>Comprimi Archivio</span>
+                          </>
+                        )}
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={handleCleanOrphans}
+                        disabled={isCleaningOrphans}
+                        className={clsx(
+                          "px-3 py-1.5 rounded-xl border text-xs font-semibold transition-all flex items-center gap-1.5 cursor-pointer shadow-liquid-sm whitespace-nowrap",
+                          isCleaningOrphans
+                            ? "bg-amber-500/20 text-amber-200 border-amber-500/30 cursor-wait"
+                            : "bg-white/[0.08] hover:bg-white/[0.14] border-white/14 text-white/80 hover:text-white"
+                        )}
+                        title="Elimina vecchi audio orfani e compatta il database (VACUUM)"
+                      >
+                        {isCleaningOrphans ? (
+                          <>
+                            <Loader2 size={13} className="animate-spin text-amber-300" />
+                            <span>Pulizia in corso...</span>
+                          </>
+                        ) : (
+                          <>
+                            <RotateCcw size={13} className="text-amber-400" />
+                            <span>Ottimizza & Pulisci</span>
+                          </>
+                        )}
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          fetchStorageStats();
+                          fetchModelsStatus(true);
+                        }}
+                        disabled={loadingModels}
+                        className="px-3 py-1.5 rounded-xl liquid-glass-pill border border-white/12 hover:border-white/22 text-white/70 hover:text-white transition-all cursor-pointer text-xs flex items-center gap-1.5 whitespace-nowrap"
+                        title="Ricalcola spazio disco"
+                      >
+                        <RefreshCw size={13} className={clsx(loadingModels && "animate-spin text-blue-400")} />
+                        <span>Ricalcola</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* ── Barra Orizzontale Multicolore Stile Apple ── */}
+                  <div className="space-y-3">
+                    <div className="w-full h-3.5 rounded-full bg-white/[0.06] p-0.5 flex gap-1 overflow-hidden border border-white/[0.12]">
+                      {combinedTotalMb === 0 ? (
+                        <div className="h-full w-full bg-white/10 rounded-full animate-pulse" />
+                      ) : (
+                        storageCategories
+                          .filter((cat) => cat.sizeMb > 0)
+                          .map((cat) => (
+                            <div
+                              key={cat.id}
+                              className={clsx('h-full rounded-full transition-all duration-500', cat.color)}
+                              style={{ width: `${getBarWidth(cat.sizeMb)}%` }}
+                              title={`${cat.shortLabel}: ${formatSize(cat.sizeMb)} (${formatPct(cat.sizeMb)})`}
+                            />
+                          ))
+                      )}
+                    </div>
+
+                    {/* ── Legenda Stile macOS Storage ── */}
+                    <div className="flex flex-wrap items-center gap-x-4 gap-y-2 pt-1 text-[11px]">
+                      {storageCategories.map((cat) => (
+                        <div key={cat.id} className="flex items-center gap-1.5 whitespace-nowrap">
+                          <span className={clsx('w-2.5 h-2.5 rounded-full flex-shrink-0 shadow-sm', cat.dotColor)} />
+                          <span className="text-white/80 font-medium">{cat.shortLabel}:</span>
+                          <span className="font-mono text-white/60">{formatSize(cat.sizeMb)}</span>
+                          <span className="text-[10px] text-white/35 font-mono">({formatPct(cat.sizeMb)})</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                {/* ── Griglia Dati: Ripartizione Dettagliata (con cestino su hover per Modelli IA) ── */}
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold uppercase tracking-wider text-white/50 block">
+                      Ripartizione Dettagliata per Categoria
+                    </span>
+                    <span className="text-[11px] text-white/40 font-mono">
+                      5 categorie monitorate
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {storageCategories.map((cat) => {
+                      const Icon = cat.icon;
+                      const isHero = cat.id === 'models';
+
+                      // Scheda Hero: Modelli IA con morphing in-place fluido e altezza stabile
+                      if (isHero) {
+                        return (
+                          <div
+                            key={cat.id}
+                            className={clsx(
+                              'sm:col-span-2 p-4 rounded-2xl border transition-colors duration-300 relative flex flex-col justify-between min-h-[160px] overflow-hidden',
+                              confirmDeleteAll
+                                ? 'bg-red-500/15 border-red-500/35 shadow-liquid-sm'
+                                : 'group/card bg-white/[0.05] border-white/[0.12] hover:border-white/[0.18]'
+                            )}
+                          >
+                            <AnimatePresence mode="wait" initial={false}>
+                              {confirmDeleteAll ? (
+                                <motion.div
+                                  key="confirm"
+                                  initial={{ opacity: 0 }}
+                                  animate={{ opacity: 1 }}
+                                  exit={{ opacity: 0 }}
+                                  transition={{ duration: 0.15, ease: 'easeOut' }}
+                                  className="flex flex-col justify-between h-full flex-1 gap-3"
+                                >
+                                  <div className="space-y-1.5">
+                                    <div className="flex items-center justify-between gap-3">
+                                      <div className="flex items-center gap-2.5 min-w-0">
+                                        <div className="w-7 h-7 rounded-xl bg-red-500/20 border border-red-500/30 flex items-center justify-center flex-shrink-0 text-red-300">
+                                          <Trash2 size={14} />
+                                        </div>
+                                        <h4 className="text-xs font-bold text-white truncate">
+                                          Eliminare tutti i modelli dal disco?
+                                        </h4>
+                                      </div>
+                                      <span className="text-[10px] font-mono font-bold px-2.5 py-0.5 rounded-full bg-red-500/25 text-red-200 border border-red-500/35 whitespace-nowrap flex-shrink-0">
+                                        {formatSize(totalInstalledMb)} da liberare
+                                      </span>
+                                    </div>
+
+                                    <p className="text-[11px] font-mono text-red-300/60 truncate" title="~/.cache/huggingface/hub">
+                                      ~/.cache/huggingface/hub
+                                    </p>
+
+                                    <p className="text-[11px] text-red-200/80 leading-relaxed">
+                                      Verranno rimossi fisicamente dalla cache di sistema tutti i pesi scaricati. L'app tornerà in modalità base.
+                                    </p>
+                                  </div>
+
+                                  <div className="pt-2.5 border-t border-red-500/20 flex items-center justify-between text-[10px] gap-2">
+                                    <span className="text-red-300/60 font-medium truncate">Azione irreversibile</span>
+                                    <div className="flex items-center gap-2 flex-shrink-0">
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setConfirmDeleteAll(false);
+                                        }}
+                                        className="px-3.5 py-1.5 rounded-xl text-xs font-medium text-white/70 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer whitespace-nowrap"
+                                      >
+                                        Annulla
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          handleDeleteAllModels();
+                                        }}
+                                        disabled={actionInProgress === 'delete-all'}
+                                        className="px-4 py-1.5 rounded-xl text-xs font-semibold bg-red-500 hover:bg-red-600 text-white transition-colors cursor-pointer shadow-liquid-sm disabled:opacity-50 whitespace-nowrap flex items-center gap-1.5"
+                                      >
+                                        {actionInProgress === 'delete-all' && <Loader2 size={12} className="animate-spin text-white" />}
+                                        <span>{actionInProgress === 'delete-all' ? 'Eliminazione...' : 'Sì, elimina tutto'}</span>
+                                      </button>
+                                    </div>
+                                  </div>
+                                </motion.div>
+                              ) : (
+                                <motion.div
+                                  key="normal"
+                                  initial={{ opacity: 0 }}
+                                  animate={{ opacity: 1 }}
+                                  exit={{ opacity: 0 }}
+                                  transition={{ duration: 0.15, ease: 'easeOut' }}
+                                  className="flex flex-col justify-between h-full flex-1 gap-3"
+                                >
+                                  <div className="space-y-1.5">
+                                    <div className="flex items-center justify-between gap-3">
+                                      <div className="flex items-center gap-2.5 min-w-0">
+                                        <div className={clsx('w-7 h-7 rounded-xl flex items-center justify-center flex-shrink-0', cat.badgeBg, cat.badgeText)}>
+                                          <Icon size={14} />
+                                        </div>
+                                        <span className="text-xs font-bold text-white truncate">
+                                          {cat.label}
+                                        </span>
+                                      </div>
+
+                                      <div className="flex items-center gap-2 flex-shrink-0">
+                                        {totalInstalledMb > 0 && (
+                                          <button
+                                            type="button"
+                                            onClick={(e) => {
+                                              e.stopPropagation();
+                                              setConfirmDeleteAll(true);
+                                            }}
+                                            disabled={actionInProgress !== null}
+                                            className="opacity-0 group-hover/card:opacity-100 transition-all p-1.5 rounded-lg text-red-300 hover:text-red-200 hover:bg-red-500/20 border border-transparent hover:border-red-500/30 cursor-pointer flex items-center gap-1 text-[11px] font-medium"
+                                            title="Svuota cache e libera memoria modelli"
+                                          >
+                                            <Trash2 size={13} className="text-red-300" />
+                                            <span className="hidden sm:inline">Libera</span>
+                                          </button>
+                                        )}
+
+                                        <span className={clsx(
+                                          'text-[10px] font-mono font-bold px-2.5 py-0.5 rounded-full border whitespace-nowrap',
+                                          cat.badgeBg, cat.badgeBorder, cat.badgeText
+                                        )}>
+                                          {formatSize(cat.sizeMb)}
+                                        </span>
+                                      </div>
+                                    </div>
+
+                                    <button
+                                      type="button"
+                                      onClick={(e) => handleCopyPath(e, cat.path)}
+                                      className="group/path flex items-center gap-1.5 px-2 py-1 -ml-2 rounded-lg hover:bg-white/[0.06] text-[11px] font-mono text-white/40 hover:text-white/90 transition-all cursor-pointer w-fit max-w-full text-left"
+                                      title="Clicca per copiare il percorso"
+                                    >
+                                      <span className="truncate">{cat.path}</span>
+                                      <Copy size={11} className="opacity-0 group-hover/path:opacity-100 transition-opacity flex-shrink-0 text-white/50" />
+                                    </button>
+
+                                    <p className="text-[11px] text-white/50 leading-relaxed">
+                                      {cat.desc}
+                                    </p>
+                                  </div>
+
+                                  <div className="pt-2.5 border-t border-white/[0.06] flex items-center justify-between text-[10px] gap-2">
+                                    <span className="text-white/40 font-medium truncate">{cat.details}</span>
+                                    <span className="font-mono text-white/50 font-bold whitespace-nowrap flex-shrink-0">{formatPct(cat.sizeMb)} del totale</span>
+                                  </div>
+                                </motion.div>
+                              )}
+                            </AnimatePresence>
+                          </div>
+                        );
+                      }
+
+                      return (
+                        <div
+                          key={cat.id}
+                          className="group/card p-4 rounded-2xl bg-white/[0.03] border border-white/[0.08] hover:border-white/[0.14] transition-all flex flex-col justify-between gap-3 relative min-h-[160px]"
+                        >
+                          <div className="space-y-1.5">
+                            <div className="flex items-center justify-between gap-3">
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                <div className={clsx('w-7 h-7 rounded-xl flex items-center justify-center flex-shrink-0', cat.badgeBg, cat.badgeText)}>
+                                  <Icon size={14} />
+                                </div>
+                                <span className="text-xs font-bold text-white truncate">
+                                  {cat.label}
+                                </span>
+                              </div>
+
+                              <span className={clsx(
+                                'text-[10px] font-mono font-bold px-2.5 py-0.5 rounded-full border whitespace-nowrap',
+                                cat.badgeBg, cat.badgeBorder, cat.badgeText
+                              )}>
+                                {formatSize(cat.sizeMb)}
+                              </span>
+                            </div>
+
+                            <button
+                              type="button"
+                              onClick={(e) => handleCopyPath(e, cat.path)}
+                              className="group/path flex items-center gap-1.5 px-2 py-1 -ml-2 rounded-lg hover:bg-white/[0.06] text-[11px] font-mono text-white/40 hover:text-white/90 transition-all cursor-pointer w-fit max-w-full text-left"
+                              title="Clicca per copiare il percorso"
+                            >
+                              <span className="truncate">{cat.path}</span>
+                              <Copy size={11} className="opacity-0 group-hover/path:opacity-100 transition-opacity flex-shrink-0 text-white/50" />
+                            </button>
+
+                            <p className="text-[11px] text-white/50 leading-relaxed">
+                              {cat.desc}
+                            </p>
+                          </div>
+
+                          <div className="pt-2.5 border-t border-white/[0.06] flex items-center justify-between text-[10px] gap-2">
+                            <span className="text-white/40 font-medium truncate">{cat.details}</span>
+                            <span className="font-mono text-white/50 font-bold whitespace-nowrap flex-shrink-0">{formatPct(cat.sizeMb)} del totale</span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* ── Cartella Libreria Principale (spostata in basso) ── */}
+                <div className="p-4 rounded-3xl liquid-glass border border-white/[0.10] shadow-liquid-sm space-y-3">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-semibold text-white/80 block">
+                      Cartella Libreria SbobinAI
+                    </label>
+                    <span className="text-[10px] text-white/40 font-mono">
+                      Archivio locale quaderni e corsi
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={(e) => handleCopyPath(e, storagePath)}
+                      className="group/lib flex-1 px-4 py-2.5 rounded-2xl liquid-input font-mono text-xs text-white/95 truncate hover:bg-white/[0.08] transition-all cursor-pointer flex items-center justify-between text-left"
+                      title="Clicca per copiare il percorso della libreria"
+                    >
+                      <span className="truncate">{storagePath}</span>
+                      <Copy size={13} className="opacity-0 group-hover/lib:opacity-100 transition-opacity flex-shrink-0 text-white/45 ml-2" />
+                    </button>
                     <button
                       type="button"
                       onClick={handlePickFolder}
-                      className="px-4 py-2.5 rounded-2xl liquid-glass-pill border border-white/18 hover:border-white/28 hover:bg-white/[0.10] text-xs font-semibold text-white transition-all flex items-center gap-2 flex-shrink-0 cursor-pointer shadow-liquid-sm"
+                      className="px-4 py-2.5 rounded-2xl liquid-glass-pill border border-white/18 hover:border-white/28 hover:bg-white/[0.10] text-xs font-semibold text-white transition-all flex items-center gap-2 flex-shrink-0 cursor-pointer shadow-liquid-sm whitespace-nowrap"
                     >
                       <Folder size={14} className="text-white/70" />
                       <span>Sfoglia nel Finder...</span>
                     </button>
                   </div>
                 </div>
-
-                {/* Sottocartelle strutturate con metriche live */}
-                <div className="grid grid-cols-3 gap-3">
-                  <div className="p-3.5 rounded-2xl bg-white/[0.03] border border-white/[0.08] space-y-1.5">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2 text-xs font-semibold text-white">
-                        <Database size={14} className="text-white/60" />
-                        <span>Database SQLite</span>
-                      </div>
-                      <span className="text-[10px] font-mono font-bold text-white/50">
-                        {storageStats ? `${storageStats.sqlite_mb} MB` : '...'}
-                      </span>
-                    </div>
-                    <p className="text-[11px] font-mono text-white/40 truncate">/sqlite/sbobinai.db</p>
-                    <p className="text-[10px] text-white/50">Quaderni, sbobine e trascrizioni temporizzate.</p>
-                  </div>
-
-                  <div className="p-3.5 rounded-2xl bg-white/[0.03] border border-white/[0.08] space-y-1.5">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2 text-xs font-semibold text-white">
-                        <FileAudio size={14} className="text-white/60" />
-                        <span>Registrazioni WAV</span>
-                      </div>
-                      <span className="text-[10px] font-mono font-bold text-white/50">
-                        {storageStats ? `${storageStats.audio_mb} MB` : '...'}
-                      </span>
-                    </div>
-                    <p className="text-[11px] font-mono text-white/40 truncate">/audio/...</p>
-                    <p className="text-[10px] text-white/50">Tracce audio native 16-bit PCM salvate localmente.</p>
-                  </div>
-
-                  <div className="p-3.5 rounded-2xl bg-white/[0.03] border border-white/[0.08] space-y-1.5">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2 text-xs font-semibold text-white">
-                        <Layers size={14} className="text-white/60" />
-                        <span>Documenti & LanceDB</span>
-                      </div>
-                      <span className="text-[10px] font-mono font-bold text-white/50">
-                        {storageStats ? `${((storageStats.uploads_mb || 0) + (storageStats.lancedb_mb || 0)).toFixed(1)} MB` : '...'}
-                      </span>
-                    </div>
-                    <p className="text-[11px] font-mono text-white/40 truncate">/uploads & /lancedb</p>
-                    <p className="text-[10px] text-white/50">Materiali caricati e vettori RAG indicizzati.</p>
-                  </div>
-                </div>
-
-                {/* Sezione Manutenzione Disco & File Orfani (Garbage Collector) */}
-                <div className="p-4 rounded-3xl liquid-glass border border-white/[0.10] shadow-liquid-sm flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-                  <div className="space-y-1">
-                    <div className="flex items-center gap-2">
-                      <Trash2 size={15} className="text-amber-400" />
-                      <h4 className="text-xs font-bold text-white">Manutenzione & Spazzino File Orfani</h4>
-                    </div>
-                    <p className="text-[11px] text-white/50 leading-relaxed max-w-lg">
-                      Elimina immediatamente vecchie registrazioni o file temporanei rimasti sul disco senza un record corrispondente nel DB e compatta il database (VACUUM).
-                    </p>
-                  </div>
-
-                  <button
-                    type="button"
-                    onClick={handleCleanOrphans}
-                    disabled={isCleaningOrphans}
-                    className={clsx(
-                      'px-4 py-2.5 rounded-2xl font-semibold text-xs transition-all flex items-center justify-center gap-2 flex-shrink-0 cursor-pointer shadow-liquid-sm',
-                      isCleaningOrphans
-                        ? 'bg-amber-500/20 text-amber-200 border border-amber-500/30 cursor-wait'
-                        : 'bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30'
-                    )}
-                  >
-                    {isCleaningOrphans ? (
-                      <>
-                        <Loader2 size={13} className="animate-spin text-amber-300" />
-                        <span>Pulizia in corso...</span>
-                      </>
-                    ) : (
-                      <>
-                        <RotateCcw size={13} />
-                        <span>Svuota Cache & File Orfani</span>
-                      </>
-                    )}
-                  </button>
-                </div>
               </div>
             )}
 
             {/* ══════════════════════════════════════════════════════════════════
-                TAB 2: GESTIONE MODELLI IA & CACHE (SENZA TESTI TAGLIATI O DUPLICATI)
+                TAB 2: MODELLI (DISCO & RETI NEURALI)
             ══════════════════════════════════════════════════════════════════ */}
             {activeTab === 'models' && (
               <div className="space-y-6 animate-fade-in">
                 
-                {/* ── Header Monitoraggio Spazio & Controlli Rapidi (Risolto overflow) ── */}
-                <div className="p-4 rounded-3xl liquid-glass border border-white/[0.12] shadow-liquid-sm flex flex-col md:flex-row md:items-center justify-between gap-4">
-                  <div className="flex items-center gap-3.5 min-w-0">
-                    <div className="w-10 h-10 rounded-2xl bg-white/[0.08] border border-white/[0.12] flex items-center justify-center text-white/80 flex-shrink-0">
-                      <HardDrive size={18} />
-                    </div>
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2.5 flex-wrap">
-                        <span className="text-xs font-bold text-white">
-                          Memoria Modelli IA sul computer:
-                        </span>
-                        <span className="text-xs font-bold font-mono px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                          {totalInstalledMb} MB {totalInstalledMb > 1024 ? `(~${(totalInstalledMb / 1024).toFixed(2)} GB)` : ''}
-                        </span>
-                      </div>
-                      <p className="text-[11px] text-white/45 mt-0.5 truncate">
-                        Posizione cache sul computer: ~/.cache/huggingface/hub
-                      </p>
-                    </div>
+                {/* ── Header Tab Modelli ── */}
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-2 border-b border-white/[0.08]">
+                  <div>
+                    <h3 className="text-sm font-bold text-white">Modelli di Intelligenza Artificiale</h3>
+                    <p className="text-xs text-white/50 mt-0.5 leading-relaxed">
+                      Motori vocali, vettoriali e modelli linguistici eseguiti al 100% in locale sul tuo Mac con accelerazione Apple Silicon MLX.
+                    </p>
                   </div>
-
-                  {/* Pulsanti Header (senza troncamento) */}
-                  <div className="flex items-center gap-2 flex-shrink-0">
-                    {/* Ricarica stato */}
-                    <button
-                      type="button"
-                      onClick={() => fetchModelsStatus()}
-                      disabled={loadingModels}
-                      className="p-2 rounded-xl liquid-glass-pill border border-white/12 hover:border-white/22 text-white/70 hover:text-white transition-all cursor-pointer disabled:opacity-50"
-                      title="Ricarica stato da disco"
-                    >
-                      <RefreshCw size={14} className={clsx(loadingModels && "animate-spin text-blue-400")} />
-                    </button>
-
-                    {/* Svuota Tutta la Cache (senza testo tagliato) */}
-                    {totalInstalledMb > 0 && (
-                      <button
-                        type="button"
-                        onClick={() => setConfirmDeleteAll(true)}
-                        className="flex items-center gap-1.5 px-3.5 py-2 rounded-2xl text-xs font-semibold bg-red-500/20 text-red-200 border border-red-500/35 hover:bg-red-500/30 transition-all cursor-pointer whitespace-nowrap shadow-liquid-sm flex-shrink-0"
-                      >
-                        <Trash2 size={13} className="text-red-300" />
-                        <span>Svuota tutta la cache</span>
-                      </button>
-                    )}
-                  </div>
+                  <button
+                    type="button"
+                    onClick={() => fetchModelsStatus()}
+                    disabled={loadingModels}
+                    className="self-start sm:self-center px-3 py-1.5 rounded-xl liquid-glass-pill border border-white/12 hover:border-white/22 text-white/70 hover:text-white transition-all cursor-pointer disabled:opacity-50 flex items-center gap-1.5 text-xs flex-shrink-0"
+                    title="Ricarica stato da disco"
+                  >
+                    <RefreshCw size={13} className={clsx(loadingModels && "animate-spin text-blue-400")} />
+                    <span>Ricarica stato</span>
+                  </button>
                 </div>
-
-                {/* Banner di Conferma Eliminazione Totale */}
-                {confirmDeleteAll && (
-                  <div className="p-4 rounded-3xl bg-red-500/15 border border-red-500/35 text-xs text-red-200 space-y-3 animate-fade-in shadow-liquid-sm">
-                    <div className="flex items-start gap-3">
-                      <Trash2 size={18} className="text-red-300 flex-shrink-0 mt-0.5" />
-                      <div>
-                        <h4 className="font-bold text-white text-sm">Vuoi davvero eliminare tutti i modelli dal disco?</h4>
-                        <p className="text-xs text-red-200/80 mt-1 leading-relaxed">
-                          Verranno rimossi fisicamente dalla cache di sistema tutti i file ({totalInstalledMb} MB liberati). L'app tornerà in modalità simulatore fittizia (0 MB).
-                        </p>
-                      </div>
-                    </div>
-                    <div className="flex items-center justify-end gap-2.5 pt-1">
-                      <button
-                        type="button"
-                        onClick={() => setConfirmDeleteAll(false)}
-                        className="px-4 py-1.5 rounded-xl text-xs font-medium text-white/70 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer"
-                      >
-                        Annulla
-                      </button>
-                      <button
-                        type="button"
-                        onClick={handleDeleteAllModels}
-                        disabled={actionInProgress === 'delete-all'}
-                        className="px-4 py-1.5 rounded-xl text-xs font-semibold bg-red-500 text-white hover:bg-red-600 transition-colors cursor-pointer shadow-liquid-sm disabled:opacity-50"
-                      >
-                        {actionInProgress === 'delete-all' ? 'Eliminazione in corso...' : 'Sì, Elimina Tutto e Libera Spazio'}
-                      </button>
-                    </div>
-                  </div>
-                )}
 
                 {/* ── Barra Filtri Modelli (Motori Base vs LLM) ── */}
                 <div className="flex items-center justify-between border-b border-white/[0.08] pb-2">
@@ -660,14 +1066,8 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                     </div>
 
                     <div className="space-y-3">
-                      {loadingModels && !modelsStatus ? (
-                        <div className="p-8 rounded-3xl liquid-glass border border-white/10 text-center space-y-2">
-                          <RefreshCw size={22} className="animate-spin text-blue-400 mx-auto" />
-                          <p className="text-xs text-white/60">Verifica componenti di sistema in corso...</p>
-                        </div>
-                      ) : (
-                        (() => {
-                          const coreWhisper = modelsStatus?.whisper?.find((m) => m.id === 'large-v3-turbo-q4') || {
+                      {(() => {
+                        const coreWhisper = modelsStatus?.whisper?.find((m) => m.id === 'large-v3-turbo-q4') || {
                             id: 'large-v3-turbo-q4',
                             name: 'Whisper Large-v3-Turbo Q4 (locale)',
                             type: 'whisper' as const,
@@ -702,7 +1102,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                                 className={clsx(
                                   'p-4 rounded-3xl border transition-all space-y-3',
                                   m.downloaded
-                                    ? 'bg-emerald-500/[0.07] border-emerald-500/25 shadow-liquid-sm'
+                                    ? 'liquid-glass border-white/[0.14] shadow-liquid-sm'
                                     : 'liquid-glass-subtle border-white/[0.08] hover:border-white/16'
                                 )}
                               >
@@ -711,7 +1111,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                                     <div className={clsx(
                                       'w-9 h-9 rounded-2xl flex items-center justify-center flex-shrink-0 mt-0.5',
                                       m.downloaded
-                                        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                                        ? 'bg-white/[0.10] text-white border border-white/[0.14]'
                                         : 'bg-white/5 text-white/40 border border-white/10'
                                     )}>
                                       {isMic ? <Mic size={16} /> : <Database size={16} />}
@@ -720,17 +1120,16 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                                     <div className="min-w-0">
                                       <div className="flex items-center gap-2 flex-wrap">
                                         <h4 className="text-xs font-bold text-white">{m.name}</h4>
-                                        <span className="text-[10px] px-2 py-0.5 rounded-full font-mono bg-blue-500/20 text-blue-300 border border-blue-500/30">
+                                        <span className="text-[10px] px-2 py-0.5 rounded-full font-mono bg-white/[0.06] text-white/60 border border-white/[0.10]">
                                           Componente Base
                                         </span>
                                         {m.downloaded ? (
-                                          <span className="text-[10px] font-semibold px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 flex items-center gap-1">
-                                            <Check size={11} strokeWidth={2.5} />
-                                            <span>Installato e Operativo ({m.disk_size_mb || m.total_mb} MB)</span>
+                                          <span className="text-[10px] font-mono text-white/40">
+                                            {m.disk_size_mb || m.total_mb} MB
                                           </span>
                                         ) : (
-                                          <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/25">
-                                            Da Installare ({m.approx_size})
+                                          <span className="text-[10px] px-2 py-0.5 rounded-full font-mono bg-amber-500/15 text-amber-300 border border-amber-500/25">
+                                            Da installare ({m.approx_size})
                                           </span>
                                         )}
                                       </div>
@@ -743,8 +1142,9 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                                   <div className="flex items-center gap-2 flex-shrink-0 self-end sm:self-center">
                                     {m.downloaded ? (
                                       <>
-                                        <span className="text-[11px] font-semibold text-emerald-400 px-2 py-1">
-                                          Verificato ✓
+                                        <span className="text-[11px] font-semibold text-emerald-300 bg-emerald-500/15 border border-emerald-500/30 px-2.5 py-1 rounded-full flex items-center gap-1.5 shadow-liquid-sm">
+                                          <Check size={11} strokeWidth={2.5} />
+                                          <span>Operativo</span>
                                         </span>
                                         <button
                                           type="button"
@@ -804,8 +1204,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                               </div>
                             );
                           });
-                        })()
-                      )}
+                        })()}
                     </div>
                   </div>
                 )}
@@ -823,17 +1222,9 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                     </div>
 
                     <div className="space-y-3">
-                      {loadingModels && !modelsStatus ? (
-                        <div className="p-8 rounded-3xl liquid-glass border border-white/10 text-center space-y-2">
-                          <RefreshCw size={22} className="animate-spin text-blue-400 mx-auto" />
-                          <p className="text-xs text-white/60">Verifica modelli LLM in corso...</p>
-                        </div>
-                      ) : !modelsStatus?.llm || modelsStatus.llm.length === 0 ? (
-                        <div className="p-6 rounded-3xl liquid-glass border border-white/10 text-center space-y-3">
-                          <p className="text-xs text-white/70">Nessun modello LLM configurato.</p>
-                        </div>
-                      ) : (
-                        modelsStatus.llm.map((m: ModelInfo) => {
+                      {(() => {
+                        const llmList = (modelsStatus?.llm && modelsStatus.llm.length > 0) ? modelsStatus.llm : defaultLlms;
+                        return llmList.map((m: ModelInfo) => {
                           const isCurrentActive = llmModel === m.id;
                           const isDownloading = m.status === 'downloading' || actionInProgress === m.id;
                           const isDeletingThis = actionInProgress === `delete-${m.id}`;
@@ -863,17 +1254,12 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                                   <div className="min-w-0">
                                     <div className="flex items-center gap-2 flex-wrap">
                                       <h4 className="text-xs font-bold text-white">{m.name}</h4>
-                                      {m.downloaded && isCurrentActive ? (
-                                        <span className="text-[10px] font-semibold px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 flex items-center gap-1">
-                                          <Check size={11} strokeWidth={2.5} />
-                                          <span>In uso ({m.disk_size_mb || m.total_mb} MB)</span>
-                                        </span>
-                                      ) : m.downloaded ? (
-                                        <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-300 border border-blue-500/30">
-                                          Scaricato ({m.disk_size_mb || m.total_mb} MB)
+                                      {m.downloaded ? (
+                                        <span className="text-[10px] font-mono text-white/40">
+                                          {m.disk_size_mb || m.total_mb} MB
                                         </span>
                                       ) : (
-                                        <span className="text-[10px] px-2 py-0.5 rounded-full bg-white/10 text-white/50 border border-white/10">
+                                        <span className="text-[10px] px-2 py-0.5 rounded-full font-mono bg-white/[0.06] text-white/45 border border-white/[0.08]">
                                           Non scaricato ({m.approx_size})
                                         </span>
                                       )}
@@ -887,18 +1273,19 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                                 <div className="flex items-center gap-2 flex-shrink-0 self-end sm:self-center">
                                   {m.downloaded ? (
                                     <>
-                                      {!isCurrentActive ? (
+                                      {isCurrentActive ? (
+                                        <span className="text-[11px] font-semibold text-emerald-300 bg-emerald-500/15 border border-emerald-500/30 px-2.5 py-1 rounded-full flex items-center gap-1.5 shadow-liquid-sm">
+                                          <Check size={11} strokeWidth={2.5} />
+                                          <span>In uso</span>
+                                        </span>
+                                      ) : (
                                         <button
                                           type="button"
                                           onClick={() => handleSelectActiveLlm(m.id)}
-                                          className="px-3.5 py-1.5 rounded-xl text-xs font-semibold bg-white/[0.14] hover:bg-white/[0.22] text-white border border-white/[0.18] transition-all cursor-pointer shadow-liquid-sm"
+                                          className="px-3.5 py-1.5 rounded-xl text-xs font-semibold bg-white/[0.12] hover:bg-white/[0.20] text-white border border-white/[0.16] transition-all cursor-pointer shadow-liquid-sm"
                                         >
-                                          Imposta come Attivo
+                                          Attiva
                                         </button>
-                                      ) : (
-                                        <span className="text-[11px] font-semibold text-emerald-400 px-2 py-1">
-                                          Attivo ✓
-                                        </span>
                                       )}
 
                                       {confirmDeleteModelId === m.id ? (
@@ -978,8 +1365,8 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                               )}
                             </div>
                           );
-                        })
-                      )}
+                        });
+                      })()}
                     </div>
                   </div>
                 )}
@@ -988,71 +1375,305 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
             )}
 
             {/* ══════════════════════════════════════════════════════════════════
-                TAB 3: MOTORE AUDIO & FILTRO VAD
+                TAB 3: FILTRO ATTIVITÀ VOCALE (VAD) — DESIGN MINIMAL APPLE
             ══════════════════════════════════════════════════════════════════ */}
             {activeTab === 'audio' && (
               <div className="space-y-6 animate-fade-in">
                 <div>
-                  <h3 className="text-sm font-bold text-white">Motore Audio in RAM & Voice Activity Detection</h3>
+                  <h3 className="text-sm font-semibold tracking-tight text-white">Filtro Attività Vocale (VAD)</h3>
                   <p className="text-xs text-white/50 mt-1 leading-relaxed">
-                    L'audio della lezione viene elaborato nei banchi RAM per azzerare l'usura del disco SSD e filtrare il silenzio dell'aula.
+                    Regola la sensibilità con cui SbobinAI rileva la voce del docente ed esclude le pause di silenzio e il brusio d'aula durante la registrazione.
                   </p>
                 </div>
 
-                <div className="p-5 rounded-3xl liquid-glass border border-white/[0.10] shadow-liquid-sm space-y-4">
-                  <div className="flex items-center justify-between">
-                    <label className="text-xs font-semibold text-white/80 flex items-center gap-2">
-                      <Sliders size={14} className="text-white/70" />
-                      <span>Sensibilità Filtro Voce (WebRTC VAD)</span>
-                    </label>
-                    <span className="text-xs font-mono font-bold text-emerald-400 bg-emerald-500/15 border border-emerald-500/30 px-2.5 py-0.5 rounded-full">
-                      Livello {vadSensitivity} di 3
-                    </span>
-                  </div>
+                {/* Selezione a 3 Opzioni Minimal Stile macOS */}
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  {/* Opzione 1: Ampia */}
+                  <button
+                    type="button"
+                    onClick={() => handleVadChange(1)}
+                    className={clsx(
+                      'p-4 rounded-2xl border text-left transition-all duration-200 flex flex-col justify-between cursor-pointer select-none',
+                      vadSensitivity === 1
+                        ? 'bg-white/[0.09] border-white/30 shadow-liquid-sm'
+                        : 'bg-white/[0.02] border-white/[0.07] hover:bg-white/[0.05] hover:border-white/[0.14]'
+                    )}
+                  >
+                    <div>
+                      <div className="flex items-center justify-between mb-3">
+                        <div className={clsx(
+                          'w-8 h-8 rounded-xl flex items-center justify-center transition-colors',
+                          vadSensitivity === 1 ? 'bg-white text-black' : 'bg-white/[0.06] text-white/70'
+                        )}>
+                          <Volume2 size={15} strokeWidth={2} />
+                        </div>
+                        <div className={clsx(
+                          'w-4 h-4 rounded-full border flex items-center justify-center transition-all',
+                          vadSensitivity === 1 ? 'border-white bg-white text-black' : 'border-white/20'
+                        )}>
+                          {vadSensitivity === 1 && <div className="w-1.5 h-1.5 rounded-full bg-black" />}
+                        </div>
+                      </div>
 
-                  <input
-                    type="range"
-                    min={1}
-                    max={3}
-                    step={1}
-                    value={vadSensitivity}
-                    onChange={(e) => handleVadChange(Number(e.target.value))}
-                    className="w-full accent-white h-2 bg-white/10 rounded-lg cursor-pointer"
-                  />
+                      <div className="space-y-1">
+                        <span className="text-xs font-semibold text-white tracking-tight block">
+                          Ampia
+                        </span>
+                        <p className="text-[11px] text-white/50 leading-relaxed">
+                          Sensibilità elevata per cattedre distanti o aule ampie. Cattura anche le spiegazioni a voce moderata.
+                        </p>
+                      </div>
+                    </div>
 
-                  <div className="grid grid-cols-3 gap-2 pt-2 text-[11px] font-mono text-center">
-                    <div className={clsx("p-2 rounded-xl border transition-all", vadSensitivity === 1 ? "bg-white/[0.12] border-white/20 text-white font-semibold" : "border-transparent text-white/40")}>
-                      1: Permissivo (Voce lontana)
+                    <div className="mt-4 pt-3 border-t border-white/[0.06]">
+                      <span className="text-[10px] font-mono text-white/40 block">
+                        Raggio: Ampio · RMS 140
+                      </span>
                     </div>
-                    <div className={clsx("p-2 rounded-xl border transition-all", vadSensitivity === 2 ? "bg-white/[0.12] border-white/20 text-white font-semibold" : "border-transparent text-white/40")}>
-                      2: Bilanciato (Consigliato aula)
+                  </button>
+
+                  {/* Opzione 2: Standard (Consigliata) */}
+                  <button
+                    type="button"
+                    onClick={() => handleVadChange(2)}
+                    className={clsx(
+                      'p-4 rounded-2xl border text-left transition-all duration-200 flex flex-col justify-between cursor-pointer select-none relative',
+                      vadSensitivity === 2
+                        ? 'bg-white/[0.09] border-white/30 shadow-liquid-sm'
+                        : 'bg-white/[0.02] border-white/[0.07] hover:bg-white/[0.05] hover:border-white/[0.14]'
+                    )}
+                  >
+                    <div>
+                      <div className="flex items-center justify-between mb-3">
+                        <div className={clsx(
+                          'w-8 h-8 rounded-xl flex items-center justify-center transition-colors',
+                          vadSensitivity === 2 ? 'bg-white text-black' : 'bg-white/[0.06] text-white/70'
+                        )}>
+                          <Sparkles size={15} strokeWidth={2} />
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-white/[0.10] text-white/80 border border-white/[0.14]">
+                            Consigliata
+                          </span>
+                          <div className={clsx(
+                            'w-4 h-4 rounded-full border flex items-center justify-center transition-all',
+                            vadSensitivity === 2 ? 'border-white bg-white text-black' : 'border-white/20'
+                          )}>
+                            {vadSensitivity === 2 && <div className="w-1.5 h-1.5 rounded-full bg-black" />}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="space-y-1">
+                        <span className="text-xs font-semibold text-white tracking-tight block">
+                          Standard
+                        </span>
+                        <p className="text-[11px] text-white/50 leading-relaxed">
+                          Bilanciamento ottimale per la maggior parte delle lezioni. Isola la voce ed esclude il brusio circostante.
+                        </p>
+                      </div>
                     </div>
-                    <div className={clsx("p-2 rounded-xl border transition-all", vadSensitivity === 3 ? "bg-white/[0.12] border-white/20 text-white font-semibold" : "border-transparent text-white/40")}>
-                      3: Aggressivo (Solo vicino)
+
+                    <div className="mt-4 pt-3 border-t border-white/[0.06]">
+                      <span className="text-[10px] font-mono text-white/40 block">
+                        Raggio: 3–8m · RMS 190
+                      </span>
                     </div>
-                  </div>
+                  </button>
+
+                  {/* Opzione 3: Diretta */}
+                  <button
+                    type="button"
+                    onClick={() => handleVadChange(3)}
+                    className={clsx(
+                      'p-4 rounded-2xl border text-left transition-all duration-200 flex flex-col justify-between cursor-pointer select-none',
+                      vadSensitivity === 3
+                        ? 'bg-white/[0.09] border-white/30 shadow-liquid-sm'
+                        : 'bg-white/[0.02] border-white/[0.07] hover:bg-white/[0.05] hover:border-white/[0.14]'
+                    )}
+                  >
+                    <div>
+                      <div className="flex items-center justify-between mb-3">
+                        <div className={clsx(
+                          'w-8 h-8 rounded-xl flex items-center justify-center transition-colors',
+                          vadSensitivity === 3 ? 'bg-white text-black' : 'bg-white/[0.06] text-white/70'
+                        )}>
+                          <Shield size={15} strokeWidth={2} />
+                        </div>
+                        <div className={clsx(
+                          'w-4 h-4 rounded-full border flex items-center justify-center transition-all',
+                          vadSensitivity === 3 ? 'border-white bg-white text-black' : 'border-white/20'
+                        )}>
+                          {vadSensitivity === 3 && <div className="w-1.5 h-1.5 rounded-full bg-black" />}
+                        </div>
+                      </div>
+
+                      <div className="space-y-1">
+                        <span className="text-xs font-semibold text-white tracking-tight block">
+                          Diretta
+                        </span>
+                        <p className="text-[11px] text-white/50 leading-relaxed">
+                          Filtro rigoroso per prime file o microfoni vicini (AirPods o USB). Esclude mormorii e voci dei compagni.
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="mt-4 pt-3 border-t border-white/[0.06]">
+                      <span className="text-[10px] font-mono text-white/40 block">
+                        Raggio: 1–3m · RMS 260
+                      </span>
+                    </div>
+                  </button>
                 </div>
 
-                {/* Specifiche Tecniche Audio Stream */}
-                <div className="p-4 rounded-3xl bg-white/[0.02] border border-white/[0.06] space-y-2.5">
-                  <span className="text-xs font-semibold text-white/70 block">Parametri Flusso Audio Locale</span>
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs font-mono text-white/60">
-                    <div className="p-2.5 rounded-xl bg-white/[0.02] border border-white/[0.04]">
-                      <span className="text-[10px] text-white/35 block">Frequenza</span>
-                      <strong className="text-white">16.000 Hz</strong>
+                {/* Parametri di Sistema Stile macOS */}
+                <div className="p-4 rounded-2xl bg-white/[0.02] border border-white/[0.06] flex items-center justify-between text-xs">
+                  <div className="flex items-center gap-2.5 text-white/70">
+                    <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                    <span>WebRTC VAD attivo a 16 kHz Mono (PCM 16-bit LE)</span>
+                  </div>
+                  <span className="text-[11px] font-mono text-white/40">
+                    Ring Buffer in RAM (zero logorio SSD)
+                  </span>
+                </div>
+
+                {/* ══════════════════════════════════════════════════════════════════
+                    SEZIONE: FORMATO REGISTRAZIONE AUDIO & SALVA-SPAZIO (5.6)
+                ══════════════════════════════════════════════════════════════════ */}
+                <div className="pt-2 space-y-3">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div>
+                      <h3 className="text-sm font-semibold tracking-tight text-white flex items-center gap-2">
+                        <FileAudio size={16} className="text-white/80" />
+                        Formato Registrazione Audio & Salva-Spazio
+                      </h3>
+                      <p className="text-xs text-white/50 mt-0.5 leading-relaxed">
+                        Configura il formato con cui salvare automaticamente le lezioni. La compressione M4A riduce lo spazio dell'85% preservando la chiarezza della voce.
+                      </p>
                     </div>
-                    <div className="p-2.5 rounded-xl bg-white/[0.02] border border-white/[0.04]">
-                      <span className="text-[10px] text-white/35 block">Canali</span>
-                      <strong className="text-white">Mono (1 ch)</strong>
-                    </div>
-                    <div className="p-2.5 rounded-xl bg-white/[0.02] border border-white/[0.04]">
-                      <span className="text-[10px] text-white/35 block">Formato PCM</span>
-                      <strong className="text-white">16-bit LE</strong>
-                    </div>
-                    <div className="p-2.5 rounded-xl bg-white/[0.02] border border-white/[0.04]">
-                      <span className="text-[10px] text-white/35 block">Architettura</span>
-                      <strong className="text-white">RAM Ring Buffer</strong>
-                    </div>
+
+                    <button
+                      type="button"
+                      onClick={handleCompressArchive}
+                      disabled={isCompressingArchive}
+                      className={clsx(
+                        "px-3 py-1.5 rounded-xl border text-xs font-semibold transition-all flex items-center gap-1.5 cursor-pointer shadow-liquid-sm self-start sm:self-center whitespace-nowrap",
+                        isCompressingArchive
+                          ? "bg-emerald-500/20 text-emerald-200 border-emerald-500/30 cursor-wait"
+                          : "bg-white/[0.06] hover:bg-white/[0.12] border-white/12 text-white/80 hover:text-white"
+                      )}
+                      title="Comprime tutte le registrazioni passate ancora in formato WAV liberando spazio sul disco"
+                    >
+                      {isCompressingArchive ? (
+                        <>
+                          <Loader2 size={13} className="animate-spin text-emerald-300" />
+                          <span>Compressione...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles size={13} className="text-emerald-400" />
+                          <span>Comprimi archivio esistente</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    {/* Opzione 1: M4A Compresso (Consigliato) */}
+                    <button
+                      type="button"
+                      onClick={() => handleAudioFormatChange('m4a')}
+                      className={clsx(
+                        'p-4 rounded-2xl border text-left transition-all duration-200 flex flex-col justify-between cursor-pointer select-none relative',
+                        audioFormat === 'm4a'
+                          ? 'bg-white/[0.09] border-white/30 shadow-liquid-sm'
+                          : 'bg-white/[0.02] border-white/[0.07] hover:bg-white/[0.05] hover:border-white/[0.14]'
+                      )}
+                    >
+                      <div>
+                        <div className="flex items-center justify-between mb-3">
+                          <div className={clsx(
+                            'w-8 h-8 rounded-xl flex items-center justify-center transition-colors',
+                            audioFormat === 'm4a' ? 'bg-white text-black' : 'bg-white/[0.06] text-white/70'
+                          )}>
+                            <Sparkles size={15} strokeWidth={2} />
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[9px] font-medium px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                              Consigliato · -85% Spazio
+                            </span>
+                            <div className={clsx(
+                              'w-4 h-4 rounded-full border flex items-center justify-center transition-all',
+                              audioFormat === 'm4a' ? 'border-white bg-white text-black' : 'border-white/20'
+                            )}>
+                              {audioFormat === 'm4a' && <div className="w-1.5 h-1.5 rounded-full bg-black" />}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="space-y-1">
+                          <span className="text-xs font-semibold text-white tracking-tight block">
+                            M4A Compresso (AAC Vocale 48 kbps)
+                          </span>
+                          <p className="text-[11px] text-white/50 leading-relaxed">
+                            Occupa solo ~18 MB per ora (risparmia circa 97 MB/h). Riproduzione istantanea, sincronizzazione karaoke parola per parola e disco protetto dalla saturazione.
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="mt-4 pt-3 border-t border-white/[0.06] flex items-center justify-between text-[10px] font-mono text-white/40">
+                        <span>Codec: AAC · 48 kbps Mono</span>
+                        <span className="text-emerald-400 font-medium">~18 MB / ora</span>
+                      </div>
+                    </button>
+
+                    {/* Opzione 2: WAV Non Compresso */}
+                    <button
+                      type="button"
+                      onClick={() => handleAudioFormatChange('wav')}
+                      className={clsx(
+                        'p-4 rounded-2xl border text-left transition-all duration-200 flex flex-col justify-between cursor-pointer select-none',
+                        audioFormat === 'wav'
+                          ? 'bg-white/[0.09] border-white/30 shadow-liquid-sm'
+                          : 'bg-white/[0.02] border-white/[0.07] hover:bg-white/[0.05] hover:border-white/[0.14]'
+                      )}
+                    >
+                      <div>
+                        <div className="flex items-center justify-between mb-3">
+                          <div className={clsx(
+                            'w-8 h-8 rounded-xl flex items-center justify-center transition-colors',
+                            audioFormat === 'wav' ? 'bg-white text-black' : 'bg-white/[0.06] text-white/70'
+                          )}>
+                            <Volume2 size={15} strokeWidth={2} />
+                          </div>
+                          <div className="flex items-center gap-1.5">
+                            <span className="text-[9px] font-medium px-2 py-0.5 rounded-full bg-white/[0.08] text-white/70 border border-white/[0.12]">
+                              Lineare PCM
+                            </span>
+                            <div className={clsx(
+                              'w-4 h-4 rounded-full border flex items-center justify-center transition-all',
+                              audioFormat === 'wav' ? 'border-white bg-white text-black' : 'border-white/20'
+                            )}>
+                              {audioFormat === 'wav' && <div className="w-1.5 h-1.5 rounded-full bg-black" />}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="space-y-1">
+                          <span className="text-xs font-semibold text-white tracking-tight block">
+                            WAV Originale Non Compresso
+                          </span>
+                          <p className="text-[11px] text-white/50 leading-relaxed">
+                            Copia identica al campione microfonico grezzo a 16-bit 16 kHz. Massima fedeltà d'archivio senza compressione lossy (~115 MB/ora).
+                          </p>
+                        </div>
+                      </div>
+
+                      <div className="mt-4 pt-3 border-t border-white/[0.06] flex items-center justify-between text-[10px] font-mono text-white/40">
+                        <span>Formato: PCM 16-bit · 16 kHz</span>
+                        <span className="text-white/50">~115 MB / ora</span>
+                      </div>
+                    </button>
                   </div>
                 </div>
               </div>
@@ -1162,6 +1783,19 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
             </button>
           </div>
         </div>
+
+        {/* ── Floating Tooltip Copiato sopra il puntatore ── */}
+        {copyTooltip && (
+          <div
+            style={{ left: copyTooltip.x, top: copyTooltip.y }}
+            className="fixed pointer-events-none z-[100] -translate-x-1/2 -translate-y-full -mt-2.5"
+          >
+            <div className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-white text-black text-xs font-semibold shadow-2xl border border-white/40 animate-slide-up select-none">
+              <Check size={12} strokeWidth={2.5} className="text-emerald-600" />
+              <span>Copiato!</span>
+            </div>
+          </div>
+        )}
 
       </div>
     </div>

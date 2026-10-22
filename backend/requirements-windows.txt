@@ -30,6 +30,7 @@ scipy>=1.11.0
 webrtcvad-wheels>=2.0.14
 huggingface-hub>=0.23.0
 tqdm>=4.66.0
+av>=12.0.0
 
 # ── Speech-to-Text (CTranslate2: CUDA 12 + cuDNN 9 con GPU NVIDIA, altrimenti CPU int8) ──
 faster-whisper>=1.1.0

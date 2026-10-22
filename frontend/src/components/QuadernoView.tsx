@@ -5,15 +5,52 @@ import {
   Check, X, Search, HelpCircle, Square, Loader2,
   PanelLeftClose, PanelLeftOpen, AlertTriangle,
   Play, Pause, RotateCcw, Bookmark as BookmarkIcon,
-  Download, FileDown
+  FileDown, Music, Share2
 } from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
 import { clsx } from 'clsx';
-import type { Lecture, Subject, DetectedQuestion, Bookmark } from '../types';
+import type { Lecture, Subject, DetectedQuestion, Bookmark, KaraokeLine } from '../types';
 import { api } from '../lib/api';
 import { useSettings } from '../lib/SettingsContext';
 import MaterialiFinderModal from './MaterialiFinderModal';
 import SegmentedControl from './SegmentedControl';
 import MarkdownContent from './MarkdownContent';
+import { AppleLyricsView } from './AppleLyricsView';
+
+function normalizeKaraokeLines(raw: any): KaraokeLine[] {
+  if (!raw) return [];
+  const list = Array.isArray(raw) ? raw : (raw.lines || raw.segments || []);
+  if (!Array.isArray(list)) return [];
+
+  const maxEnd = list.length > 0 ? Math.max(...list.map((it: any) => parseFloat(it.lineEnd ?? it.end ?? 0))) : 0;
+  const mult = maxEnd > 0 && maxEnd < 100000 ? 1000 : 1;
+
+  return list.map((item: any) => {
+    const rawStart = parseFloat(item.lineStart ?? item.start ?? 0);
+    const rawEnd = parseFloat(item.lineEnd ?? item.end ?? 0);
+
+    const wordsSrc = item.words || [];
+    const words = wordsSrc.map((w: any) => {
+      const wText = String(w.text || w.word || '').trim();
+      const wStart = parseFloat(w.start ?? 0) * mult;
+      const wEnd = parseFloat(w.end ?? 0) * mult;
+      return {
+        text: wText,
+        start: Math.round(wStart),
+        end: Math.round(wEnd),
+      };
+    }).filter((w: any) => w.text.length > 0);
+
+    const lineStart = Math.round(rawStart * mult);
+    const lineEnd = Math.round(rawEnd * mult);
+
+    return {
+      lineStart: words.length > 0 ? Math.min(lineStart, words[0].start) : lineStart,
+      lineEnd: words.length > 0 ? Math.max(lineEnd, words[words.length - 1].end) : lineEnd,
+      words,
+    };
+  }).filter((line: any) => line.words.length > 0);
+}
 
 interface Props {
   subject: Subject;
@@ -107,6 +144,24 @@ export default function QuadernoView({
   // Export State
   const [showExportMenu, setShowExportMenu] = useState(false);
   const [exportNotice, setExportNotice] = useState<string | null>(null);
+  const exportMenuRef = useRef<HTMLDivElement | null>(null);
+
+  // Chiudi il menu esporta se si clicca altrove nello schermo
+  useEffect(() => {
+    if (!showExportMenu) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (exportMenuRef.current && !exportMenuRef.current.contains(e.target as Node)) {
+        setShowExportMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [showExportMenu]);
+
+  // ── Sincronizzazione Trascrizione Stile Apple Music ─────────────────────
+  const [karaokeLines, setKaraokeLines] = useState<KaraokeLine[] | null>(null);
+  const [loadingKaraoke, setLoadingKaraoke] = useState(false);
+  const [copiedTranscript, setCopiedTranscript] = useState(false);
 
   // State per generazione risposta domanda specifica con IA
   const [answeringQuestionId, setAnsweringQuestionId] = useState<string | null>(null);
@@ -264,8 +319,52 @@ export default function QuadernoView({
     };
   }, [selectedLecture?.id]);
 
+  // Carica i timestamp parola per parola all'apertura della lezione (Stile Apple Music)
+  useEffect(() => {
+    setKaraokeLines(null);
+    if (!selectedLecture) {
+      setLoadingKaraoke(false);
+      return;
+    }
+    let isMounted = true;
+    setLoadingKaraoke(true);
+    api.lectures.getTimestamps(selectedLecture.id)
+      .then((res: any) => {
+        if (isMounted) {
+          const parsed = normalizeKaraokeLines(res);
+          setKaraokeLines(parsed.length > 0 ? parsed : null);
+        }
+      })
+      .catch((err) => {
+        console.warn('[Karaoke] Timestamps non disponibili:', err);
+      })
+      .finally(() => {
+        if (isMounted) setLoadingKaraoke(false);
+      });
+    return () => { isMounted = false; };
+  }, [selectedLecture?.id]);
+
+  const handleSeekAudio = (seconds: number) => {
+    if (!selectedLecture?.audio_path || !audioRef.current) return;
+    audioRef.current.currentTime = Math.max(0, seconds);
+    setCurrentTime(seconds);
+    if (!isPlaying) {
+      audioRef.current
+        .play()
+        .then(() => setIsPlaying(true))
+        .catch((e) => console.warn('Audio play prevented:', e));
+    }
+  };
+
+  const handleCopyTranscript = () => {
+    if (!selectedLecture?.raw_transcript) return;
+    navigator.clipboard.writeText(selectedLecture.raw_transcript);
+    setCopiedTranscript(true);
+    setTimeout(() => setCopiedTranscript(false), 2000);
+  };
+
   const toggleAudioPlay = () => {
-    if (!audioRef.current) return;
+    if (!selectedLecture?.audio_path || !audioRef.current) return;
     if (isPlaying) {
       audioRef.current.pause();
       setIsPlaying(false);
@@ -278,7 +377,7 @@ export default function QuadernoView({
   };
 
   const handleJumpToBookmark = (seconds: number) => {
-    if (!audioRef.current) return;
+    if (!selectedLecture?.audio_path || !audioRef.current) return;
     audioRef.current.currentTime = Math.max(0, seconds);
     setCurrentTime(seconds);
     audioRef.current
@@ -288,7 +387,7 @@ export default function QuadernoView({
   };
 
   const handleSkipAudio = (offsetSeconds: number) => {
-    if (!audioRef.current) return;
+    if (!selectedLecture?.audio_path || !audioRef.current) return;
     const maxDur = audioDuration || (audioRef.current.duration > 0 ? audioRef.current.duration : 99999);
     const newTime = Math.max(0, Math.min(maxDur, (audioRef.current.currentTime || 0) + offsetSeconds));
     audioRef.current.currentTime = newTime;
@@ -381,6 +480,39 @@ export default function QuadernoView({
 
     const cleanFilename = `Quaderno_${subject.name}`.replace(/[^a-zA-Z0-9_\-]/g, '_') + '.md';
     downloadMarkdownFile(md, cleanFilename);
+  };
+
+  const handleExportTranscriptTxt = () => {
+    if (!selectedLecture || !selectedLecture.raw_transcript) return;
+    const cleanFilename = `Trascrizione_${subject.name}_${selectedLecture.title}`.replace(/[^a-zA-Z0-9_\-]/g, '_') + '.txt';
+    const blob = new Blob([selectedLecture.raw_transcript], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = cleanFilename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    setShowExportMenu(false);
+    setExportNotice(`Trascrizione salvata: ${cleanFilename}`);
+    setTimeout(() => setExportNotice(null), 3500);
+  };
+
+  const handleDownloadAudio = () => {
+    if (!selectedLecture || !selectedLecture.audio_path) return;
+    const ext = selectedLecture.audio_path.split('.').pop() || 'wav';
+    const cleanFilename = `Audio_${subject.name}_${selectedLecture.title}`.replace(/[^a-zA-Z0-9_\-]/g, '_') + `.${ext}`;
+    const audioUrl = api.lectures.getAudioUrl(selectedLecture.id);
+    const link = document.createElement('a');
+    link.href = audioUrl;
+    link.download = cleanFilename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setShowExportMenu(false);
+    setExportNotice(`Download audio avviato: ${cleanFilename}`);
+    setTimeout(() => setExportNotice(null), 3500);
   };
 
 
@@ -538,7 +670,7 @@ export default function QuadernoView({
 
       {/* ── Right Column: Clean Reading & Editing Sheet (flex-1) ── */}
       {selectedLecture ? (
-        <div className="flex-1 flex flex-col overflow-hidden content-canvas border-l border-white/[0.06]">
+        <div className="flex-1 flex flex-col overflow-hidden content-canvas border-l border-white/[0.06] relative">
           {/* Sheet Header — Clean macOS Document Header */}
           <div className="px-8 pt-6 pb-4 border-b border-white/[0.06] bg-white/[0.015] flex flex-col gap-4 flex-shrink-0">
             {/* Row 1: Title & Metadata on the left, Action buttons on the right */}
@@ -558,7 +690,7 @@ export default function QuadernoView({
                 <div className="min-w-0 flex-1">
                   {isEditing ? (
                   <div>
-                    <label className="block text-[11px] font-mono text-white/50 mb-1.5 uppercase tracking-wider">
+                    <label className="block text-xs font-sans font-medium text-white/50 mb-1.5 uppercase tracking-wider">
                       Titolo Lezione
                     </label>
                     <input
@@ -657,48 +789,125 @@ export default function QuadernoView({
                       <span>Modifica</span>
                     </button>
 
-                    {/* Bottone Esporta Markdown (.md) */}
-                    <div className="relative">
+                    {/* Bottone Esporta con Morphing in 'X' & Pannello a Bolla Liquid Glass */}
+                    <div className="relative" ref={exportMenuRef}>
                       <button
                         type="button"
                         onClick={() => setShowExportMenu(!showExportMenu)}
-                        className="h-8 px-3 rounded-full liquid-glass-pill hover:bg-white/[0.14] text-xs font-medium text-white/90 border border-white/[0.14] transition-all flex items-center gap-1.5 cursor-pointer shadow-liquid-sm"
-                        title="Esporta appunti in Markdown (.md)"
+                        className={clsx(
+                          "w-8 h-8 rounded-full flex items-center justify-center transition-all cursor-pointer shadow-liquid-sm select-none",
+                          showExportMenu
+                            ? "bg-white/[0.25] text-white border border-white/40 shadow-liquid-md scale-105"
+                            : "liquid-glass-pill hover:bg-white/[0.18] text-white/90 border border-white/[0.14] hover:scale-105"
+                        )}
+                        title={showExportMenu ? "Chiudi menu" : "Esporta e scarica materiali"}
                       >
-                        <Download size={12} strokeWidth={2} />
-                        <span>Esporta</span>
+                        <AnimatePresence mode="wait" initial={false}>
+                          {showExportMenu ? (
+                            <motion.span
+                              key="close"
+                              initial={{ rotate: -90, opacity: 0, scale: 0.6 }}
+                              animate={{ rotate: 0, opacity: 1, scale: 1 }}
+                              exit={{ rotate: 90, opacity: 0, scale: 0.6 }}
+                              transition={{ duration: 0.16 }}
+                              className="flex items-center justify-center"
+                            >
+                              <X size={14} strokeWidth={2.5} className="text-white" />
+                            </motion.span>
+                          ) : (
+                            <motion.span
+                              key="export"
+                              initial={{ rotate: 90, opacity: 0, scale: 0.6 }}
+                              animate={{ rotate: 0, opacity: 1, scale: 1 }}
+                              exit={{ rotate: -90, opacity: 0, scale: 0.6 }}
+                              transition={{ duration: 0.16 }}
+                              className="flex items-center justify-center"
+                            >
+                              <Share2 size={13} strokeWidth={2} className="text-white/90" />
+                            </motion.span>
+                          )}
+                        </AnimatePresence>
                       </button>
 
-                      {showExportMenu && (
-                        <div 
-                          className="absolute right-0 top-10 w-64 rounded-2xl liquid-glass border border-white/[0.14] shadow-liquid-lg p-1.5 z-50 space-y-1 animate-slide-up"
-                          onClick={(e) => e.stopPropagation()}
-                        >
-                          <button
-                            type="button"
-                            onClick={handleExportSingleLecture}
-                            className="w-full px-3 py-2 rounded-xl text-left text-xs font-medium text-white/85 hover:text-white hover:bg-white/[0.10] transition-colors flex items-center gap-2 cursor-pointer"
+                      {/* Pannello a Bolla Liquid Glass (alta opacità, zero sovrapposizione visiva) */}
+                      <AnimatePresence>
+                        {showExportMenu && (
+                          <motion.div 
+                            initial={{ opacity: 0, scale: 0.15, y: -16, filter: 'blur(10px)' }}
+                            animate={{ 
+                              opacity: 1, 
+                              scale: 1, 
+                              y: 0, 
+                              filter: 'blur(0px)',
+                              transition: { type: 'spring', damping: 22, stiffness: 340, mass: 0.75 } 
+                            }}
+                            exit={{ 
+                              opacity: 0, 
+                              scale: 0.25, 
+                              y: -12, 
+                              filter: 'blur(8px)',
+                              transition: { duration: 0.16, ease: 'easeIn' } 
+                            }}
+                            style={{ transformOrigin: 'top right' }}
+                            className="absolute right-0 top-11 w-72 rounded-3xl bg-[#13141c]/95 backdrop-blur-3xl border border-white/[0.20] shadow-[0_24px_60px_rgba(0,0,0,0.85),0_0_0_1px_rgba(255,255,255,0.08)] p-2 z-50 space-y-1.5"
+                            onClick={(e) => e.stopPropagation()}
                           >
-                            <FileDown size={14} className="text-amber-300 flex-shrink-0" />
-                            <div className="min-w-0">
-                              <span className="block truncate">Esporta questa Lezione (.md)</span>
-                              <span className="block text-[10px] text-white/40">Appunti, note e domande</span>
-                            </div>
-                          </button>
+                            <button
+                              type="button"
+                              onClick={handleExportSingleLecture}
+                              className="w-full px-3 py-2 rounded-2xl text-left text-xs font-medium text-white/90 hover:text-white hover:bg-white/[0.12] transition-colors flex items-center gap-2.5 cursor-pointer"
+                            >
+                              <FileDown size={15} className="text-amber-300 flex-shrink-0" />
+                              <div className="min-w-0">
+                                <span className="block truncate font-semibold">Lezione completa (.md)</span>
+                                <span className="block text-[10px] text-white/45">Appunti, domande e trascrizione</span>
+                              </div>
+                            </button>
 
-                          <button
-                            type="button"
-                            onClick={handleExportFullQuaderno}
-                            className="w-full px-3 py-2 rounded-xl text-left text-xs font-medium text-white/85 hover:text-white hover:bg-white/[0.10] transition-colors flex items-center gap-2 cursor-pointer"
-                          >
-                            <BookOpen size={14} className="text-blue-300 flex-shrink-0" />
-                            <div className="min-w-0">
-                              <span className="block truncate">Esporta Intero Quaderno (.md)</span>
-                              <span className="block text-[10px] text-white/40">{lectures.length} lezioni del corso</span>
-                            </div>
-                          </button>
-                        </div>
-                      )}
+                            {selectedLecture.raw_transcript && (
+                              <button
+                                type="button"
+                                onClick={handleExportTranscriptTxt}
+                                className="w-full px-3 py-2 rounded-2xl text-left text-xs font-medium text-white/90 hover:text-white hover:bg-white/[0.12] transition-colors flex items-center gap-2.5 cursor-pointer"
+                              >
+                                <FileText size={15} className="text-emerald-300 flex-shrink-0" />
+                                <div className="min-w-0">
+                                  <span className="block truncate font-semibold">Solo Trascrizione (.txt)</span>
+                                  <span className="block text-[10px] text-white/45">Testo integrale sbobinato</span>
+                                </div>
+                              </button>
+                            )}
+
+                            {selectedLecture.audio_path && (
+                              <button
+                                type="button"
+                                onClick={handleDownloadAudio}
+                                className="w-full px-3 py-2 rounded-2xl text-left text-xs font-medium text-white/90 hover:text-white hover:bg-white/[0.12] transition-colors flex items-center gap-2.5 cursor-pointer"
+                              >
+                                <Music size={15} className="text-cyan-300 flex-shrink-0" />
+                                <div className="min-w-0">
+                                  <span className="block truncate font-semibold">File Audio Registrato</span>
+                                  <span className="block text-[10px] text-white/45">Traccia audio della lezione</span>
+                                </div>
+                              </button>
+                            )}
+
+                            <div className="h-px bg-white/[0.10] my-1" />
+
+                            <button
+                              type="button"
+                              onClick={handleExportFullQuaderno}
+                              className="w-full px-3 py-2 rounded-2xl text-left text-xs font-medium text-white/90 hover:text-white hover:bg-white/[0.12] transition-colors flex items-center gap-2.5 cursor-pointer"
+                            >
+                              <BookOpen size={15} className="text-blue-300 flex-shrink-0" />
+                              <div className="min-w-0">
+                                <span className="block truncate font-semibold">Intero Quaderno (.md)</span>
+                                <span className="block text-[10px] text-white/45">{lectures.length} lezioni del corso</span>
+                              </div>
+                            </button>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
                     </div>
 
                     <button
@@ -750,7 +959,7 @@ export default function QuadernoView({
           </div>
 
           {/* Sheet Body */}
-          <div className="flex-1 overflow-y-auto px-12 py-8">
+          <div className="flex-1 overflow-y-auto px-12 py-8 pb-32">
             <div className="max-w-3xl mx-auto space-y-6">
               {isEditing ? (
                 <div className="space-y-3">
@@ -875,18 +1084,18 @@ export default function QuadernoView({
                   )}
                 </>
               ) : activeTab === 'transcript' ? (
-                <div className="p-6 rounded-3xl bg-white/[0.02] border border-white/[0.06]">
-                  <div className="flex items-center gap-2 mb-4 pb-3 border-b border-white/[0.06]">
-                    <AlignLeft size={14} className="text-white/50" />
-                    <span className="text-xs font-medium text-white/70">Trascrizione integrale</span>
-                  </div>
-                  {selectedLecture.raw_transcript ? (
-                    <p className="text-xs text-white/85 leading-relaxed font-mono whitespace-pre-wrap">
-                      {selectedLecture.raw_transcript}
-                    </p>
-                  ) : (
-                    <p className="text-xs text-white/40 italic">Nessun testo trascritto disponibile.</p>
-                  )}
+                <div className="animate-fade-in">
+                  <AppleLyricsView
+                    lines={karaokeLines}
+                    audioRef={audioRef}
+                    isPlaying={isPlaying}
+                    onSeek={handleSeekAudio}
+                    subjectColor={subject.color}
+                    rawTranscript={selectedLecture.raw_transcript || ''}
+                    onCopyTranscript={handleCopyTranscript}
+                    copiedTranscript={copiedTranscript}
+                    isLoadingTimestamps={loadingKaraoke}
+                  />
                 </div>
               ) : (
                 <div className="space-y-4">
@@ -1022,25 +1231,15 @@ export default function QuadernoView({
             </div>
           </div>
 
-          {/* ── Native macOS Audio Player Bar & Click-to-Play Segnalibri ── */}
+          {/* ── Apple Music Floating Liquid Glass Audio Player Pill ── */}
           {selectedLecture.audio_path && (
-            <div className="border-t border-white/[0.08] liquid-glass px-6 py-3 flex flex-col gap-2.5 flex-shrink-0 z-30 shadow-[0_-4px_24px_rgba(0,0,0,0.25)]">
-              {/* HTML Audio element */}
-              <audio
-                ref={audioRef}
-                src={api.lectures.getAudioUrl(selectedLecture.id)}
-                preload="metadata"
-                onTimeUpdate={() => setCurrentTime(audioRef.current?.currentTime || 0)}
-                onLoadedMetadata={() => setAudioDuration(audioRef.current?.duration || selectedLecture.duration_seconds || 0)}
-                onEnded={() => setIsPlaying(false)}
-              />
-
-              {/* Segnalibri Esame: Click-to-Play pills */}
+            <div className="absolute bottom-6 left-0 right-0 z-30 flex flex-col items-center pointer-events-none px-6">
+              {/* Segnalibri Esame: Floating mini-pill dock above player */}
               {bookmarks.length > 0 && (
-                <div className="flex items-center gap-1.5 overflow-x-auto pb-1 scrollbar-none">
-                  <span className="text-[10px] font-mono uppercase text-amber-400/80 flex items-center gap-1 flex-shrink-0 mr-1 font-semibold">
+                <div className="pointer-events-auto mb-2 flex items-center gap-1.5 overflow-x-auto max-w-xl py-1 px-3.5 rounded-full bg-[#0c0d14]/85 backdrop-blur-2xl border border-white/[0.12] shadow-[0_8px_24px_rgba(0,0,0,0.5)] no-scrollbar animate-fade-in">
+                  <span className="text-[10px] font-mono uppercase text-amber-400 flex items-center gap-1 flex-shrink-0 mr-1 font-semibold">
                     <BookmarkIcon size={11} className="fill-amber-400/20 text-amber-400" />
-                    <span>Segnalibri Esame:</span>
+                    <span>Segnalibri:</span>
                   </span>
                   {bookmarks.map((b) => {
                     const isNear = Math.abs(currentTime - b.timestamp_seconds) <= 2;
@@ -1051,7 +1250,7 @@ export default function QuadernoView({
                         onClick={() => handleJumpToBookmark(b.timestamp_seconds)}
                         title={`Salta al secondo ${Math.round(b.timestamp_seconds)}`}
                         className={clsx(
-                          'px-2.5 py-0.5 rounded-lg text-[11px] font-mono flex items-center gap-1 transition-all flex-shrink-0 cursor-pointer border',
+                          'px-2.5 py-0.5 rounded-full text-[10.5px] font-mono flex items-center gap-1 transition-all flex-shrink-0 cursor-pointer border',
                           isNear
                             ? 'bg-amber-500/25 border-amber-500/50 text-amber-200 shadow-liquid-sm scale-105'
                             : 'bg-white/[0.06] hover:bg-white/[0.12] border-white/[0.08] text-white/70'
@@ -1059,21 +1258,33 @@ export default function QuadernoView({
                       >
                         <span className="text-amber-400 text-[9px]">▶</span>
                         <span>{formatSeconds(b.timestamp_seconds)}</span>
-                        {b.note && <span className="text-white/40 truncate max-w-[140px]">· {b.note}</span>}
+                        {b.note && <span className="text-white/40 truncate max-w-[120px]">· {b.note}</span>}
                       </button>
                     );
                   })}
                 </div>
               )}
 
-              {/* Controlli Audio Player */}
-              <div className="flex items-center gap-3">
-                {/* Play / Pause button */}
+              {/* Floating Pill Player Container — Apple Music Liquid Glass Capsule */}
+              <div className="pointer-events-auto w-full max-w-xl h-[52px] px-4 rounded-full bg-white/[0.08] hover:bg-white/[0.11] backdrop-blur-3xl border border-white/[0.20] shadow-[0_20px_50px_rgba(0,0,0,0.65),inset_0_1px_1px_rgba(255,255,255,0.30)] flex items-center gap-3 transition-all">
+                {/* HTML Audio element */}
+                <audio
+                  ref={audioRef}
+                  src={api.lectures.getAudioUrl(selectedLecture.id)}
+                  preload="metadata"
+                  onTimeUpdate={() => setCurrentTime(audioRef.current?.currentTime || 0)}
+                  onLoadedMetadata={() => setAudioDuration(audioRef.current?.duration || selectedLecture.duration_seconds || 0)}
+                  onPlay={() => setIsPlaying(true)}
+                  onPause={() => setIsPlaying(false)}
+                  onEnded={() => setIsPlaying(false)}
+                />
+
+                {/* Play / Pause button — Apple Music circular button */}
                 <button
                   type="button"
                   onClick={toggleAudioPlay}
-                  className="w-8 h-8 rounded-full bg-white/[0.16] hover:bg-white/[0.26] text-white flex items-center justify-center border border-white/[0.20] shadow-liquid-sm transition-all cursor-pointer flex-shrink-0 hover:scale-105"
-                  title={isPlaying ? 'Pausa riproduzione' : 'Avvia riproduzione audio lezione'}
+                  className="w-8 h-8 rounded-full bg-white text-black hover:bg-white/90 active:scale-95 flex items-center justify-center shadow-[0_2px_12px_rgba(255,255,255,0.35)] transition-all cursor-pointer flex-shrink-0"
+                  title={isPlaying ? 'Pausa' : 'Riproduci'}
                 >
                   {isPlaying ? (
                     <Pause size={13} className="fill-current" />
@@ -1086,19 +1297,19 @@ export default function QuadernoView({
                 <button
                   type="button"
                   onClick={() => handleSkipAudio(-10)}
-                  className="w-7 h-7 rounded-lg text-white/50 hover:text-white hover:bg-white/[0.08] flex items-center justify-center transition-colors cursor-pointer flex-shrink-0"
+                  className="w-7 h-7 rounded-full text-white/60 hover:text-white hover:bg-white/[0.10] flex items-center justify-center transition-all cursor-pointer flex-shrink-0 active:scale-95"
                   title="Riavvolgi 10 secondi"
                 >
-                  <RotateCcw size={12} />
+                  <RotateCcw size={13} />
                 </button>
 
                 {/* Current Time */}
-                <span className="text-[11px] font-mono text-white/70 min-w-[36px] text-right font-medium">
+                <span className="text-[11px] font-mono text-white/85 min-w-[32px] text-right font-medium tabular-nums">
                   {formatSeconds(currentTime)}
                 </span>
 
                 {/* Scrubber Range Slider */}
-                <div className="flex-1 relative flex items-center">
+                <div className="flex-1 relative flex items-center group">
                   <input
                     type="range"
                     min={0}
@@ -1110,12 +1321,12 @@ export default function QuadernoView({
                       setCurrentTime(val);
                       if (audioRef.current) audioRef.current.currentTime = val;
                     }}
-                    className="w-full h-1.5 bg-white/[0.12] rounded-full appearance-none cursor-pointer accent-white hover:accent-amber-300"
+                    className="w-full h-1 group-hover:h-1.5 bg-white/[0.16] rounded-full appearance-none cursor-pointer accent-white transition-all"
                   />
                 </div>
 
                 {/* Total Duration */}
-                <span className="text-[11px] font-mono text-white/40 min-w-[36px]">
+                <span className="text-[11px] font-mono text-white/45 min-w-[32px] tabular-nums">
                   {formatSeconds(audioDuration || selectedLecture.duration_seconds || 0)}
                 </span>
 
@@ -1123,10 +1334,10 @@ export default function QuadernoView({
                 <button
                   type="button"
                   onClick={() => handleSkipAudio(10)}
-                  className="w-7 h-7 rounded-lg text-white/50 hover:text-white hover:bg-white/[0.08] flex items-center justify-center transition-colors cursor-pointer flex-shrink-0"
+                  className="w-7 h-7 rounded-full text-white/60 hover:text-white hover:bg-white/[0.10] flex items-center justify-center transition-all cursor-pointer flex-shrink-0 active:scale-95"
                   title="Avanza 10 secondi"
                 >
-                  <RotateCcw size={12} className="scale-x-[-1]" />
+                  <RotateCcw size={13} className="scale-x-[-1]" />
                 </button>
               </div>
             </div>

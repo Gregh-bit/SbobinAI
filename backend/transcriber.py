@@ -6,7 +6,7 @@ Backend selezionato da platform_utils.AI_BACKEND:
   - "portable" → faster-whisper (CTranslate2): CUDA float16 se disponibile, altrimenti CPU int8,
                  repo dropbox-dash/faster-whisper-large-v3-turbo
 
-API pubblica invariata (Transcriber, transcribe_chunk, release_*, warm_up_*, get_local_snapshot_dir,
+API pubblica invariata (Transcriber, release_*, warm_up_*, get_local_snapshot_dir,
 TARGET_HF_REPO) + transcribe_file() per file audio completi.
 Nessun import MLX / CTranslate2 a livello di modulo.
 """
@@ -65,11 +65,6 @@ def get_local_snapshot_dir(repo_id: str) -> Optional[str]:
     (La snapshot di fallback è la più recente per mtime, non l'ultima in ordine alfabetico.)
     """
     return _get_local_snapshot_dir(repo_id)
-
-
-def check_is_model_cached(repo_id: str) -> bool:
-    """Verifica se il repo HuggingFace è già presente nella cache locale."""
-    return get_local_snapshot_dir(repo_id) is not None
 
 
 def _resolve_model_path(repo_id: str) -> Optional[str]:
@@ -204,11 +199,6 @@ def warm_up_whisper() -> None:
             logger.info("[Transcriber] Pre-riscaldamento completato: Whisper Large Turbo pronto all'uso!")
         except Exception as exc:
             logger.warning(f"[Transcriber] Pre-riscaldamento non completato: {exc}")
-
-
-def warm_up_in_background() -> None:
-    """Lancia il warmup in un thread separato al boot del server."""
-    threading.Thread(target=warm_up_whisper, daemon=True, name="whisper-warmup").start()
 
 
 class Transcriber:
@@ -421,10 +411,15 @@ def transcribe_file(audio_path: str, language: str = "it", initial_prompt: Optio
 
     with _transcription_lock:
         try:
+            # Decodifica sempre con PyAV in np.ndarray float32 mono 16kHz (nessun ffmpeg CLI esterno richiesto)
+            audio = _decode_audio_file(audio_path)
+            if audio.size < 1600:
+                return "", audio.size / 16000.0
+
             if USE_MLX:
                 import mlx_whisper
                 result = mlx_whisper.transcribe(
-                    audio_path,
+                    audio,
                     path_or_hf_repo=model_path,
                     language=language,
                     initial_prompt=initial_prompt,
@@ -434,15 +429,11 @@ def transcribe_file(audio_path: str, language: str = "it", initial_prompt: Optio
                 )
                 text = (result.get("text") or "").strip()
                 segments = result.get("segments") or []
-                duration = float(segments[-1].get("end", 0.0)) if segments else 0.0
+                duration = float(segments[-1].get("end", 0.0)) if segments else (audio.size / 16000.0)
             else:
-                # Decodifica con PyAV (nessun ffmpeg esterno richiesto)
-                audio = _decode_audio_file(audio_path)
-                if audio.size < 1600:
-                    return "", audio.size / 16000.0
                 text, duration = _faster_whisper_run(model_path, audio, live=False,
                                                      initial_prompt=initial_prompt, language=language)
-                del audio
+            del audio
         except Exception as exc:
             raise RuntimeError(f"Trascrizione del file audio non riuscita: {exc}") from exc
         finally:
@@ -503,6 +494,9 @@ def release_metal_cache() -> None:
     gc.collect()
 
 
+clear_metal_cache = release_metal_cache
+
+
 def release_transcriber_memory() -> None:
     """Scarica il modello Whisper dalla RAM/VRAM, svuota le cache ed esegue gc.collect()."""
     global _model_warmed
@@ -518,7 +512,7 @@ def release_transcriber_memory() -> None:
                 import mlx.core as mx
                 if hasattr(mx, "clear_cache"):
                     mx.clear_cache()
-                elif hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
+                if hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
                     mx.metal.clear_cache()
             except Exception as e:
                 logger.debug(f"[Transcriber] Errore pulizia memoria: {e}")
@@ -530,12 +524,3 @@ def release_transcriber_memory() -> None:
         _model_warmed = False
         gc.collect()
         logger.info("[Transcriber] Modello Whisper e cache rilasciati con successo.")
-
-
-# Istanza helper singleton
-_default_transcriber = Transcriber()
-
-
-async def transcribe_chunk(audio_data: bytes, sample_rate: int = 16000) -> str:
-    """Funzione helper asincrona per trascrivere un singolo chunk."""
-    return await _default_transcriber.transcribe(audio_data)

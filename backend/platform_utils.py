@@ -256,21 +256,3 @@ def safe_rmtree(path: str, retries: int = 5, delay: float = 0.3) -> bool:
         time.sleep(delay * (attempt + 1))
     return not os.path.exists(path)
 
-
-def safe_remove(path: str, retries: int = 5, delay: float = 0.2) -> bool:
-    """Rimuove un file riprovando in caso di lock temporanei (Windows)."""
-    for attempt in range(retries):
-        try:
-            os.remove(path)
-            return True
-        except FileNotFoundError:
-            return True
-        except PermissionError:
-            try:
-                os.chmod(path, stat.S_IWRITE)
-            except Exception:
-                pass
-            time.sleep(delay * (attempt + 1))
-        except OSError:
-            time.sleep(delay * (attempt + 1))
-    return not os.path.exists(path)

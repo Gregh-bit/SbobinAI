@@ -13,6 +13,7 @@ rag.py — SbobinAI RAG Module (LanceDB + Qwen3-Embedding 1024-dim, platform-awa
 """
 from __future__ import annotations
 
+from functools import lru_cache
 import gc
 import logging
 import os
@@ -97,11 +98,14 @@ def clear_metal_cache() -> None:
             import mlx.core as mx
             if hasattr(mx, "clear_cache"):
                 mx.clear_cache()
-            elif hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
+            if hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
                 mx.metal.clear_cache()
         except Exception:
             pass
     gc.collect()
+
+
+release_metal_cache = clear_metal_cache
 
 
 def is_embedding_downloaded(model_id: Optional[str] = None) -> bool:
@@ -222,6 +226,7 @@ def unload_embedding_model() -> None:
                 pass
         del model
     reset_connection()
+    _cached_query_vector_tuple.cache_clear()
     clear_metal_cache()
     logger.info("[RAG] Modello embedding scaricato e cache LanceDB azzerata.")
 
@@ -313,10 +318,34 @@ def compute_embeddings(
         clear_metal_cache()
 
 
+# ── Query Embedding Cache ─────────────────────────────────────────────────────
+
+@lru_cache(maxsize=256)
+def _cached_query_vector_tuple(query: str, model_id: Optional[str] = None) -> Optional[Tuple[float, ...]]:
+    vecs = compute_embeddings([query], is_query=True, model_id=model_id)
+    if vecs is None or len(vecs) == 0:
+        return None
+    return tuple(vecs[0].tolist())
+
+
+def get_cached_query_vector(query: str, model_id: Optional[str] = None) -> Optional[np.ndarray]:
+    """
+    Calcola (o recupera da cache LRU maxsize=256) il vettore di embedding normalizzato a 1024-dim
+    per una query di ricerca. Evita ricalcoli GPU/CPU identici durante sessioni di studio e chat.
+    """
+    clean_q = query.strip()
+    if not clean_q:
+        return None
+    cached_tup = _cached_query_vector_tuple(clean_q, model_id)
+    if cached_tup is None:
+        return None
+    return np.array(cached_tup, dtype=np.float32)
+
+
 # ── Text Chunking ─────────────────────────────────────────────────────────────
 
-def chunk_text(text: str, chunk_size: int = 400, overlap: int = 50) -> List[str]:
-    """Splitta un testo accademico in chunk coerenti con overlap."""
+def chunk_text(text: str, chunk_size: int = 240, overlap: int = 40) -> List[str]:
+    """Splitta un testo accademico in chunk coerenti con overlap (240 parole ~320-350 token, limite EMBED_MAX_TOKENS = 512)."""
     words = text.split()
     if not words:
         return []
@@ -371,7 +400,7 @@ def index_lecture(
     if transcript:
         full_body += f"Trascrizione spiegazione docente:\n{transcript}"
 
-    chunks = chunk_text(full_body, chunk_size=350, overlap=50)
+    chunks = chunk_text(full_body, chunk_size=240, overlap=40)
     if not chunks:
         return 0
 
@@ -419,7 +448,7 @@ def index_material_document(
     if not content or len(content.strip()) < 10:
         return 0
 
-    chunks = chunk_text(content, chunk_size=350, overlap=50)
+    chunks = chunk_text(content, chunk_size=240, overlap=40)
     if not chunks:
         return 0
 
@@ -543,12 +572,12 @@ def query_context(
         records: Dict[str, Dict[str, Any]] = {}
         scores: Dict[str, float] = {}
 
-        # 1. Ricerca vettoriale
-        query_vector = compute_embeddings([clean_q], is_query=True)
-        if query_vector is not None and len(query_vector) > 0:
+        # 1. Ricerca vettoriale con cache LRU (256 query)
+        q_vec = get_cached_query_vector(clean_q)
+        if q_vec is not None:
             try:
                 vec_matches = (
-                    tbl.search(query_vector[0])
+                    tbl.search(q_vec)
                     .where(where, prefilter=True)
                     .select(_RESULT_COLUMNS + ["_distance"])
                     .limit(top_k * 4)

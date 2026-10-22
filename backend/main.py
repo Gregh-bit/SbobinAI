@@ -493,13 +493,15 @@ async def _finalize_session(session: LiveSession, subject_id: int) -> Tuple[floa
             if tail:
                 session.push_transcript(tail)
 
-    # Registry + rilascio memoria (bloccante: attende un'eventuale inferenza in corso)
+    # Registry + rilascio memoria transcriber (evita doppia invocazione di stop su audio_engine)
     try:
-        ended = await asyncio.to_thread(end_session, subject_id, session)
-        if ended is None:
-            await asyncio.to_thread(session.stop)
+        from live_session import _active_sessions
+        if _active_sessions.get(subject_id) is session:
+            _active_sessions.pop(subject_id, None)
+        if hasattr(session, "transcriber") and session.transcriber:
+            await asyncio.to_thread(session.transcriber.release_memory)
     except Exception as exc:
-        logger.debug(f"[WS] Errore chiusura sessione: {exc}")
+        logger.debug(f"[WS] Errore pulizia sessione e rilascio memoria: {exc}")
 
     full_transcript = session.get_full_transcript()
     db_sess = SessionLocal()
@@ -528,6 +530,11 @@ async def _finalize_session(session: LiveSession, subject_id: int) -> Tuple[floa
             full_transcript=full_transcript,
         ))
 
+    # Pre-calcola subito i timestamp sincronizzati parola per parola a fine registrazione
+    if session.lecture_id:
+        from routers.lectures import compute_and_cache_lecture_timestamps
+        _spawn(asyncio.to_thread(compute_and_cache_lecture_timestamps, session.lecture_id))
+
     logger.info(
         f"[WS] Sessione chiusa: lezione={session.lecture_id}, durata={duration:.1f}s, "
         f"chunk totali={len(session.full_transcript)}, wav={audio_path}"
@@ -555,7 +562,6 @@ def _as_int(value: Any, default: int, lo: int, hi: int) -> int:
 async def live_lecture_ws(
     websocket: WebSocket,
     subject_id: int,
-    db: Session = Depends(get_db),
 ):
     """
     WebSocket per la gestione di una lezione live.
@@ -613,43 +619,45 @@ async def live_lecture_ws(
                 lecture_id = payload.get("lecture_id")
 
                 from database import Lecture as LectureModel, Subject
-                subject = db.query(Subject).filter(Subject.id == subject_id).first()
-                if not subject:
-                    await send_error(f"Materia {subject_id} non trovata")
-                    continue
-
-                if lecture_id is not None:
-                    try:
-                        lecture_id = int(lecture_id)
-                    except (TypeError, ValueError):
-                        await send_error("lecture_id non valido")
+                with SessionLocal() as db:
+                    subject = db.query(Subject).filter(Subject.id == subject_id).first()
+                    if not subject:
+                        await send_error(f"Materia {subject_id} non trovata")
                         continue
-                    owned = (
-                        db.query(LectureModel)
-                        .filter(LectureModel.id == lecture_id, LectureModel.subject_id == subject_id)
-                        .first()
-                    )
-                    if not owned:
-                        await send_error(f"Lezione {lecture_id} non trovata per la materia {subject_id}")
-                        continue
+                    whisper_keywords = subject.whisper_prompt_keywords
 
-                # Una sessione già aperta (su questo socket o su un socket precedente rimasto appeso)
-                # viene prima salvata e chiusa, mai scartata.
-                if session is not None:
-                    await _finalize_session(session, subject_id)
-                    session = None
-                stale = get_session(subject_id)
-                if stale is not None:
-                    logger.warning(f"[WS] Sessione precedente ancora attiva per materia {subject_id}: la salvo e la chiudo.")
-                    await _finalize_session(stale, subject_id)
+                    if lecture_id is not None:
+                        try:
+                            lecture_id = int(lecture_id)
+                        except (TypeError, ValueError):
+                            await send_error("lecture_id non valido")
+                            continue
+                        owned = (
+                            db.query(LectureModel)
+                            .filter(LectureModel.id == lecture_id, LectureModel.subject_id == subject_id)
+                            .first()
+                        )
+                        if not owned:
+                            await send_error(f"Lezione {lecture_id} non trovata per la materia {subject_id}")
+                            continue
 
-                if lecture_id is None:
-                    # Crea una nuova Lecture nel DB se non fornita
-                    lecture = LectureModel(subject_id=subject_id, title=title)
-                    db.add(lecture)
-                    db.commit()
-                    db.refresh(lecture)
-                    lecture_id = lecture.id
+                    # Una sessione già aperta (su questo socket o su un socket precedente rimasto appeso)
+                    # viene prima salvata e chiusa, mai scartata.
+                    if session is not None:
+                        await _finalize_session(session, subject_id)
+                        session = None
+                    stale = get_session(subject_id)
+                    if stale is not None:
+                        logger.warning(f"[WS] Sessione precedente ancora attiva per materia {subject_id}: la salvo e la chiudo.")
+                        await _finalize_session(stale, subject_id)
+
+                    if lecture_id is None:
+                        # Crea una nuova Lecture nel DB se non fornita
+                        lecture = LectureModel(subject_id=subject_id, title=title)
+                        db.add(lecture)
+                        db.commit()
+                        db.refresh(lecture)
+                        lecture_id = lecture.id
 
                 # Leggi configurazione modello Whisper e sensibilità VAD
                 model = payload.get("model")
@@ -668,7 +676,7 @@ async def live_lecture_ws(
                 session = start_session(
                     subject_id=subject_id,
                     lecture_id=lecture_id,
-                    whisper_keywords=subject.whisper_prompt_keywords,
+                    whisper_keywords=whisper_keywords,
                     mock_transcriber=mock_transcriber,
                     model_name=model,
                     vad_sensitivity=vad_level,
@@ -714,18 +722,21 @@ async def live_lecture_ws(
                 from database import Bookmark
                 note = str(payload.get("note") or "")
                 ts = session.elapsed_seconds()
-                bookmark = Bookmark(
-                    lecture_id=session.lecture_id,
-                    timestamp_seconds=ts,
-                    note=note,
-                )
-                db.add(bookmark)
-                db.commit()
-                db.refresh(bookmark)
+                bm_id = None
+                with SessionLocal() as db:
+                    bookmark = Bookmark(
+                        lecture_id=session.lecture_id,
+                        timestamp_seconds=ts,
+                        note=note,
+                    )
+                    db.add(bookmark)
+                    db.commit()
+                    db.refresh(bookmark)
+                    bm_id = bookmark.id
                 logger.info(f"[WS] Segnalibro salvato @ {ts:.1f}s: '{note}'")
                 await websocket.send_json({
                     "type": "bookmark_saved",
-                    "payload": {"bookmark_id": bookmark.id, "timestamp": ts, "note": note}
+                    "payload": {"bookmark_id": bm_id, "timestamp": ts, "note": note}
                 })
 
             # ── CHAT (domanda all'assistente live con streaming RAG) ───────────
@@ -1157,13 +1168,14 @@ async def course_chat_stream_endpoint(
     )
 
 
-@app.post("/api/v1/subjects/{subject_id}/chat", tags=["Subjects"])
+@app.post("/api/v1/subjects/{subject_id}/chat", tags=["Subjects"], deprecated=True)
 async def course_chat_endpoint(
     subject_id: int,
     payload: CourseChatRequest,
     db: Session = Depends(get_db),
 ):
     """
+    [DEPRECATO] Utilizzare l'endpoint di streaming '/api/v1/subjects/{subject_id}/chat-stream'.
     Risponde ai dubbi dello studente sul corso interrogando LanceDB (lezioni passate e materiali)
     e sintetizzando con Qwen 3.5 4B su Apple Silicon Metal.
     """

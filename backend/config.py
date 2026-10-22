@@ -63,6 +63,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "embedding_model": "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ",
     "vad_sensitivity": 2,
     "models_downloaded": False,
+    "audio_format": "m4a",
 }
 
 
@@ -107,6 +108,9 @@ def load_settings() -> Dict[str, Any]:
             if _same_path(sp, LEGACY_STORAGE_ROOT):
                 sp = DEFAULT_STORAGE_ROOT
             merged["storage_path"] = sp
+        # Validazione formato di registrazione audio (default "m4a" compresso AAC)
+        if merged.get("audio_format") not in ("m4a", "wav"):
+            merged["audio_format"] = "m4a"
         return merged
     except Exception as e:
         logger.error(f"[Config] Errore lettura {SETTINGS_FILE}: {e}. Uso defaults.")
@@ -114,16 +118,23 @@ def load_settings() -> Dict[str, Any]:
 
 
 def save_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
-    """Salva le impostazioni nel file settings.json (scrittura atomica)."""
+    """Salva le impostazioni nel file settings.json (scrittura atomica protetta da lock)."""
     with SETTINGS_LOCK:
         tmp = SETTINGS_FILE + ".tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(settings, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, SETTINGS_FILE)
             logger.info(f"[Config] Impostazioni salvate in {SETTINGS_FILE}")
         except Exception as e:
             logger.error(f"[Config] Impossibile salvare {SETTINGS_FILE}: {e}")
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
     return settings
 
 
@@ -353,10 +364,29 @@ def update_storage_path(new_path: str, migrate_data: bool = True) -> Dict[str, A
 
     # Re-bind del database SQLAlchemy
     try:
-        from database import rebind_database
+        from database import rebind_database, SessionLocal, Lecture
         rebind_database()
+        # Aggiorna audio_path nel database per puntare alla nuova cartella
+        if migrate_data:
+            with SessionLocal() as db_mig:
+                lectures = db_mig.query(Lecture).all()
+                updated_count = 0
+                old_audio_norm = os.path.normcase(os.path.abspath(old_audio))
+                for lec in lectures:
+                    if not lec.audio_path:
+                        continue
+                    fname = os.path.basename(lec.audio_path)
+                    potential_new = os.path.join(new_audio, fname)
+                    lec_norm = os.path.normcase(os.path.abspath(lec.audio_path))
+                    # Aggiorna tutti i record che puntavano a old_audio o il cui file si trova nella nuova cartella
+                    if (lec_norm.startswith(old_audio_norm) or os.path.exists(potential_new)) and lec.audio_path != potential_new:
+                        lec.audio_path = potential_new
+                        updated_count += 1
+                if updated_count > 0:
+                    db_mig.commit()
+                    logger.info(f"[Config] Aggiornati {updated_count} percorsi audio nel database.")
     except Exception as e:
-        logger.warning(f"[Config] Rebind database: {e}")
+        logger.warning(f"[Config] Rebind database / migrazione audio_path: {e}")
 
     # Riapre LanceDB sulla nuova cartella
     try:

@@ -98,14 +98,6 @@ class BookmarkOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
-# ── WebSocket messages ─────────────────────────────────────────────────────────
-
-class WSMessage(BaseModel):
-    """Messaggio generico in/out per la live lecture WebSocket."""
-    type: str  # 'transcript_chunk' | 'bookmark' | 'question_detected' | 'chat_query' | 'chat_response' | 'error'
-    payload: dict
-
-
 # ── Materials ──────────────────────────────────────────────────────────────────
 
 class MaterialOut(BaseModel):
@@ -129,8 +121,6 @@ class CourseChatRequest(BaseModel):
     query: str
     model_id: Optional[str] = None
 
-
-CourseChatRequest.model_rebuild()
 
 
 

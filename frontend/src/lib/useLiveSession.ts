@@ -28,8 +28,8 @@ function normalizeQuestion(text: string): string {
   return text.toLowerCase().replace(/[\?\.\,\s]/g, '');
 }
 
-// Tempo massimo di attesa del messaggio 'stopped' dal backend dopo l'invio di 'stop'
-const STOP_ACK_TIMEOUT_MS = 10000;
+// Tempo massimo di attesa del messaggio 'stopped' dal backend dopo l'invio di 'stop' (Bug B8 fix)
+const STOP_ACK_TIMEOUT_MS = 45000;
 
 interface UseLiveSessionProps {
   subject: Subject;
@@ -68,6 +68,8 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
   // Chat live: query attiva e numero di risposte di richieste annullate ancora da scartare
   const activeChatQueryRef = useRef<string | null>(null);
   const cancelledChatResponsesRef = useRef(0);
+  const chatChunkBufferRef = useRef<string>('');
+  const chatChunkTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Attesa del messaggio 'stopped' dopo l'invio di 'stop'
   const stopResolverRef = useRef<((acknowledged: boolean) => void) | null>(null);
   const isStoppingRef = useRef(false);
@@ -172,27 +174,45 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
         if (cancelledChatResponsesRef.current > 0 || activeChatQueryRef.current === null) break;
         const chunkQuery = msg.payload.query as string | undefined;
         if (chunkQuery !== undefined && chunkQuery !== activeChatQueryRef.current) break;
-        setChatMessages((prev) => {
-          if (prev.length === 0 || prev[prev.length - 1].role !== 'assistant') {
-            const newAssistant: ChatMessage = {
-              id: generateId(),
-              role: 'assistant',
-              content: chunk,
-              timestamp: Date.now(),
-            };
-            return [...prev, newAssistant];
-          }
-          const last = prev[prev.length - 1];
-          const updatedLast: ChatMessage = {
-            ...last,
-            content: last.content + chunk,
-          };
-          return [...prev.slice(0, -1), updatedLast];
-        });
+
+        chatChunkBufferRef.current += chunk;
+
+        if (!chatChunkTimerRef.current) {
+          chatChunkTimerRef.current = setTimeout(() => {
+            chatChunkTimerRef.current = null;
+            const buffered = chatChunkBufferRef.current;
+            if (!buffered) return;
+            chatChunkBufferRef.current = '';
+
+            setChatMessages((prev) => {
+              if (prev.length === 0 || prev[prev.length - 1].role !== 'assistant') {
+                const newAssistant: ChatMessage = {
+                  id: generateId(),
+                  role: 'assistant',
+                  content: buffered,
+                  timestamp: Date.now(),
+                };
+                return [...prev, newAssistant];
+              }
+              const last = prev[prev.length - 1];
+              const updatedLast: ChatMessage = {
+                ...last,
+                content: last.content + buffered,
+              };
+              return [...prev.slice(0, -1), updatedLast];
+            });
+          }, 60);
+        }
         break;
       }
 
       case 'chat_response': {
+        if (chatChunkTimerRef.current) {
+          clearTimeout(chatChunkTimerRef.current);
+          chatChunkTimerRef.current = null;
+        }
+        chatChunkBufferRef.current = '';
+
         // Risposta finale di una richiesta annullata (il backend ne invia sempre una per richiesta)
         if (cancelledChatResponsesRef.current > 0) {
           cancelledChatResponsesRef.current -= 1;
@@ -358,6 +378,10 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
     };
 
     return () => {
+      if (chatChunkTimerRef.current) {
+        clearTimeout(chatChunkTimerRef.current);
+        chatChunkTimerRef.current = null;
+      }
       ws.onclose = null;
       ws.onerror = null;
       ws.onmessage = null;
@@ -455,6 +479,12 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
   }, [chatInput, isSendingChat]);
 
   const handleCancelChat = useCallback(async () => {
+    if (chatChunkTimerRef.current) {
+      clearTimeout(chatChunkTimerRef.current);
+      chatChunkTimerRef.current = null;
+    }
+    chatChunkBufferRef.current = '';
+
     // La risposta della richiesta annullata arriverà comunque: va scartata
     if (activeChatQueryRef.current !== null) {
       cancelledChatResponsesRef.current += 1;

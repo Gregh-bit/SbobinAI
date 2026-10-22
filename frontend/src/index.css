@@ -260,3 +260,59 @@
   color: rgba(255, 255, 255, 0.92);
 }
 
+/* ── Apple Music Mesh Gradient Animations ── */
+@keyframes mesh-drift-1 {
+  0% {
+    transform: translate3d(0, 0, 0) scale(1) rotate(0deg);
+  }
+  33% {
+    transform: translate3d(60px, -45px, 0) scale(1.18) rotate(15deg);
+  }
+  66% {
+    transform: translate3d(-35px, 35px, 0) scale(0.92) rotate(-10deg);
+  }
+  100% {
+    transform: translate3d(0, 0, 0) scale(1) rotate(0deg);
+  }
+}
+
+@keyframes mesh-drift-2 {
+  0% {
+    transform: translate3d(0, 0, 0) scale(1) rotate(0deg);
+  }
+  33% {
+    transform: translate3d(-50px, 40px, 0) scale(0.9) rotate(-18deg);
+  }
+  66% {
+    transform: translate3d(40px, -50px, 0) scale(1.22) rotate(12deg);
+  }
+  100% {
+    transform: translate3d(0, 0, 0) scale(1) rotate(0deg);
+  }
+}
+
+@keyframes mesh-drift-3 {
+  0% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(45px, 55px, 0) scale(1.25);
+  }
+  100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+.animate-mesh-drift-1 {
+  animation: mesh-drift-1 24s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+.animate-mesh-drift-2 {
+  animation: mesh-drift-2 30s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+.animate-mesh-drift-3 {
+  animation: mesh-drift-3 20s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+

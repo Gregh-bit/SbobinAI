@@ -11,6 +11,7 @@ export interface AppSettings {
   embeddingModel: string;
   ollamaModel: string; // Retrocompatibilità UI
   vadSensitivity: number; // 1 (permissivo) a 3 (molto reattivo/aggressivo)
+  audioFormat: 'm4a' | 'wav'; // 'm4a' (compresso AAC ~48kbps, -85% spazio) o 'wav' (lineare PCM)
 }
 
 interface SettingsContextType {
@@ -29,6 +30,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   embeddingModel: 'mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ',
   ollamaModel: 'mlx-community/Qwen3.5-4B-MLX-4bit',
   vadSensitivity: 2,
+  audioFormat: 'm4a',
 };
 
 const STORAGE_KEY = 'sbobinai_settings_v1';
@@ -84,6 +86,9 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         if (typeof settingsData.models_downloaded === 'boolean') {
           patch.modelsDownloaded = settingsData.models_downloaded;
         }
+        if (settingsData.audio_format === 'm4a' || settingsData.audio_format === 'wav') {
+          patch.audioFormat = settingsData.audio_format;
+        }
       }
 
       if (modelsData && typeof modelsData === 'object') {
@@ -135,6 +140,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     if (partial.embeddingModel !== undefined) backendPayload.embedding_model = partial.embeddingModel;
     if (partial.vadSensitivity !== undefined) backendPayload.vad_sensitivity = partial.vadSensitivity;
     if (partial.modelsDownloaded !== undefined) backendPayload.models_downloaded = partial.modelsDownloaded;
+    if (partial.audioFormat !== undefined) backendPayload.audio_format = partial.audioFormat;
 
     if (Object.keys(backendPayload).length > 0) {
       try {
@@ -171,6 +177,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     }
     if (updated.embeddingModel) backendPayload.embedding_model = updated.embeddingModel;
     if (updated.vadSensitivity) backendPayload.vad_sensitivity = updated.vadSensitivity;
+    if (updated.audioFormat) backendPayload.audio_format = updated.audioFormat;
     backendPayload.models_downloaded = updated.modelsDownloaded;
     try {
       await api.settings.update(backendPayload);

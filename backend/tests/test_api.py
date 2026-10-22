@@ -168,6 +168,63 @@ def test_settings_get_does_not_rewrite_file(client):
     assert os.path.getmtime(config.SETTINGS_FILE) == mtime
 
 
+def test_settings_audio_format_toggle(client):
+    """Verifica che il formato di salvataggio audio sia modificabile e persistito."""
+    r = client.patch("/api/v1/settings/", json={"audio_format": "wav"})
+    assert r.status_code == 200
+    assert r.json()["audio_format"] == "wav"
+
+    cur = client.get("/api/v1/settings/").json()
+    assert cur["audio_format"] == "wav"
+
+    r2 = client.patch("/api/v1/settings/", json={"audio_format": "m4a"})
+    assert r2.status_code == 200
+    assert r2.json()["audio_format"] == "m4a"
+
+
+def test_compress_archive_endpoint(client, subject):
+    """Verifica l'endpoint POST /settings/compress-audio per la compressione su richiesta."""
+    import wave
+    import numpy as np
+    import database
+    from config import get_audio_dir
+
+    audio_dir = get_audio_dir()
+    os.makedirs(audio_dir, exist_ok=True)
+    test_wav = os.path.join(audio_dir, "lecture_archive_test.wav")
+    with wave.open(test_wav, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        samples = (np.sin(2 * np.pi * 440 * np.linspace(0, 2.0, 32000, False)) * 10000).astype(np.int16)
+        wf.writeframes(samples.tobytes())
+
+    with database.SessionLocal() as s:
+        lec = database.Lecture(subject_id=subject["id"], title="Test Compressione", audio_path=test_wav)
+        s.add(lec)
+        s.commit()
+        lec_id = lec.id
+
+    r = client.post("/api/v1/settings/compress-audio")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["status"] == "success"
+    assert data["converted_count"] >= 1
+    assert data["freed_mb"] > 0
+
+    with database.SessionLocal() as s:
+        updated_lec = s.query(database.Lecture).filter(database.Lecture.id == lec_id).first()
+        assert updated_lec.audio_path.endswith(".m4a")
+        assert os.path.isfile(updated_lec.audio_path)
+        assert not os.path.exists(test_wav)
+        # Cleanup
+        try:
+            os.remove(updated_lec.audio_path)
+        except OSError:
+            pass
+
+
+
 # ── AI endpoints (body opzionali) ──────────────────────────────────────────────
 
 def test_ai_stop_body_is_honoured(client, monkeypatch):

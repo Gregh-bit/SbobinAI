@@ -54,6 +54,7 @@ class SettingsUpdateRequest(BaseModel):
     ollama_model: Optional[str] = None  # Retrocompatibilità
     vad_sensitivity: Optional[int] = None
     models_downloaded: Optional[bool] = None
+    audio_format: Optional[str] = None
 
 
 @router.get("/")
@@ -139,4 +140,22 @@ def get_storage_stats():
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Errore calcolo statistiche storage: {exc}"
         )
+
+
+@router.post("/compress-audio")
+def trigger_compress_audio():
+    """
+    Esegue su richiesta la compressione dell'archivio registrazioni audio esistenti,
+    convertendo tutti i file .wav in formato salva-spazio .m4a (-85% spazio).
+    """
+    try:
+        from cleaner import compress_archive_audio
+        res = compress_archive_audio()
+        return res
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Errore durante la compressione dell'archivio audio: {exc}"
+        )
+
 

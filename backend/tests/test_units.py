@@ -71,3 +71,35 @@ def test_cleaner_removes_only_orphans_in_active_storage(client):
     assert os.path.exists(kept)
     assert not os.path.exists(orphan)
     os.remove(kept)
+
+
+def test_compress_wav_to_m4a_reduces_size_and_decodes(tmp_path):
+    import wave
+    import numpy as np
+    from audio_engine import compress_wav_to_m4a
+    from transcriber import _decode_audio_file
+
+    wav_path = str(tmp_path / "lecture_test.wav")
+    with wave.open(wav_path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        # 2 secondi a 16kHz
+        samples = (np.sin(2 * np.pi * 440 * np.linspace(0, 2.0, 32000, False)) * 12000).astype(np.int16)
+        wf.writeframes(samples.tobytes())
+
+    orig_size = os.path.getsize(wav_path)
+    assert orig_size >= 64000
+
+    m4a_path = compress_wav_to_m4a(wav_path, bitrate=48000, remove_original=True)
+    assert m4a_path.endswith(".m4a")
+    assert os.path.isfile(m4a_path)
+    assert not os.path.exists(wav_path)
+
+    m4a_size = os.path.getsize(m4a_path)
+    assert m4a_size < orig_size * 0.4  # Almeno 60-80% di riduzione
+
+    # Verifica decodifica corretta
+    decoded = _decode_audio_file(m4a_path)
+    assert abs(len(decoded) - 32000) < 1500
+

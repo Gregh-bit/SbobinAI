@@ -60,6 +60,39 @@ export interface TranscriptChunk {
   speaker?: string;
 }
 
+export interface KaraokeWord {
+  text: string;
+  start: number; // in milliseconds
+  end: number;   // in milliseconds
+}
+
+export interface KaraokeLine {
+  lineStart: number; // in milliseconds
+  lineEnd: number;   // in milliseconds
+  words: KaraokeWord[];
+}
+
+export interface TranscriptWord {
+  word: string;
+  start: number;
+  end: number;
+  probability?: number;
+}
+
+export interface TranscriptSegment {
+  id: number;
+  start: number;
+  end: number;
+  text: string;
+  words: TranscriptWord[];
+}
+
+export interface TranscriptKaraokeResponse {
+  lines: KaraokeLine[];
+  segments?: KaraokeLine[] | TranscriptSegment[];
+  cached?: boolean;
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';

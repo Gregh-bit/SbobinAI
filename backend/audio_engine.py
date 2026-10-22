@@ -511,10 +511,126 @@ class AudioEngine:
                     except OSError:
                         pass
 
-        logger.info(f"[AudioEngine] Registrazione salvata con successo: {output_path}")
-        return output_path
+        logger.info(f"[AudioEngine] Registrazione WAV esportata: {output_path}")
 
-    def get_recorded_duration(self) -> float:
-        """Durata in secondi dell'audio registrato finora."""
-        # 16000 samples/sec * 2 bytes/sample = 32000 bytes/sec
-        return self._recorded_bytes / (self.SAMPLE_RATE * 2)
+        # Determina formato desiderato (da parametro o da settings.json)
+        if not audio_format:
+            try:
+                from config import load_settings
+                audio_format = load_settings().get("audio_format", "m4a")
+            except Exception:
+                audio_format = "m4a"
+
+        final_path = output_path
+        if audio_format == "m4a":
+            try:
+                final_path = compress_wav_to_m4a(output_path, bitrate=48000, remove_original=True)
+            except Exception as e:
+                logger.error(f"[AudioEngine] Fallback su WAV non compresso ({e})")
+                final_path = output_path
+
+        logger.info(f"[AudioEngine] Registrazione finalizzata con successo: {final_path} (formato: {audio_format})")
+        return final_path
+
+
+def compress_wav_to_m4a(wav_path: str, bitrate: int = 48000, remove_original: bool = True) -> str:
+    """
+    Converte un file WAV PCM mono/stereo in formato M4A / AAC a basso bitrate (default 48 kbps)
+    usando PyAV in streaming a blocchi, riducendo lo spazio occupato di circa l'85% preservando
+    la chiarezza vocale.
+    
+    Non carica mai l'intera lezione in memoria (consumo RAM costante O(1)).
+    Scrive su file .part e rinomina atomicamente a conversione completata.
+    Se remove_original è True, elimina il file .wav originale solo se la conversione ha successo.
+    Aggiorna anche l'eventuale file di cache dei timestamp (.timestamps.json).
+    Restituisce il percorso del file finale (.m4a se riuscita, o il .wav originario in caso di fallback).
+    """
+    if not wav_path or not os.path.isfile(wav_path) or os.path.getsize(wav_path) <= 44:
+        return wav_path
+
+    if wav_path.lower().endswith(".m4a"):
+        return wav_path
+
+    base, _ = os.path.splitext(wav_path)
+    m4a_path = base + ".m4a"
+    part_path = m4a_path + ".part"
+
+    try:
+        import av
+
+        with av.open(wav_path, mode="r") as in_container:
+            if not in_container.streams.audio:
+                logger.warning(f"[AudioEngine] Nessun flusso audio trovato in {wav_path}")
+                return wav_path
+            in_stream = in_container.streams.audio[0]
+
+            with av.open(part_path, mode="w", format="mp4") as out_container:
+                out_stream = out_container.add_stream("aac", rate=16000)
+                out_stream.bit_rate = int(bitrate)
+                out_stream.layout = "mono"
+
+                resampler = av.AudioResampler(
+                    format=out_stream.format,
+                    layout=out_stream.layout,
+                    rate=out_stream.rate,
+                )
+
+                for frame in in_container.decode(in_stream):
+                    for resampled in resampler.resample(frame):
+                        for packet in out_stream.encode(resampled):
+                            out_container.mux(packet)
+
+                for resampled in resampler.resample(None):
+                    for packet in out_stream.encode(resampled):
+                        out_container.mux(packet)
+
+                for packet in out_stream.encode(None):
+                    out_container.mux(packet)
+
+        if not os.path.exists(part_path) or os.path.getsize(part_path) == 0:
+            logger.warning(f"[AudioEngine] File compresso vuoto o non generato per {wav_path}")
+            if os.path.exists(part_path):
+                try:
+                    os.remove(part_path)
+                except OSError:
+                    pass
+            return wav_path
+
+        # Sostituzione atomica del file compresso
+        os.replace(part_path, m4a_path)
+
+        orig_size = os.path.getsize(wav_path) if os.path.exists(wav_path) else 0
+        new_size = os.path.getsize(m4a_path) if os.path.exists(m4a_path) else 0
+        saved_bytes = orig_size - new_size
+        ratio = (1.0 - (new_size / orig_size)) * 100 if orig_size > 0 else 0
+        logger.info(
+            f"[AudioEngine] Compressione salva-spazio completata: {orig_size / (1024*1024):.1f} MB -> "
+            f"{new_size / (1024*1024):.1f} MB (-{ratio:.1f}%, liberati {saved_bytes / (1024*1024):.1f} MB)"
+        )
+
+        # Se richiesto, rimuovi il WAV originale
+        if remove_original and os.path.exists(wav_path) and os.path.abspath(wav_path) != os.path.abspath(m4a_path):
+            try:
+                os.remove(wav_path)
+            except OSError as del_err:
+                logger.warning(f"[AudioEngine] Impossibile eliminare WAV temporaneo {wav_path}: {del_err}")
+
+        # Se esiste una cache di timestamp pre-calcolata, migrala al nuovo nome file
+        old_cache = wav_path + ".timestamps.json"
+        new_cache = m4a_path + ".timestamps.json"
+        if os.path.isfile(old_cache) and not os.path.exists(new_cache):
+            try:
+                os.replace(old_cache, new_cache)
+            except Exception:
+                pass
+
+        return m4a_path
+
+    except Exception as exc:
+        logger.error(f"[AudioEngine] Errore compressione M4A per {wav_path}: {exc}. Mantengo WAV originale.")
+        if os.path.exists(part_path):
+            try:
+                os.remove(part_path)
+            except OSError:
+                pass
+        return wav_path

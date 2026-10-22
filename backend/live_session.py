@@ -127,7 +127,9 @@ class LiveSession:
     def get_recent_context(self, minutes: int = RING_BUFFER_MINUTES) -> str:
         """Restituisce il testo degli ultimi `minutes` minuti come stringa unica."""
         cutoff = time.time() - (minutes * 60)
-        recent = [c.text for c in self._buffer if c.timestamp >= cutoff]
+        # Snapshot sicuro per evitare RuntimeError: deque mutated during iteration
+        snapshot = list(self._buffer)
+        recent = [c.text for c in snapshot if c.timestamp >= cutoff]
         return " ".join(recent)
 
     def get_full_transcript(self) -> str:

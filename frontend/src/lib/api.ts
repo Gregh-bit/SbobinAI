@@ -140,6 +140,8 @@ export const api = {
         { method: 'POST' }
       ),
     getAudioUrl: (lectureId: number) => `${BASE_URL}/lectures/${lectureId}/audio`,
+    getTimestamps: (lectureId: number) =>
+      request<import('../types').TranscriptKaraokeResponse>(`/lectures/${lectureId}/timestamps`),
   },
   bookmarks: {
     listByLecture: (lectureId: number) =>
@@ -178,6 +180,14 @@ export const api = {
         lancedb_mb: number;
         total_mb: number;
       }>('/settings/storage-stats'),
+    compressArchive: () =>
+      request<{
+        status: string;
+        converted_count: number;
+        freed_mb: number;
+        total_audio_mb: number;
+        message: string;
+      }>('/settings/compress-audio', { method: 'POST' }),
   },
   models: {
     status: () => request<import('../types').ModelsStatusResponse>('/models/status'),
@@ -213,7 +223,8 @@ export const api = {
   study: {
     generateQuiz: (
       subjectId: number,
-      data?: { lecture_ids?: number[]; model_id?: string; num_questions?: number }
+      data?: { lecture_ids?: number[]; model_id?: string; num_questions?: number },
+      signal?: AbortSignal
     ) =>
       request<{
         status: string;
@@ -223,23 +234,27 @@ export const api = {
       }>(`/study/${subjectId}/generate-quiz`, {
         method: 'POST',
         body: JSON.stringify(data || {}),
+        signal,
       }),
     getOralQuestion: (
       subjectId: number,
-      data?: { lecture_ids?: number[]; model_id?: string }
+      data?: { lecture_ids?: number[]; model_id?: string },
+      signal?: AbortSignal
     ) =>
       request<{ status: string; question: string; topic: string }>(
         `/study/${subjectId}/oral-question`,
         {
           method: 'POST',
           body: JSON.stringify(data || {}),
+          signal,
         }
       ),
     evaluateOral: async (
       subjectId: number,
       audioBlob: Blob,
       question: string,
-      modelId?: string
+      modelId?: string,
+      signal?: AbortSignal
     ): Promise<import('../types').OralEvaluationResult> => {
       const formData = new FormData();
       const mime = audioBlob.type || '';
@@ -251,12 +266,18 @@ export const api = {
       const res = await fetch(`${BASE_URL}/study/${subjectId}/evaluate-oral`, {
         method: 'POST',
         body: formData,
+        signal,
       });
       if (!res.ok) {
         await throwResponseError(res);
       }
       return res.json();
     },
+    abort: (subjectId?: number) =>
+      request<{ status: string; message: string }>(
+        subjectId ? `/study/${subjectId}/abort` : '/study/abort',
+        { method: 'POST' }
+      ),
   },
   ws: {
     liveLecture: (subjectId: number) => new WebSocket(`${WS_URL}/ws/live-lecture/${subjectId}`),

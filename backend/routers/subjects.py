@@ -8,12 +8,14 @@ import asyncio
 import json
 import logging
 import os
+from pathlib import Path
 import shutil
 import threading
 import time
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from database import Bookmark, Lecture, Subject, get_db
@@ -37,9 +39,11 @@ AUDIO_EXTENSIONS = (".mp3", ".wav", ".m4a", ".aac", ".ogg")
 def _safe_filename(raw: str | None) -> str:
     """
     Riduce un nome file fornito dal client al solo basename (niente '../', percorsi
-    assoluti o separatori Windows/Unix), rifiutando nomi riservati.
+    assoluti o separatori Windows/Unix), rifiutando null-byte e nomi riservati.
     """
-    name = os.path.basename((raw or "").replace("\\", "/")).strip()
+    if raw is None or "\x00" in raw:
+        raise HTTPException(status_code=400, detail="Nome file non valido.")
+    name = os.path.basename(raw.replace("\\", "/")).strip()
     if not name or name in (".", "..") or name.startswith(".") or name == "InfoCorso.md" or name.endswith(".meta.json"):
         raise HTTPException(status_code=400, detail="Nome file non valido.")
     return name
@@ -73,12 +77,19 @@ def ensure_infocorso_file(subject: Subject) -> str:
 
 @router.get("/", response_model=List[SubjectOut])
 def list_subjects(db: Session = Depends(get_db)):
-    """Restituisce tutte le materie ordinate per nome."""
+    """Restituisce tutte le materie ordinate per nome (ottimizzata con singola query SQL aggregata)."""
+    counts = (
+        db.query(Lecture.subject_id, func.count(Lecture.id).label("count"))
+        .group_by(Lecture.subject_id)
+        .all()
+    )
+    count_map = {c[0]: c[1] for c in counts}
+
     subjects = db.query(Subject).order_by(Subject.name).all()
     result = []
     for s in subjects:
         out = SubjectOut.model_validate(s)
-        out.lecture_count = len(s.lectures)
+        out.lecture_count = count_map.get(s.id, 0)
         result.append(out)
     return result
 
@@ -329,8 +340,16 @@ def _process_imported_audio_bg(subject_id: int, audio_path: str, orig_filename: 
             time.sleep(10)
 
         logger.info(f"[Audio Ingest] Inizio trascrizione Whisper per: {orig_filename} ({audio_path})")
+        # Recupera eventuali keywords tecniche configurate per la materia
+        from database import SessionLocal, Subject, Lecture
+        keywords = None
+        with SessionLocal() as db_tmp:
+            subj = db_tmp.query(Subject).filter(Subject.id == subject_id).first()
+            if subj and subj.whisper_prompt_keywords:
+                keywords = subj.whisper_prompt_keywords.strip()
+
         from transcriber import transcribe_file
-        transcript, duration_sec = transcribe_file(audio_path, language="it")
+        transcript, duration_sec = transcribe_file(audio_path, language="it", initial_prompt=keywords)
         transcript = (transcript or "").strip()
 
         clean_title = os.path.splitext(orig_filename)[0].replace("_", " ").strip()
@@ -385,6 +404,12 @@ def _process_imported_audio_bg(subject_id: int, audio_path: str, orig_filename: 
                 transcript=transcript,
                 notes=notes
             )
+            # Pre-calcola e salva in cache i timestamp parola per parola
+            try:
+                from routers.lectures import compute_and_cache_lecture_timestamps
+                compute_and_cache_lecture_timestamps(lec_id)
+            except Exception as e_ts:
+                logger.warning(f"[Audio Ingest] Pre-calcolo timestamp fallito: {e_ts}")
 
         clear_metal_cache()
         logger.info(f"[Audio Ingest] ✅ Completato con successo! Lezione '{clean_title}' (ID {lec_id}) salvata e indicizzata.")
@@ -410,11 +435,15 @@ def upload_material_file(
     if not subject:
         raise HTTPException(status_code=404, detail="Materia non trovata.")
 
-    subj_dir = os.path.join(get_uploads_dir(), f"subject_{subject_id}")
-    os.makedirs(subj_dir, exist_ok=True)
+    upload_root = Path(get_uploads_dir()).resolve()
+    subj_dir_path = (upload_root / f"subject_{subject_id}").resolve()
+    subj_dir_path.mkdir(parents=True, exist_ok=True)
 
     filename = _safe_filename(file.filename)
-    fpath = os.path.join(subj_dir, filename)
+    fpath_obj = (subj_dir_path / filename).resolve()
+    if not fpath_obj.is_relative_to(subj_dir_path):
+        raise HTTPException(status_code=400, detail="Percorso non consentito.")
+    fpath = str(fpath_obj)
 
     with open(fpath, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
@@ -524,8 +553,16 @@ def delete_material_file(subject_id: int, filename: str, db: Session = Depends(g
 
     # Un audio importato è anche il file della lezione generata: non rompere il player
     for udir in get_all_uploads_directories():
-        candidate = os.path.abspath(os.path.join(udir, folder_name, filename))
-        linked = db.query(Lecture).filter(Lecture.audio_path == candidate).first()
+        udir_root = Path(udir).resolve()
+        base_dir = (udir_root / folder_name).resolve()
+        candidate_obj = (base_dir / filename).resolve()
+        if not candidate_obj.is_relative_to(base_dir):
+            raise HTTPException(status_code=400, detail="Percorso non consentito.")
+        candidate = str(candidate_obj)
+        candidate_unresolved = os.path.abspath(os.path.join(udir, folder_name, filename))
+        linked = db.query(Lecture).filter(
+            (Lecture.audio_path == candidate) | (Lecture.audio_path == candidate_unresolved)
+        ).first()
         if linked:
             raise HTTPException(
                 status_code=409,
@@ -533,7 +570,12 @@ def delete_material_file(subject_id: int, filename: str, db: Session = Depends(g
             )
 
     for udir in get_all_uploads_directories():
-        fpath = os.path.join(udir, folder_name, filename)
+        udir_root = Path(udir).resolve()
+        base_dir = (udir_root / folder_name).resolve()
+        fpath_obj = (base_dir / filename).resolve()
+        if not fpath_obj.is_relative_to(base_dir):
+            continue
+        fpath = str(fpath_obj)
         if os.path.exists(fpath) and os.path.isfile(fpath):
             try:
                 os.remove(fpath)
