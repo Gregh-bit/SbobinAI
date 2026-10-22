@@ -23,6 +23,15 @@ Puoi scaricare l'applicazione precompilata scegliendo il canale che preferisci:
 * 🍏 **[Scarica per macOS (.dmg)](https://github.com/Gregh-bit/SbobinAI/releases/latest/download/SbobinAI-macOS.dmg)** — Ottimizzato per Apple Silicon (M1/M2/M3/M4)
 * 🪟 **[Scarica per Windows (.exe)](https://github.com/Gregh-bit/SbobinAI/releases/latest/download/SbobinAI-Windows.exe)** — Installer per Windows 10/11 x64
 
+> [!TIP]
+> **Nota per gli utenti macOS (Apple Silicon, macOS Sonoma e Sequoia):**  
+> Trattandosi di un software open source distribuito gratuitamente al di fuori del Mac App Store, al primo avvio macOS Gatekeeper potrebbe mostrare l'avviso *"SbobinAI è danneggiato e non può essere aperto. Dovresti spostarlo nel Cestino."*  
+> **Risoluzione immediata:** dopo aver trascinato l'app in **Applicazioni**, apri il **Terminale** e digita:
+> ```bash
+> xattr -cr /Applications/SbobinAI.app
+> ```
+> Premi Invio: l'attributo di quarantena web verrà rimosso e potrai aprire SbobinAI normalmente con un doppio clic.
+
 Puoi visualizzare l'elenco di tutte le versioni, i changelog e i file di installazione nella [sezione GitHub Releases](https://github.com/Gregh-bit/SbobinAI/releases).
 
 ---

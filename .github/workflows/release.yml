@@ -70,6 +70,9 @@ jobs:
           if [ -n "$DMG_FILE" ] && [ -n "$TAG_NAME" ]; then
             cp "$DMG_FILE" SbobinAI-macOS.dmg
             gh release upload "$TAG_NAME" SbobinAI-macOS.dmg --clobber
+            if [ -f "scripts/Sblocca-SbobinAI-macOS.command" ]; then
+              gh release upload "$TAG_NAME" scripts/Sblocca-SbobinAI-macOS.command --clobber
+            fi
           fi
 
       - name: Upload fixed-name asset for direct website download (Windows)

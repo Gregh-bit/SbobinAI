@@ -1703,24 +1703,34 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
 
                 {/* Sezione Aggiornamenti */}
                 <div className="p-4 rounded-3xl liquid-glass border border-white/[0.12] space-y-3">
-                  <div>
-                    <h4 className="text-sm font-bold text-white">Aggiornamenti</h4>
-                    <p className="text-[11px] text-white/50 mt-0.5">
-                      {updater.supported
-                        ? "SbobinAI controlla automaticamente gli aggiornamenti all'avvio."
-                        : "Gli aggiornamenti automatici sono disponibili solo nell'app desktop."}
-                    </p>
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <h4 className="text-sm font-bold text-white">Aggiornamenti</h4>
+                        <span className="text-[10px] font-mono font-medium px-2 py-0.5 rounded-full bg-white/[0.08] text-white/70 border border-white/10">
+                          v{updater.currentVersion || '0.0.3'}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-white/50 mt-0.5">
+                        {updater.supported
+                          ? "SbobinAI controlla automaticamente gli aggiornamenti all'avvio."
+                          : "Gli aggiornamenti automatici sono disponibili solo nell'app desktop."}
+                      </p>
+                    </div>
                   </div>
                   <div className="flex items-center gap-3 flex-wrap">
                     <button
                       type="button"
                       disabled={!updater.supported || updater.status === 'checking' || updater.status === 'downloading' || updater.status === 'installing'}
                       onClick={() => void updater.checkNow()}
-                      className="px-4 py-1.5 rounded-full bg-white/[0.10] hover:bg-white/[0.18] border border-white/[0.12] text-xs font-semibold text-white disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                      className="px-4 py-1.5 rounded-full bg-white/[0.10] hover:bg-white/[0.18] border border-white/[0.12] text-xs font-semibold text-white disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer transition-colors"
                     >
                       {updater.status === 'checking' ? 'Controllo in corso...' : 'Controlla aggiornamenti'}
                     </button>
-                    {updater.status === 'uptodate' && <span className="text-[11px] text-emerald-300">Sei aggiornato</span>}
+                    <span className="text-[11px] text-white/40 font-medium">
+                      Versione installata: <strong className="font-mono text-white/80">v{updater.currentVersion || '0.0.3'}</strong>
+                    </span>
+                    {updater.status === 'uptodate' && <span className="text-[11px] text-emerald-300 font-medium">Sei all'ultima versione</span>}
                     {updater.status === 'available' && (
                       <>
                         <span className="text-[11px] text-blue-300">Versione {updater.version} disponibile</span>

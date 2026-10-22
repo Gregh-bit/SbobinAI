@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "SbobinAI",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "identifier": "com.sbobinai.app",
   "build": {
     "frontendDist": "../dist",
@@ -38,6 +38,25 @@
       "icons/icon.ico"
     ],
     "createUpdaterArtifacts": true,
+    "macOS": {
+      "signingIdentity": "-",
+      "entitlements": "./Entitlements.plist",
+      "dmg": {
+        "background": "./icons/dmg-background.png",
+        "windowSize": {
+          "width": 660,
+          "height": 400
+        },
+        "appPosition": {
+          "x": 180,
+          "y": 190
+        },
+        "applicationFolderPosition": {
+          "x": 480,
+          "y": 190
+        }
+      }
+    },
     "resources": {
       "../../backend/*.py": "backend/",
       "../../backend/requirements*.txt": "backend/",

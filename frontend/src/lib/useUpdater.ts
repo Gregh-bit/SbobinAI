@@ -15,16 +15,31 @@ interface State {
   version: string | null;
   progress: number; // 0..100
   error: string | null;
+  currentVersion: string;
 }
 
-let state: State = { status: 'idle', version: null, progress: 0, error: null };
+let state: State = { status: 'idle', version: null, progress: 0, error: null, currentVersion: '0.0.3' };
 let handle: UpdateHandle | null = null;
 let startupDone = false;
+let versionFetched = false;
 const listeners = new Set<() => void>();
 
 function setState(patch: Partial<State>) {
   state = { ...state, ...patch };
   listeners.forEach((l) => l());
+}
+
+async function fetchCurrentVersion(): Promise<void> {
+  if (versionFetched) return;
+  versionFetched = true;
+  if (!isTauri()) return;
+  try {
+    const { getVersion } = await import('@tauri-apps/api/app');
+    const v = await getVersion();
+    if (v) setState({ currentVersion: v });
+  } catch (e) {
+    console.warn('[Updater] Errore lettura versione app:', e);
+  }
 }
 
 async function runCheck(silent: boolean): Promise<void> {
@@ -78,6 +93,7 @@ async function runInstall(): Promise<void> {
 export function useUpdater(opts: { autoCheck?: boolean } = {}) {
   const [, force] = useState(0);
   useEffect(() => {
+    void fetchCurrentVersion();
     const l = () => force((n) => n + 1);
     listeners.add(l);
     return () => {
