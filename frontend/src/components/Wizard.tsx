@@ -74,6 +74,22 @@ function formatMbOrGb(mb: number): string {
   return `~${Math.round(mb)} MB`;
 }
 
+function formatFriendlyError(raw?: unknown): string {
+  if (!raw) return 'Errore sconosciuto durante la connessione con il motore locale.';
+  const str = typeof raw === 'string' ? raw : (raw as any)?.message || String(raw);
+  const lower = str.toLowerCase();
+  if (
+    lower.includes('load failed') ||
+    lower.includes('failed to fetch') ||
+    lower.includes('networkerror') ||
+    lower.includes('econnrefused') ||
+    lower.includes('connection refused')
+  ) {
+    return 'Motore locale SbobinAI (porta 8000) non raggiungibile. Verifica che il servizio locale sia avviato correttamente.';
+  }
+  return str;
+}
+
 export default function Wizard() {
   const { settings, completeSetup } = useSettings();
   const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
@@ -126,7 +142,7 @@ export default function Wizard() {
               try {
                 await api.models.download(nextModelId);
               } catch (e: any) {
-                setDownloadError(e?.message || 'Errore durante l\'avvio del download del componente successivo.');
+                setDownloadError(formatFriendlyError(e));
               }
             } else {
               // Tutti i modelli della coda sono stati completati con successo
@@ -210,15 +226,14 @@ export default function Wizard() {
       setIsTriggering(true);
       setDownloadError(null);
 
-      // Assicurati che lo stato modelli sia disponibile
+      // Assicurati che lo stato modelli sia disponibile, con fallback resiliente
       let currentStatus = modelsStatus;
       if (!currentStatus) {
         try {
           currentStatus = await api.models.status();
           setModelsStatus(currentStatus);
-        } catch (e: any) {
-          setDownloadError(e?.message || 'Impossibile connettersi al motore locale SbobinAI.');
-          return;
+        } catch (e) {
+          console.warn('[Wizard] Impossibile recuperare stato modelli, uso fallback:', e);
         }
       }
 
@@ -254,10 +269,15 @@ export default function Wizard() {
       setActiveDownloadModel(queue[0]);
       setIsDownloadingScreen(true);
 
-      await api.models.download(queue[0]);
+      try {
+        await api.models.download(queue[0]);
+      } catch (err: any) {
+        console.error('[Wizard] Errore avvio download:', err);
+        setDownloadError(formatFriendlyError(err));
+      }
     } catch (err: any) {
-      console.error('[Wizard] Errore avvio download:', err);
-      setDownloadError(err?.message || 'Impossibile avviare il download dei componenti.');
+      console.error('[Wizard] Errore trigger download:', err);
+      setDownloadError(formatFriendlyError(err));
     } finally {
       setIsTriggering(false);
     }
@@ -269,7 +289,7 @@ export default function Wizard() {
     try {
       await api.models.download(activeDownloadModel);
     } catch (err: any) {
-      setDownloadError(err?.message || 'Errore durante il tentativo di download.');
+      setDownloadError(formatFriendlyError(err));
     }
   };
 

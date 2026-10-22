@@ -1,6 +1,6 @@
 // App.tsx — SbobinAI root component (macOS Native Liquid Glass)
 import { useCallback, useEffect, useState, lazy, Suspense } from 'react';
-import { api } from './lib/api';
+import { api, checkBackendHealth } from './lib/api';
 import Sidebar from './components/Sidebar';
 import SubjectDashboard from './components/SubjectDashboard';
 import EmptyState from './components/EmptyState';
@@ -12,6 +12,119 @@ import type { Lecture, Subject } from './types';
 // Lazy loading componenti pesanti non visibili all'avvio (<100ms startup)
 const Wizard = lazy(() => import('./components/Wizard'));
 const SettingsModal = lazy(() => import('./components/SettingsModal'));
+
+function BackendLoadingGate({ children }: { children: React.ReactNode }) {
+  const [isReady, setIsReady] = useState(false);
+  const [statusMessage, setStatusMessage] = useState('Avvio del motore locale SbobinAI...');
+  const [error, setError] = useState<string | null>(null);
+  const [retryCount, setRetryCount] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    let attempts = 0;
+    const maxAttempts = 75; // ~60 secondi
+
+    const check = async () => {
+      if (cancelled) return;
+
+      // 1. Controlla lo stato dettagliato da Tauri (se attivo)
+      try {
+        const { invoke } = await import('@tauri-apps/api/core');
+        const tauriStatus: any = await invoke('get_backend_status');
+        if (tauriStatus && !cancelled) {
+          if (tauriStatus.message) {
+            setStatusMessage(tauriStatus.message);
+          }
+          if (tauriStatus.status === 'error') {
+            setError(tauriStatus.error || tauriStatus.message || 'Errore di avvio del motore.');
+            return;
+          }
+          if (tauriStatus.port_ready) {
+            setIsReady(true);
+            return;
+          }
+        }
+      } catch {
+        // Fuori da Tauri (in browser/dev) o comando non ancora pronto
+      }
+
+      // 2. Verifica se la porta HTTP 8000 risponde al healthcheck
+      const healthy = await checkBackendHealth(1200);
+      if (cancelled) return;
+
+      if (healthy) {
+        setIsReady(true);
+        return;
+      }
+
+      attempts++;
+      if (attempts >= maxAttempts) {
+        setError(
+          'Il motore locale non ha risposto entro il tempo previsto. Assicurati che Python sia installato e consulta il log in ~/Library/Logs/SbobinAI/backend.log.'
+        );
+        return;
+      }
+
+      setTimeout(check, 800);
+    };
+
+    check();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [retryCount]);
+
+  if (!isReady) {
+    return (
+      <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-[#0B0F19] text-white select-none px-6">
+        <div className="flex flex-col items-center max-w-sm text-center">
+          {/* Logo SbobinAI Glow */}
+          <div className="relative mb-6">
+            <div className="absolute -inset-4 bg-gradient-to-r from-blue-600/30 via-indigo-500/20 to-purple-600/30 rounded-3xl blur-2xl animate-pulse" />
+            <div className="relative w-20 h-20 rounded-2xl bg-gradient-to-b from-white/10 to-white/5 border border-white/20 shadow-2xl flex items-center justify-center backdrop-blur-xl">
+              <span className="text-3xl font-extrabold tracking-tight bg-gradient-to-br from-white via-white/90 to-white/60 bg-clip-text text-transparent">
+                Sb
+              </span>
+            </div>
+          </div>
+
+          <h1 className="text-xl font-bold tracking-tight mb-2">SbobinAI</h1>
+
+          {error ? (
+            <div className="mt-4 p-4 rounded-xl bg-red-500/10 border border-red-500/25 text-left text-xs w-full max-w-xs">
+              <p className="text-red-400 font-semibold mb-1">Avvio del motore non riuscito</p>
+              <p className="text-red-200/80 mb-3 break-words">{error}</p>
+              <button
+                onClick={() => {
+                  setError(null);
+                  setRetryCount((c) => c + 1);
+                }}
+                className="w-full py-2 px-3 rounded-lg bg-red-500/20 hover:bg-red-500/30 border border-red-500/40 text-red-200 text-xs font-medium transition cursor-pointer"
+              >
+                Riprova
+              </button>
+            </div>
+          ) : (
+            <>
+              <div className="flex items-center gap-2.5 mt-3 mb-1.5">
+                <div className="w-3.5 h-3.5 rounded-full border-2 border-blue-400/30 border-t-blue-400 animate-spin" />
+                <span className="text-xs text-white/75 font-medium">
+                  {statusMessage}
+                </span>
+              </div>
+              <p className="text-[11px] text-white/40">
+                Elaborazione 100% offline e locale sul tuo dispositivo
+              </p>
+            </>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  return <>{children}</>;
+}
 
 function MainApp() {
   const { settings } = useSettings();
@@ -158,8 +271,10 @@ function MainApp() {
 
 export default function App() {
   return (
-    <SettingsProvider>
-      <MainApp />
-    </SettingsProvider>
+    <BackendLoadingGate>
+      <SettingsProvider>
+        <MainApp />
+      </SettingsProvider>
+    </BackendLoadingGate>
   );
 }

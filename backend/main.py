@@ -9,6 +9,19 @@ Server FastAPI principale con:
 """
 from __future__ import annotations
 
+import os
+# macOS SSL Certificates & HuggingFace Transfer Configuration
+try:
+    import certifi
+    ca_bundle = certifi.where()
+    os.environ["SSL_CERT_FILE"] = ca_bundle
+    os.environ["REQUESTS_CA_BUNDLE"] = ca_bundle
+except ImportError:
+    pass
+
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+
 import asyncio
 import json
 import logging
@@ -100,6 +113,7 @@ app.include_router(study_router, prefix="/api/v1")
 
 
 @app.get("/health", tags=["System"])
+@app.get("/api/v1/health", tags=["System"])
 async def health_check():
     """Endpoint di healthcheck."""
     return {"status": "ok", "service": "SbobinAI", "version": "0.1.0"}

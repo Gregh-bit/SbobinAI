@@ -25,6 +25,7 @@ numpy>=1.26.0
 scipy>=1.11.0
 webrtcvad>=2.0.10
 huggingface-hub>=0.23.0
+certifi>=2024.2.2
 tqdm>=4.66.0
 av>=12.0.0
 

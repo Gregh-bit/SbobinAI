@@ -12,10 +12,23 @@ Le eliminazioni toccano SOLO i repo noti all'app (mai l'intera cache HuggingFace
 """
 from __future__ import annotations
 
+import datetime
 import logging
 import os
 import threading
 from typing import Any, Dict, List, Optional
+
+# macOS SSL Certificates & HuggingFace Transfer Configuration
+try:
+    import certifi
+    ca_bundle = certifi.where()
+    os.environ["SSL_CERT_FILE"] = ca_bundle
+    os.environ["REQUESTS_CA_BUNDLE"] = ca_bundle
+except ImportError:
+    pass
+
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel
@@ -40,6 +53,7 @@ EMBEDDING_MODELS: Dict[str, Dict[str, Any]] = _infos("embedding")
 
 # ── Stato Download in Memoria ──────────────────────────────────────────────────
 _download_tracker: Dict[str, Dict[str, Any]] = {}
+DOWNLOAD_STATUS = _download_tracker  # Alias pubblico per accesso rapido
 _lock = threading.Lock()
 _cancel_events: Dict[str, threading.Event] = {}
 _download_threads: Dict[str, threading.Thread] = {}
@@ -188,7 +202,16 @@ def _download_hf_worker(model_id: str, spec: ai_models.ModelSpec, cancel_event: 
         _finish_cancelled(model_id, spec, total_mb)
 
     except Exception as exc:
-        logger.error(f"[Models] Errore durante il download di {model_id}: {exc}")
+        err_msg = str(exc)
+        logger.error(f"[Models] Errore durante il download di {model_id}: {err_msg}", exc_info=True)
+        try:
+            log_dir = os.path.expanduser("~/Library/Logs/SbobinAI")
+            os.makedirs(log_dir, exist_ok=True)
+            with open(os.path.join(log_dir, "backend.log"), "a", encoding="utf-8") as f:
+                f.write(f"\n[DOWNLOAD ERROR] [{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Modello {model_id}: {err_msg}\n")
+        except Exception:
+            pass
+
         with _lock:
             _download_tracker[model_id] = {
                 "status": "error",
@@ -196,7 +219,7 @@ def _download_hf_worker(model_id: str, spec: ai_models.ModelSpec, cancel_event: 
                 "downloaded_mb": 0.0,
                 "total_mb": total_mb,
                 "stage": "Errore",
-                "error": str(exc),
+                "error": err_msg,
             }
     finally:
         ai_models.set_downloading(model_id, False)
@@ -298,6 +321,43 @@ def get_models_status():
     }
 
 
+@router.get("/download-status")
+def get_download_status(model_id: Optional[str] = None):
+    """
+    Endpoint veloce per interrogare lo stato del download in corso (polling ogni 1-2 secondi)
+    senza calcolare le dimensioni su disco di tutti i modelli del sistema.
+    """
+    with _lock:
+        if model_id:
+            spec = ai_models.resolve(model_id.strip())
+            resolved_id = spec.id if spec else model_id.strip()
+            item = _download_tracker.get(resolved_id)
+            if item is None:
+                if spec is not None:
+                    is_dl, size_mb = ai_models.is_downloaded(spec)
+                    if is_dl:
+                        return {
+                            "status": "completed",
+                            "model_id": resolved_id,
+                            "progress": 100,
+                            "downloaded_mb": size_mb,
+                            "total_mb": size_mb,
+                            "stage": "Completato",
+                            "error": None,
+                        }
+                return {
+                    "status": "idle",
+                    "model_id": resolved_id,
+                    "progress": 0,
+                    "downloaded_mb": 0.0,
+                    "total_mb": 0.0,
+                    "stage": None,
+                    "error": None,
+                }
+            return {"model_id": resolved_id, **item}
+        return {mid: dict(data) for mid, data in _download_tracker.items()}
+
+
 class DownloadRequest(BaseModel):
     model_config = {"protected_namespaces": ()}
     model_id: str
@@ -307,11 +367,11 @@ class DownloadRequest(BaseModel):
 def download_model(payload: DownloadRequest):
     """
     Avvia il download in background del modello specificato con monitoraggio dei byte.
-    Accetta ID logici, repo id (MLX o portable) e alias storici.
+    Risponde IMMEDIATAMENTE (in ~50ms) per evitare timeout su WebKit/Tauri.
     """
     requested = payload.model_id.strip()
     if requested == ai_models.MOCK_WHISPER_ID:
-        return {"status": "completed", "message": "Modalità simulatore sempre disponibile (0 MB)."}
+        return {"status": "completed", "model": requested, "model_id": requested, "message": "Modalità simulatore sempre disponibile (0 MB)."}
 
     spec = ai_models.resolve(requested)
     if spec is None:
@@ -327,20 +387,24 @@ def download_model(payload: DownloadRequest):
         if thread is not None and thread.is_alive():
             current = _download_tracker.get(model_id, {})
             return {
-                "status": "already_downloading",
+                "status": "downloading",
+                "model": model_id,
                 "model_id": model_id,
-                "progress": current.get("progress", 0),
+                "progress": current.get("progress", 1),
+                "downloaded_mb": current.get("downloaded_mb", 0.0),
+                "total_mb": current.get("total_mb", 0.0),
             }
 
         approx_b = spec.variant.approx_bytes or (580 * 1024 * 1024)
+        approx_mb = round(approx_b / (1024 * 1024), 1)
         _download_tracker[model_id] = {
             "status": "downloading",
             "progress": 1,
             "downloaded_bytes": 0,
             "downloaded_mb": 0.0,
             "total_bytes": approx_b,
-            "total_mb": round(approx_b / (1024 * 1024), 1),
-            "stage": "Avvio download e connessione...",
+            "total_mb": approx_mb,
+            "stage": "Connessione a HuggingFace...",
             "error": None,
         }
         cancel_event = threading.Event()
@@ -355,7 +419,8 @@ def download_model(payload: DownloadRequest):
         _download_threads[model_id] = thread
     thread.start()
     return {
-        "status": "started",
+        "status": "downloading",
+        "model": model_id,
         "model_id": model_id,
         "repos": [repo_id],
         "progress": 1,

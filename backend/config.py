@@ -49,8 +49,30 @@ def _same_path(a: str, b: str) -> bool:
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# SBOBINAI_SETTINGS_FILE permette di usare un file alternativo (test, profili separati)
-SETTINGS_FILE = os.environ.get("SBOBINAI_SETTINGS_FILE") or os.path.join(BASE_DIR, "settings.json")
+
+def _get_default_settings_file() -> str:
+    env_file = os.environ.get("SBOBINAI_SETTINGS_FILE")
+    if env_file:
+        return env_file
+    local_file = os.path.join(BASE_DIR, "settings.json")
+    if os.path.exists(local_file) and os.access(local_file, os.W_OK):
+        return local_file
+    if not os.path.exists(local_file) and os.access(BASE_DIR, os.W_OK):
+        return local_file
+    # Fallback su cartella dati applicazione utente (evita PermissionError in /Applications)
+    if sys.platform == "darwin":
+        app_dir = os.path.expanduser("~/Library/Application Support/com.sbobinai.app")
+    elif sys.platform == "win32":
+        app_dir = os.path.expandvars(r"%LOCALAPPDATA%\SbobinAI")
+    else:
+        app_dir = os.path.expanduser("~/.sbobinai")
+    try:
+        os.makedirs(app_dir, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(app_dir, "settings.json")
+
+SETTINGS_FILE = _get_default_settings_file()
 DOCUMENTS_DIR = _documents_dir()
 DEFAULT_STORAGE_ROOT = os.path.join(DOCUMENTS_DIR, "SbobinAI")
 LEGACY_STORAGE_ROOT = os.path.join(DOCUMENTS_DIR, "UniCoPilot")

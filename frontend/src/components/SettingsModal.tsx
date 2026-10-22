@@ -1708,7 +1708,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       <div className="flex items-center gap-2">
                         <h4 className="text-sm font-bold text-white">Aggiornamenti</h4>
                         <span className="text-[10px] font-mono font-medium px-2 py-0.5 rounded-full bg-white/[0.08] text-white/70 border border-white/10">
-                          v{updater.currentVersion || '0.0.4'}
+                          v{updater.currentVersion || '0.0.5'}
                         </span>
                       </div>
                       <p className="text-[11px] text-white/50 mt-0.5">
@@ -1728,7 +1728,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       {updater.status === 'checking' ? 'Controllo in corso...' : 'Controlla aggiornamenti'}
                     </button>
                     <span className="text-[11px] text-white/40 font-medium">
-                      Versione installata: <strong className="font-mono text-white/80">v{updater.currentVersion || '0.0.4'}</strong>
+                      Versione installata: <strong className="font-mono text-white/80">v{updater.currentVersion || '0.0.5'}</strong>
                     </span>
                     {updater.status === 'uptodate' && <span className="text-[11px] text-emerald-300 font-medium">Sei all'ultima versione</span>}
                     {updater.status === 'available' && (

@@ -34,6 +34,24 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   return res.json();
 }
 
+export async function checkBackendHealth(timeoutMs = 1500): Promise<boolean> {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const origin = BASE_URL.replace(/\/api\/v1\/?$/, '');
+    const res = await fetch(`${origin}/health`, {
+      method: 'GET',
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) return false;
+    const data = await res.json().catch(() => null);
+    return data?.status === 'ok';
+  } catch {
+    return false;
+  }
+}
+
 // ── Subjects ──────────────────────────────────────────────────────────────────
 export const api = {
   subjects: {
@@ -191,8 +209,14 @@ export const api = {
   },
   models: {
     status: () => request<import('../types').ModelsStatusResponse>('/models/status'),
+    downloadStatus: (modelId?: string) =>
+      request<any>(
+        modelId
+          ? `/models/download-status?model_id=${encodeURIComponent(modelId)}`
+          : '/models/download-status'
+      ),
     download: (modelId: string) =>
-      request<{ status: string; model_id: string }>('/models/download', {
+      request<{ status: string; model_id: string; model?: string; progress?: number }>('/models/download', {
         method: 'POST',
         body: JSON.stringify({ model_id: modelId }),
       }),

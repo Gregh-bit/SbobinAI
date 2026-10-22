@@ -29,6 +29,7 @@ scipy>=1.11.0
 # webrtcvad non ha wheel Windows: webrtcvad-wheels espone lo stesso modulo `webrtcvad`
 webrtcvad-wheels>=2.0.14
 huggingface-hub>=0.23.0
+certifi>=2024.2.2
 tqdm>=4.66.0
 av>=12.0.0
 

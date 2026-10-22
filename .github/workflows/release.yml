@@ -57,6 +57,14 @@ jobs:
           uploadUpdaterJson: true
           args: ${{ matrix.args }}
 
+      - name: Ad-hoc codesign app bundle (macOS)
+        if: matrix.platform == 'macos-14'
+        run: |
+          for app in $(find frontend/src-tauri/target -name "SbobinAI.app" -type d); do
+            echo "Signing $app ad-hoc..."
+            codesign --force --deep --sign - "$app"
+          done
+
       - name: Upload fixed-name asset for direct website download (macOS)
         if: matrix.platform == 'macos-14'
         env:
@@ -70,9 +78,6 @@ jobs:
           if [ -n "$DMG_FILE" ] && [ -n "$TAG_NAME" ]; then
             cp "$DMG_FILE" SbobinAI-macOS.dmg
             gh release upload "$TAG_NAME" SbobinAI-macOS.dmg --clobber
-            if [ -f "scripts/Sblocca-SbobinAI-macOS.command" ]; then
-              gh release upload "$TAG_NAME" scripts/Sblocca-SbobinAI-macOS.command --clobber
-            fi
           fi
 
       - name: Upload fixed-name asset for direct website download (Windows)
