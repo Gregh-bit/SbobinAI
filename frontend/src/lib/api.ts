@@ -1,7 +1,7 @@
 // lib/api.ts — SbobinAI HTTP API client
 
-const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1';
-const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000';
+const BASE_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000/api/v1';
+const WS_URL = import.meta.env.VITE_WS_URL || 'ws://127.0.0.1:8000';
 
 // Estrae un messaggio leggibile dal campo `detail` di FastAPI (stringa o array di errori 422)
 function formatErrorDetail(detail: unknown, status: number): string {

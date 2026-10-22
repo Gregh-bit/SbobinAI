@@ -1,9 +1,9 @@
 import { osBadge, isMac } from '../lib/platform';
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { 
   Sparkles, Folder, ArrowRight, ArrowLeft, 
   CheckCircle2, HardDrive, ShieldCheck, Zap, Laptop,
-  Download, Loader2, X, AlertCircle, Bot, Check, Database, Mic
+  Download, Loader2, X, AlertCircle, Bot, Check, Database, Mic, RefreshCw
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import { useSettings } from '../lib/SettingsContext';
@@ -51,6 +51,29 @@ const LLM_OPTIONS = [
 const CORE_WHISPER_ID = 'large-v3-turbo-q4';
 const CORE_EMBEDDING_ID = 'mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ';
 
+const MODEL_SIZE_ESTIMATES: Record<string, number> = {
+  [CORE_WHISPER_ID]: 580,
+  [CORE_EMBEDDING_ID]: 300,
+  'mlx-community/Qwen3.5-4B-MLX-4bit': 2400,
+  'unsloth/gemma-4-E4B-it-UD-MLX-4bit': 2500,
+  'later': 0,
+};
+
+function getModelDisplayName(id: string): string {
+  if (id === CORE_WHISPER_ID) return 'Whisper Large-v3-Turbo Q4';
+  if (id === CORE_EMBEDDING_ID) return 'Qwen3-Embedding 0.6B RAG';
+  if (id === 'mlx-community/Qwen3.5-4B-MLX-4bit') return 'Qwen 3.5 4B (4-bit)';
+  if (id === 'unsloth/gemma-4-E4B-it-UD-MLX-4bit') return 'Gemma 4 E4B (4-bit)';
+  return id;
+}
+
+function formatMbOrGb(mb: number): string {
+  if (mb >= 1000) {
+    return `~${(mb / 1024).toFixed(1)} GB`;
+  }
+  return `~${Math.round(mb)} MB`;
+}
+
 export default function Wizard() {
   const { settings, completeSetup } = useSettings();
   const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
@@ -62,10 +85,17 @@ export default function Wizard() {
 
   // Stato Modelli Reale da Backend
   const [modelsStatus, setModelsStatus] = useState<ModelsStatusResponse | null>(null);
+  const [downloadQueue, setDownloadQueue] = useState<string[]>([]);
+  const [queueIndex, setQueueIndex] = useState<number>(0);
   const [activeDownloadModel, setActiveDownloadModel] = useState<string | null>(null);
   const [isDownloadingScreen, setIsDownloadingScreen] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
+  const [isTriggering, setIsTriggering] = useState(false);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+
+  // Ref per accedere sempre ai valori correnti nel loop del polling
+  const queueRef = useRef({ downloadQueue, queueIndex, activeDownloadModel, isDownloadingScreen });
+  queueRef.current = { downloadQueue, queueIndex, activeDownloadModel, isDownloadingScreen };
 
   // Verifica continua dello stato dei modelli
   useEffect(() => {
@@ -77,23 +107,37 @@ export default function Wizard() {
         if (!isMounted) return;
         setModelsStatus(res);
 
-        // Se siamo nella schermata di download, verifica l'avanzamento sequenziale dei core
-        if (isDownloadingScreen && activeDownloadModel) {
+        const { downloadQueue: q, queueIndex: qIdx, activeDownloadModel: curActive, isDownloadingScreen: isDl } = queueRef.current;
+
+        // Se siamo nella schermata di download, verifica l'avanzamento sequenziale della coda
+        if (isDl && curActive) {
           const allModels = [...(res.whisper || []), ...(res.embedding || []), ...(res.llm || [])];
-          const curInfo = allModels.find((m) => m.id === activeDownloadModel);
+          const curInfo = allModels.find((m) => m.id === curActive);
 
           if (curInfo?.status === 'completed') {
-            // Se Whisper è completato, verifica se serve scaricare Qwen3-Embedding
-            const embInfo = res.embedding?.find((m) => m.id === CORE_EMBEDDING_ID);
-            const isEmbDone = embInfo?.downloaded === true;
-
-            if (activeDownloadModel === CORE_WHISPER_ID && !isEmbDone) {
-              setActiveDownloadModel(CORE_EMBEDDING_ID);
-              await api.models.download(CORE_EMBEDDING_ID);
+            const nextIdx = qIdx + 1;
+            if (nextIdx < q.length) {
+              const nextModelId = q[nextIdx];
+              queueRef.current.queueIndex = nextIdx;
+              queueRef.current.activeDownloadModel = nextModelId;
+              setQueueIndex(nextIdx);
+              setActiveDownloadModel(nextModelId);
+              setDownloadError(null);
+              try {
+                await api.models.download(nextModelId);
+              } catch (e: any) {
+                setDownloadError(e?.message || 'Errore durante l\'avvio del download del componente successivo.');
+              }
             } else {
-              // Entrambi i core completati con successo
+              // Tutti i modelli della coda sono stati completati con successo
+              queueRef.current.isDownloadingScreen = false;
+              queueRef.current.activeDownloadModel = null;
+              queueRef.current.downloadQueue = [];
+              queueRef.current.queueIndex = 0;
               setIsDownloadingScreen(false);
               setActiveDownloadModel(null);
+              setDownloadQueue([]);
+              setQueueIndex(0);
               setDownloadError(null);
             }
           } else if (curInfo?.status === 'error') {
@@ -112,14 +156,13 @@ export default function Wizard() {
       isMounted = false;
       clearInterval(timer);
     };
-  }, [step, isDownloadingScreen, activeDownloadModel]);
+  }, [isDownloadingScreen]);
 
   const handleChooseFolder = async () => {
     setIsSelectingFolder(true);
     try {
       const selected = await pickFolder(storagePath);
       if (selected) {
-        // Il percorso viene inviato al backend una sola volta al completamento del setup
         setStoragePath(selected);
       }
     } finally {
@@ -127,14 +170,28 @@ export default function Wizard() {
     }
   };
 
-  // Verifica presenza su disco dei due motori base obbligatori
+  // Verifica presenza su disco dei componenti
   const isWhisperDownloaded = Boolean(
     modelsStatus?.whisper?.find((m) => m.id === CORE_WHISPER_ID)?.downloaded
   );
   const isEmbeddingDownloaded = Boolean(
     modelsStatus?.embedding?.find((m) => m.id === CORE_EMBEDDING_ID)?.downloaded
   );
-  const isCoreReady = isWhisperDownloaded && isEmbeddingDownloaded;
+  const isLlmDownloaded =
+    llmModel === 'later'
+      ? true
+      : Boolean(modelsStatus?.llm?.find((m) => m.id === llmModel)?.downloaded);
+
+  // Tutto pronto per iniziare
+  const isAllRequiredReady = isWhisperDownloaded && isEmbeddingDownloaded && isLlmDownloaded;
+
+  // Calcolo dinamico dei megabyte totali da scaricare
+  let totalMbNeeded = 0;
+  if (!isWhisperDownloaded) totalMbNeeded += MODEL_SIZE_ESTIMATES[CORE_WHISPER_ID] || 580;
+  if (!isEmbeddingDownloaded) totalMbNeeded += MODEL_SIZE_ESTIMATES[CORE_EMBEDDING_ID] || 300;
+  if (llmModel !== 'later' && !isLlmDownloaded) {
+    totalMbNeeded += MODEL_SIZE_ESTIMATES[llmModel] || 2400;
+  }
 
   // Modello attualmente monitorato durante il download
   const allKnownModels = [
@@ -145,40 +202,97 @@ export default function Wizard() {
   const activeInfo = allKnownModels.find((m) => m.id === activeDownloadModel);
   const progressPct = activeInfo?.progress ?? 0;
   const downloadedMb = activeInfo?.downloaded_mb ?? 0;
-  const totalMb = activeInfo?.total_mb ?? (activeDownloadModel === CORE_EMBEDDING_ID ? 300 : 580);
+  const totalMb = activeInfo?.total_mb ?? (MODEL_SIZE_ESTIMATES[activeDownloadModel || ''] || 500);
 
-  // Avvio download dei componenti di sistema base obbligatori
-  const handleStartCoreDownload = async () => {
+  // Avvio download dei componenti in coda sequenziale
+  const handleStartDownloads = async () => {
     try {
+      setIsTriggering(true);
       setDownloadError(null);
+
+      // Assicurati che lo stato modelli sia disponibile
+      let currentStatus = modelsStatus;
+      if (!currentStatus) {
+        try {
+          currentStatus = await api.models.status();
+          setModelsStatus(currentStatus);
+        } catch (e: any) {
+          setDownloadError(e?.message || 'Impossibile connettersi al motore locale SbobinAI.');
+          return;
+        }
+      }
+
+      const whisperDone = Boolean(
+        currentStatus?.whisper?.find((m) => m.id === CORE_WHISPER_ID)?.downloaded
+      );
+      const embeddingDone = Boolean(
+        currentStatus?.embedding?.find((m) => m.id === CORE_EMBEDDING_ID)?.downloaded
+      );
+      const llmDone =
+        llmModel === 'later'
+          ? true
+          : Boolean(currentStatus?.llm?.find((m) => m.id === llmModel)?.downloaded);
+
+      // Costruisci la lista dei modelli da scaricare
+      const queue: string[] = [];
+      if (!whisperDone) queue.push(CORE_WHISPER_ID);
+      if (!embeddingDone) queue.push(CORE_EMBEDDING_ID);
+      if (llmModel !== 'later' && !llmDone) queue.push(llmModel);
+
+      if (queue.length === 0) {
+        await handleFinishSetup();
+        return;
+      }
+
+      queueRef.current.downloadQueue = queue;
+      queueRef.current.queueIndex = 0;
+      queueRef.current.activeDownloadModel = queue[0];
+      queueRef.current.isDownloadingScreen = true;
+
+      setDownloadQueue(queue);
+      setQueueIndex(0);
+      setActiveDownloadModel(queue[0]);
       setIsDownloadingScreen(true);
 
-      if (!isWhisperDownloaded) {
-        setActiveDownloadModel(CORE_WHISPER_ID);
-        await api.models.download(CORE_WHISPER_ID);
-      } else if (!isEmbeddingDownloaded) {
-        setActiveDownloadModel(CORE_EMBEDDING_ID);
-        await api.models.download(CORE_EMBEDDING_ID);
-      }
+      await api.models.download(queue[0]);
     } catch (err: any) {
-      console.error('[Wizard] Errore avvio download core:', err);
-      setDownloadError(err?.message || 'Impossibile avviare il download dei componenti base.');
-      setIsDownloadingScreen(false);
-      setActiveDownloadModel(null);
+      console.error('[Wizard] Errore avvio download:', err);
+      setDownloadError(err?.message || 'Impossibile avviare il download dei componenti.');
+    } finally {
+      setIsTriggering(false);
+    }
+  };
+
+  const handleRetryCurrent = async () => {
+    if (!activeDownloadModel) return;
+    setDownloadError(null);
+    try {
+      await api.models.download(activeDownloadModel);
+    } catch (err: any) {
+      setDownloadError(err?.message || 'Errore durante il tentativo di download.');
     }
   };
 
   const handleInterruptDownload = async () => {
-    if (!activeDownloadModel) return;
+    if (!activeDownloadModel) {
+      setIsDownloadingScreen(false);
+      return;
+    }
     setIsCancelling(true);
     try {
       await api.models.cancelDownload(activeDownloadModel);
     } catch (err) {
       console.warn('[Wizard] Errore stop download:', err);
     } finally {
+      queueRef.current.isDownloadingScreen = false;
+      queueRef.current.activeDownloadModel = null;
+      queueRef.current.downloadQueue = [];
+      queueRef.current.queueIndex = 0;
       setIsCancelling(false);
       setIsDownloadingScreen(false);
       setActiveDownloadModel(null);
+      setDownloadQueue([]);
+      setQueueIndex(0);
       setDownloadError(null);
       try {
         const res = await api.models.status();
@@ -193,7 +307,6 @@ export default function Wizard() {
     const finalEmbedding = CORE_EMBEDDING_ID;
     const finalLlm = llmModel === 'later' ? 'mlx-community/Qwen3.5-4B-MLX-4bit' : llmModel;
 
-    // completeSetup esegue in sequenza: POST /settings/storage (atteso) e poi PATCH /settings
     await completeSetup({
       storagePath,
       whisperModel: finalWhisper,
@@ -230,10 +343,8 @@ export default function Wizard() {
           <div className="flex items-center gap-2 px-3.5 py-1.5 rounded-full liquid-glass-subtle border border-blue-500/30 text-xs text-blue-300 font-medium">
             <Loader2 size={12} className="animate-spin text-blue-400" />
             <span>
-              Installazione Componente:{' '}
-              {activeDownloadModel === CORE_WHISPER_ID
-                ? 'Whisper Large Turbo (1/2)'
-                : 'Qwen3-Embedding RAG (2/2)'}
+              Installazione Componente ({queueIndex + 1}/{downloadQueue.length || 1}):{' '}
+              {getModelDisplayName(activeDownloadModel || '')}
             </span>
           </div>
         ) : (
@@ -333,7 +444,7 @@ export default function Wizard() {
                 Dove vuoi archiviare i tuoi corsi?
               </h2>
               <p className="text-xs text-white/60 leading-relaxed">
-                SbobinAI memorizzerà in questa cartella il database SQLite delle lezioni, i file audio WAV registrati e l'indice vettoriale LanceDB.
+                SbobinAI memorizzerà in questa cartella il database SQLite delle lezioni, i file audio M4A/WAV registrati e l'indice vettoriale LanceDB.
               </p>
             </div>
 
@@ -425,34 +536,54 @@ export default function Wizard() {
               <span>
                 {llmModel === 'later'
                   ? 'Hai scelto di rimandare: potrai registrare e sbobinare subito le lezioni, e scaricare l\'LLM in seguito dalle Impostazioni.'
-                  : `Hai selezionato ${LLM_OPTIONS.find((o) => o.id === llmModel)?.name}. Sarà pronto all'uso sul tuo computer.`}
+                  : `Hai selezionato ${LLM_OPTIONS.find((o) => o.id === llmModel)?.name}. Verrà preparato per l'uso sul tuo computer.`}
               </span>
             </div>
           </div>
         )}
 
-        {/* ── STEP 4: COMPONENTI DI SISTEMA OBBLIGATORI (AUDIO & RAG) ── */}
+        {/* ── STEP 4: COMPONENTI DI SISTEMA (AUDIO, RAG E MODELLO IA) ── */}
         {step === 4 && !isDownloadingScreen && (
-          <div className="animate-fade-in space-y-6 w-full max-w-2xl my-auto">
+          <div className="animate-fade-in space-y-6 w-full max-w-3xl my-auto">
             <div className="space-y-2">
               <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full liquid-glass-subtle border border-emerald-500/25 text-xs text-emerald-300 font-medium">
                 <CheckCircle2 size={13} className="text-emerald-400" />
-                <span>Installazione Obbligatoria Core Engine</span>
+                <span>Riepilogo e Installazione Componenti</span>
               </div>
               <h2 className="text-2xl font-bold tracking-tight text-white">
-                Componenti di Sistema Obbligatori (Audio & Ricerca Semantica)
+                Componenti per Audio, Ricerca e Assistente IA
               </h2>
               <p className="text-xs text-white/60 leading-relaxed">
-                SbobinAI richiede questi due motori nativi per poter catturare le lezioni e abilitare la memoria del corso. 
-                L'installazione su disco è obbligatoria per sbloccare l'applicazione.
+                Ecco i motori che verranno installati sul tuo computer. 
+                Tutti i pesi operano al 100% in locale sulla memoria del tuo dispositivo.
               </p>
             </div>
 
-            {/* Le 2 Card dei Componenti Fissi di Sistema */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            {/* Eventuale messaggio di errore globale */}
+            {downloadError && (
+              <div className="p-4 rounded-2xl bg-red-500/15 border border-red-500/30 text-red-200 text-xs flex items-center justify-between gap-3 animate-fade-in">
+                <div className="flex items-center gap-2.5">
+                  <AlertCircle size={16} className="text-red-400 flex-shrink-0" />
+                  <span>{downloadError}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setDownloadError(null)}
+                  className="p-1 hover:bg-white/10 rounded-lg text-white/60 hover:text-white"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            )}
+
+            {/* Le Card dei Componenti */}
+            <div className={clsx(
+              "grid gap-3.5",
+              llmModel !== 'later' ? "grid-cols-1 sm:grid-cols-3" : "grid-cols-1 sm:grid-cols-2"
+            )}>
               {/* Card 1: Whisper Large-v3-Turbo Q4 */}
               <div className={clsx(
-                'p-5 rounded-3xl border transition-all flex flex-col justify-between text-left space-y-3',
+                'p-4 rounded-3xl border transition-all flex flex-col justify-between text-left space-y-2.5',
                 isWhisperDownloaded
                   ? 'bg-emerald-500/10 border-emerald-500/30 shadow-liquid-sm'
                   : 'liquid-glass border-white/[0.12]'
@@ -465,21 +596,21 @@ export default function Wizard() {
                         ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
                         : 'bg-amber-500/20 text-amber-300 border-amber-500/30'
                     )}>
-                      {isWhisperDownloaded ? 'Installato sul computer ✓' : 'Da Installare'}
+                      {isWhisperDownloaded ? 'Installato ✓' : 'Da Installare'}
                     </span>
-                    <div className="w-8 h-8 rounded-xl bg-white/[0.08] flex items-center justify-center text-white/80">
-                      <Mic size={15} />
+                    <div className="w-7 h-7 rounded-xl bg-white/[0.08] flex items-center justify-center text-white/80">
+                      <Mic size={14} />
                     </div>
                   </div>
 
-                  <h3 className="text-sm font-bold text-white mb-0.5">Motore Vocale Whisper</h3>
-                  <p className="text-[11px] font-mono text-white/40">Whisper Large-v3-Turbo Q4 (~580 MB)</p>
-                  <p className="text-xs text-white/60 mt-2 leading-relaxed">
-                    Trascrizione continua, fedele e priva di allucinazioni, accelerata in locale.
+                  <h3 className="text-xs font-bold text-white mb-0.5">Motore Whisper</h3>
+                  <p className="text-[10px] font-mono text-white/40">Whisper Large Turbo</p>
+                  <p className="text-[11px] text-white/60 mt-1.5 leading-relaxed">
+                    Trascrizione vocale continua accelerata in locale.
                   </p>
                 </div>
 
-                <div className="pt-2 border-t border-white/[0.08] flex items-center justify-between text-[11px] font-mono text-white/50">
+                <div className="pt-2 border-t border-white/[0.08] flex items-center justify-between text-[10px] font-mono text-white/50">
                   <span>Stato: {isWhisperDownloaded ? 'Pronto' : 'Richiesto'}</span>
                   <span>~580 MB</span>
                 </div>
@@ -487,7 +618,7 @@ export default function Wizard() {
 
               {/* Card 2: Qwen3-Embedding-0.6B-4bit-DWQ */}
               <div className={clsx(
-                'p-5 rounded-3xl border transition-all flex flex-col justify-between text-left space-y-3',
+                'p-4 rounded-3xl border transition-all flex flex-col justify-between text-left space-y-2.5',
                 isEmbeddingDownloaded
                   ? 'bg-emerald-500/10 border-emerald-500/30 shadow-liquid-sm'
                   : 'liquid-glass border-white/[0.12]'
@@ -500,46 +631,85 @@ export default function Wizard() {
                         ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
                         : 'bg-amber-500/20 text-amber-300 border-amber-500/30'
                     )}>
-                      {isEmbeddingDownloaded ? 'Installato sul computer ✓' : 'Da Installare'}
+                      {isEmbeddingDownloaded ? 'Installato ✓' : 'Da Installare'}
                     </span>
-                    <div className="w-8 h-8 rounded-xl bg-white/[0.08] flex items-center justify-center text-white/80">
-                      <Database size={15} />
+                    <div className="w-7 h-7 rounded-xl bg-white/[0.08] flex items-center justify-center text-white/80">
+                      <Database size={14} />
                     </div>
                   </div>
 
-                  <h3 className="text-sm font-bold text-white mb-0.5">Motore Memoria RAG</h3>
-                  <p className="text-[11px] font-mono text-white/40">Qwen3-Embedding 0.6B DWQ (~300 MB)</p>
-                  <p className="text-xs text-white/60 mt-2 leading-relaxed">
-                    Vettorializzazione 1024-dim nativa per la ricerca ibrida nei materiali e lezioni.
+                  <h3 className="text-xs font-bold text-white mb-0.5">Memoria RAG</h3>
+                  <p className="text-[10px] font-mono text-white/40">Qwen3-Embedding DWQ</p>
+                  <p className="text-[11px] text-white/60 mt-1.5 leading-relaxed">
+                    Vettori per ricerca semantica e memoria lezioni.
                   </p>
                 </div>
 
-                <div className="pt-2 border-t border-white/[0.08] flex items-center justify-between text-[11px] font-mono text-white/50">
+                <div className="pt-2 border-t border-white/[0.08] flex items-center justify-between text-[10px] font-mono text-white/50">
                   <span>Stato: {isEmbeddingDownloaded ? 'Pronto' : 'Richiesto'}</span>
                   <span>~300 MB</span>
                 </div>
               </div>
+
+              {/* Card 3: Modello LLM selezionato */}
+              {llmModel !== 'later' && (
+                <div className={clsx(
+                  'p-4 rounded-3xl border transition-all flex flex-col justify-between text-left space-y-2.5',
+                  isLlmDownloaded
+                    ? 'bg-emerald-500/10 border-emerald-500/30 shadow-liquid-sm'
+                    : 'liquid-glass border-white/[0.12]'
+                )}>
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <span className={clsx(
+                        'text-[10px] px-2.5 py-0.5 rounded-full font-semibold border',
+                        isLlmDownloaded
+                          ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
+                          : 'bg-blue-500/20 text-blue-300 border-blue-500/30'
+                      )}>
+                        {isLlmDownloaded ? 'Installato ✓' : 'Selezionato allo Step 3'}
+                      </span>
+                      <div className="w-7 h-7 rounded-xl bg-white/[0.08] flex items-center justify-center text-white/80">
+                        <Bot size={14} />
+                      </div>
+                    </div>
+
+                    <h3 className="text-xs font-bold text-white mb-0.5">Assistente IA</h3>
+                    <p className="text-[10px] font-mono text-white/40 truncate">
+                      {getModelDisplayName(llmModel)}
+                    </p>
+                    <p className="text-[11px] text-white/60 mt-1.5 leading-relaxed">
+                      Generazione capitoli Quaderno e risposte in chat.
+                    </p>
+                  </div>
+
+                  <div className="pt-2 border-t border-white/[0.08] flex items-center justify-between text-[10px] font-mono text-white/50">
+                    <span>Stato: {isLlmDownloaded ? 'Pronto' : 'Da scaricare'}</span>
+                    <span>{formatMbOrGb(MODEL_SIZE_ESTIMATES[llmModel] || 2400)}</span>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Box informativo di stato */}
             <div className={clsx(
               'p-4 rounded-2xl border flex items-center gap-3 text-xs leading-relaxed',
-              isCoreReady
+              isAllRequiredReady
                 ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-200'
-                : 'bg-amber-500/10 border-amber-500/25 text-amber-200'
+                : 'bg-blue-500/10 border-blue-500/25 text-blue-200'
             )}>
-              {isCoreReady ? (
+              {isAllRequiredReady ? (
                 <>
                   <CheckCircle2 size={18} className="text-emerald-400 flex-shrink-0" />
                   <span>
-                    <strong>Componenti di sistema base verificati!</strong> Il tuo computer è pronto per registrare le lezioni e indicizzare i contenuti. Clicca su "Inizia a Studiare".
+                    <strong>Tutti i componenti sono pronti!</strong> Il tuo computer ha tutti i modelli necessari. Clicca su "Inizia a Studiare" per accedere all'applicazione.
                   </span>
                 </>
               ) : (
                 <>
-                  <AlertCircle size={18} className="text-amber-400 flex-shrink-0" />
+                  <Sparkles size={18} className="text-blue-400 flex-shrink-0" />
                   <span>
-                    <strong>Installazione necessaria:</strong> per poter usare SbobinAI, clicca sul pulsante sottostante per scaricare i componenti base mancanti.
+                    <strong>Download pronto:</strong> clicca su <strong>"Scarica ({formatMbOrGb(totalMbNeeded)})"</strong> per installare sul disco i modelli selezionati.
                   </span>
                 </>
               )}
@@ -552,12 +722,10 @@ export default function Wizard() {
           <div className="flex-1 flex flex-col items-center justify-center p-8 max-w-lg mx-auto text-center animate-fade-in space-y-7 my-auto">
             <div className="space-y-1">
               <span className="text-[11px] font-mono uppercase tracking-wider text-blue-400 font-semibold px-3 py-1 rounded-full bg-blue-500/10 border border-blue-500/20 inline-block">
-                Installazione Componenti di Sistema Base
+                Installazione Componenti ({queueIndex + 1} di {downloadQueue.length || 1})
               </span>
               <h2 className="text-xl font-bold tracking-tight text-white">
-                {activeDownloadModel === CORE_WHISPER_ID
-                  ? 'Download Whisper Large-v3-Turbo Q4 (~580 MB)'
-                  : 'Download Qwen3-Embedding-0.6B-4bit-DWQ (~300 MB)'}
+                Download {getModelDisplayName(activeDownloadModel || '')} ({formatMbOrGb(MODEL_SIZE_ESTIMATES[activeDownloadModel || ''] || 500)})
               </h2>
             </div>
 
@@ -597,7 +765,7 @@ export default function Wizard() {
                 {downloadError ? (
                   <div className="flex flex-col items-center animate-fade-in px-4">
                     <AlertCircle size={40} className="text-red-400 mb-1" />
-                    <span className="text-xs font-semibold text-red-300">Errore Connessione</span>
+                    <span className="text-xs font-semibold text-red-300">Errore Download</span>
                   </div>
                 ) : progressPct >= 100 ? (
                   <div className="flex flex-col items-center animate-fade-in">
@@ -618,7 +786,7 @@ export default function Wizard() {
             </div>
 
             {/* Testi dinamici sotto la progress bar */}
-            <div className="space-y-2 max-w-sm">
+            <div className="space-y-3 max-w-sm">
               <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-white/[0.06] border border-white/[0.12] text-xs font-medium text-white/90">
                 {downloadError ? (
                   <AlertCircle size={13} className="text-red-400" />
@@ -629,20 +797,43 @@ export default function Wizard() {
                 )}
                 <span>
                   {downloadError
-                    ? 'Errore di connessione ai server Hugging Face'
+                    ? 'Errore durante il download dal repository'
                     : activeInfo?.stage || (
                         progressPct < 90
-                          ? `Download ${activeDownloadModel === CORE_WHISPER_ID ? 'Whisper Large Turbo' : 'Qwen3 Embedding'}...`
-                          : 'Ottimizzazione pesi su in locale...'
+                          ? `Download in corso (${queueIndex + 1}/${downloadQueue.length || 1})...`
+                          : 'Ottimizzazione pesi in locale...'
                       )}
                 </span>
               </div>
 
               <p className="text-xs text-white/50 leading-relaxed">
                 {downloadError
-                  ? `Si è verificato un errore: ${downloadError}. Clicca su "Interrompi" per riprovare.`
+                  ? `${downloadError}`
                   : 'I componenti risiedono interamente nella memoria locale del tuo computer.'}
               </p>
+
+              {downloadError && (
+                <div className="pt-2 flex items-center justify-center gap-3">
+                  <button
+                    type="button"
+                    onClick={handleRetryCurrent}
+                    className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold bg-blue-500 hover:bg-blue-600 text-white transition-colors cursor-pointer"
+                  >
+                    <RefreshCw size={12} />
+                    <span>Riprova</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsDownloadingScreen(false);
+                      setActiveDownloadModel(null);
+                    }}
+                    className="px-4 py-2 rounded-xl text-xs font-medium text-white/70 hover:text-white bg-white/10 hover:bg-white/15 transition-colors cursor-pointer"
+                  >
+                    Torna al Wizard
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -702,8 +893,8 @@ export default function Wizard() {
                   <span>Continua</span>
                   <ArrowRight size={14} />
                 </button>
-              ) : isCoreReady ? (
-                /* ── STEP 4: CORE INSTALLATI -> INIZIA A STUDIARE (SBLOCCATO) ── */
+              ) : isAllRequiredReady ? (
+                /* ── STEP 4: TUTTO INSTALLATO -> INIZIA A STUDIARE ── */
                 <button
                   type="button"
                   onClick={handleFinishSetup}
@@ -713,16 +904,26 @@ export default function Wizard() {
                   <span>Inizia a Studiare</span>
                 </button>
               ) : (
-                /* ── STEP 4: CORE MANCANTI -> PULSANTE DOWNLOAD OBBLIGATORIO ── */
+                /* ── STEP 4: COMPONENTI DA SCARICARE -> PULSANTE DOWNLOAD DINAMICO ── */
                 <button
                   type="button"
-                  onClick={handleStartCoreDownload}
-                  className="flex items-center gap-2 px-7 py-2.5 rounded-2xl text-xs font-semibold text-white bg-blue-500 hover:bg-blue-600 shadow-[0_0_20px_rgba(59,130,246,0.35)] transition-all cursor-pointer"
+                  onClick={handleStartDownloads}
+                  disabled={isTriggering}
+                  className="flex items-center gap-2 px-7 py-2.5 rounded-2xl text-xs font-semibold text-white bg-blue-500 hover:bg-blue-600 shadow-[0_0_20px_rgba(59,130,246,0.35)] transition-all cursor-pointer disabled:opacity-50"
                 >
-                  <Download size={14} />
-                  <span>
-                    Installa Componenti di Sistema Base (~{(!isWhisperDownloaded && !isEmbeddingDownloaded) ? '880' : !isWhisperDownloaded ? '580' : '300'} MB)
-                  </span>
+                  {isTriggering ? (
+                    <>
+                      <Loader2 size={14} className="animate-spin text-white" />
+                      <span>Avvio download...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Download size={14} />
+                      <span>
+                        Scarica ({formatMbOrGb(totalMbNeeded)})
+                      </span>
+                    </>
+                  )}
                 </button>
               )}
             </div>
