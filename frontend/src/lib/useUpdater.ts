@@ -18,7 +18,7 @@ interface State {
   currentVersion: string;
 }
 
-let state: State = { status: 'idle', version: null, progress: 0, error: null, currentVersion: '0.0.5' };
+let state: State = { status: 'idle', version: null, progress: 0, error: null, currentVersion: '0.0.6' };
 let handle: UpdateHandle | null = null;
 let startupDone = false;
 let versionFetched = false;

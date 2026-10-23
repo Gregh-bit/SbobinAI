@@ -6,5 +6,11 @@
   <string>SbobinAI utilizza il microfono per registrare e trascrivere le tue lezioni universitarie in locale.</string>
   <key>NSSpeechRecognitionUsageDescription</key>
   <string>SbobinAI trascrive il parlato delle lezioni e delle interrogazioni con modelli di riconoscimento vocale eseguiti interamente in locale sul tuo Mac.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>SbobinAI salva le tue lezioni, registrazioni audio e riassunti nella cartella Documenti.</string>
+  <key>LSRequiresCarbon</key>
+  <false/>
+  <key>LSMinimumSystemVersion</key>
+  <string>12.0</string>
 </dict>
 </plist>

@@ -106,31 +106,23 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
     return result;
   }, [lines]);
 
-  // ── Animation Loop ottimizzato (~30-35 FPS per eliminare il sovraccarico su display 120Hz) ──
+  // ── Animation Loop ottimizzato (Sincronizzazione fluidissima ~60 FPS) ──
   useEffect(() => {
     let animId: number;
-    let lastTime = 0;
 
-    const tick = (now: number) => {
-      if (now - lastTime >= 28) {
-        lastTime = now;
-        if (audioRef.current) {
-          setCurrentMs(Math.round(audioRef.current.currentTime * 1000));
-        }
+    const tick = () => {
+      const audio = audioRef.current;
+      if (audio && !audio.paused) {
+        setCurrentMs(Math.round(audio.currentTime * 1000));
       }
       animId = requestAnimationFrame(tick);
     };
 
-    if (isPlaying) {
-      animId = requestAnimationFrame(tick);
-    } else if (audioRef.current) {
-      setCurrentMs(Math.round(audioRef.current.currentTime * 1000));
-    }
-
+    animId = requestAnimationFrame(tick);
     return () => {
-      if (animId) cancelAnimationFrame(animId);
+      cancelAnimationFrame(animId);
     };
-  }, [isPlaying, audioRef]);
+  }, [audioRef]);
 
   // Ascolto eventi audio nativi per scrubbing istantaneo
   useEffect(() => {
@@ -140,9 +132,15 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
     const syncTime = () => setCurrentMs(Math.round(audio.currentTime * 1000));
     audio.addEventListener('timeupdate', syncTime);
     audio.addEventListener('seeked', syncTime);
+    audio.addEventListener('play', syncTime);
+    audio.addEventListener('playing', syncTime);
+    audio.addEventListener('pause', syncTime);
     return () => {
       audio.removeEventListener('timeupdate', syncTime);
       audio.removeEventListener('seeked', syncTime);
+      audio.removeEventListener('play', syncTime);
+      audio.removeEventListener('playing', syncTime);
+      audio.removeEventListener('pause', syncTime);
     };
   }, [audioRef]);
 
@@ -165,12 +163,17 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
     if (!isAutoScrollLocked && !force) return;
     if (activeLineIndex < 0 || !lineRefs.current[activeLineIndex] || !containerRef.current) return;
 
+    const container = containerRef.current;
     const targetEl = lineRefs.current[activeLineIndex];
-    if (targetEl) {
+    if (targetEl && container) {
       isProgrammaticScrollRef.current = true;
-      targetEl.scrollIntoView({
+      const containerRect = container.getBoundingClientRect();
+      const targetRect = targetEl.getBoundingClientRect();
+      const relativeTop = targetRect.top - containerRect.top + container.scrollTop;
+      const targetScrollTop = relativeTop - (container.clientHeight / 2) + (targetRect.height / 2);
+      container.scrollTo({
+        top: Math.max(0, targetScrollTop),
         behavior: 'smooth',
-        block: 'center',
       });
       setTimeout(() => {
         isProgrammaticScrollRef.current = false;
@@ -345,21 +348,42 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
                     )}
                   >
                     {line.words.map((word, wIdx) => {
+                      const isWordActive = isLineActive && currentMs >= word.start && currentMs <= word.end;
+                      const isWordPastInLine = isLineActive && currentMs > word.end;
+                      const isWordFutureInLine = isLineActive && currentMs < word.start;
+
                       let wordStyle: React.CSSProperties = {};
-                      if (isLineActive) {
+                      if (!isPlaying && isInitialState) {
+                        wordStyle = {
+                          color: 'rgba(255, 255, 255, 0.88)',
+                          opacity: 1,
+                        };
+                      } else if (isWordActive) {
+                        const dur = Math.max(1, word.end - word.start);
+                        const ratio = Math.min(1, Math.max(0, (currentMs - word.start) / dur));
+                        const pct = Math.round(ratio * 100);
+                        const feather = Math.min(100, pct + 3);
+
+                        wordStyle = {
+                          backgroundImage: `linear-gradient(90deg, #ffffff 0%, #ffffff ${pct}%, rgba(255, 255, 255, 0.35) ${feather}%, rgba(255, 255, 255, 0.35) 100%)`,
+                          WebkitBackgroundClip: 'text',
+                          WebkitTextFillColor: 'transparent',
+                          transition: 'none',
+                        };
+                      } else if (isWordPastInLine || isLinePast) {
                         wordStyle = {
                           color: '#ffffff',
-                          textShadow: isInitialState
-                            ? 'none'
-                            : '0 0 14px rgba(255, 255, 255, 0.45)',
+                          opacity: 0.95,
                         };
-                      } else if (isLinePast) {
+                      } else if (isWordFutureInLine) {
                         wordStyle = {
-                          color: 'rgba(255, 255, 255, 0.85)',
+                          color: 'rgba(255, 255, 255, 0.35)',
+                          opacity: 0.40,
                         };
                       } else {
                         wordStyle = {
-                          color: 'rgba(255, 255, 255, 0.45)',
+                          color: 'rgba(255, 255, 255, 0.25)',
+                          opacity: 0.30,
                         };
                       }
 
@@ -372,9 +396,10 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
                           }}
                           style={wordStyle}
                           className={clsx(
-                            "inline-block cursor-pointer select-none transition-transform duration-100 active:scale-95",
+                            "inline-block cursor-pointer select-none",
                             "mr-[0.28em] my-0.5",
-                            "hover:opacity-100"
+                            !isWordActive && "transition-all duration-200 ease-out",
+                            "hover:opacity-100 hover:text-white"
                           )}
                           title={`[${formatTimeMs(word.start)}] Clicca per ascoltare`}
                         >

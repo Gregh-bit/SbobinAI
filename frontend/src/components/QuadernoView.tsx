@@ -22,8 +22,27 @@ function normalizeKaraokeLines(raw: any): KaraokeLine[] {
   const list = Array.isArray(raw) ? raw : (raw.lines || raw.segments || []);
   if (!Array.isArray(list)) return [];
 
-  const maxEnd = list.length > 0 ? Math.max(...list.map((it: any) => parseFloat(it.lineEnd ?? it.end ?? 0))) : 0;
-  const mult = maxEnd > 0 && maxEnd < 100000 ? 1000 : 1;
+  // Rileva se i timestamp sono già in millisecondi analizzando la durata di parole o segmenti
+  let isMs = false;
+  for (const item of list) {
+    if (!item) continue;
+    const words = item.words || [];
+    for (const w of words) {
+      const dur = parseFloat(w.end ?? 0) - parseFloat(w.start ?? 0);
+      if (dur >= 15) {
+        isMs = true;
+        break;
+      }
+    }
+    if (isMs) break;
+    const segDur = parseFloat(item.lineEnd ?? item.end ?? 0) - parseFloat(item.lineStart ?? item.start ?? 0);
+    if (segDur >= 30) {
+      isMs = true;
+      break;
+    }
+  }
+
+  const mult = isMs ? 1 : 1000;
 
   return list.map((item: any) => {
     const rawStart = parseFloat(item.lineStart ?? item.start ?? 0);

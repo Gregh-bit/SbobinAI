@@ -181,18 +181,11 @@ fn resolve_backend_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
         }
     }
 
-    // 3. Verifica percorsi workspace comuni nel profilo utente
+    // 3. Verifica percorsi sicuri in Application Support (senza toccare Documents o Desktop che richiedono permessi TCC)
     if let Some(home) = get_home_dir() {
-        for rel in &[
-            "Desktop/prova1/backend",
-            "Documents/SbobinAI/backend",
-            "SbobinAI/backend",
-            "Library/Application Support/com.sbobinai.app/backend",
-        ] {
-            let p = home.join(rel);
-            if has_main(&p) {
-                return Some(p);
-            }
+        let p = home.join("Library/Application Support/com.sbobinai.app/backend");
+        if has_main(&p) {
+            return Some(p);
         }
     }
 
@@ -269,7 +262,7 @@ fn ensure_virtualenv(
             {
                 let mut s = state.0.lock().unwrap();
                 s.status = "initializing_venv".into();
-                s.message = "Configurazione motore AI portatile (uv)...".into();
+                s.message = "Sto preparando l'ambiente per l'uso, aspetta ancora un po'...".into();
             }
             let _ = Command::new("/bin/sh")
                 .args(["-c", "curl -LsSf https://astral.sh/uv/install.sh | sh"])
@@ -292,22 +285,22 @@ fn ensure_virtualenv(
         {
             let mut s = state.0.lock().unwrap();
             s.status = "initializing_venv".into();
-            s.message = "Configurazione ambiente Python 3.12 con uv...".into();
+            s.message = "Sto preparando l'ambiente per l'uso, aspetta ancora un po'...".into();
         }
         let _ = std::fs::create_dir_all(target_venv.parent().unwrap_or(target_venv));
         let status = Command::new(&uv_bin)
             .args(["venv", target_venv.to_str().unwrap_or_default(), "--python", "3.12"])
             .env("PATH", &path_env)
             .status()
-            .map_err(|e| format!("Errore esecuzione uv venv: {e}"))?;
+            .map_err(|e| format!("Errore configurazione ambiente: {e}"))?;
         if !status.success() {
-            return Err("Fallito comando uv venv".into());
+            return Err("Configurazione ambiente fallita".into());
         }
 
         {
             let mut s = state.0.lock().unwrap();
             s.status = "installing_deps".into();
-            s.message = "Installazione pacchetti AI locali con uv...".into();
+            s.message = "Sto preparando l'ambiente per l'uso, aspetta ancora un po'...".into();
         }
         let status = Command::new(&uv_bin)
             .args([
@@ -320,34 +313,34 @@ fn ensure_virtualenv(
             ])
             .env("PATH", &path_env)
             .status()
-            .map_err(|e| format!("Errore esecuzione uv pip install: {e}"))?;
+            .map_err(|e| format!("Errore configurazione componenti: {e}"))?;
         if !status.success() {
-            return Err("Fallito comando uv pip install".into());
+            return Err("Configurazione componenti fallita".into());
         }
     } else {
         let base_py = find_base_python().ok_or_else(|| {
-            "Nessun interprete Python 3 trovato sul sistema. Assicurati che Python sia installato.".to_string()
+            "Impossibile avviare il motore. Assicurati che Python sia installato.".to_string()
         })?;
 
         {
             let mut s = state.0.lock().unwrap();
             s.status = "initializing_venv".into();
-            s.message = "Inizializzazione ambiente Python in corso...".into();
+            s.message = "Sto preparando l'ambiente per l'uso, aspetta ancora un po'...".into();
         }
         let _ = std::fs::create_dir_all(target_venv.parent().unwrap_or(target_venv));
         let status = Command::new(&base_py)
             .args(["-m", "venv", target_venv.to_str().unwrap_or_default()])
             .env("PATH", &path_env)
             .status()
-            .map_err(|e| format!("Errore creazione venv con {:?}: {e}", base_py))?;
+            .map_err(|e| format!("Errore configurazione: {e}"))?;
         if !status.success() {
-            return Err("Fallita creazione virtualenv con Python di sistema".into());
+            return Err("Configurazione fallita".into());
         }
 
         {
             let mut s = state.0.lock().unwrap();
             s.status = "installing_deps".into();
-            s.message = "Installazione dipendenze AI al primo avvio (richiede ~1 min)...".into();
+            s.message = "Sto preparando l'ambiente per l'uso, aspetta ancora un po'...".into();
         }
         let pip_bin = if cfg!(windows) {
             target_venv.join("Scripts/pip.exe")
@@ -550,8 +543,39 @@ fn kill_backend(app: &tauri::AppHandle) {
                 .stderr(Stdio::null())
                 .status();
         }
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            std::thread::sleep(Duration::from_millis(300));
+        }
         let _ = child.kill();
         let _ = child.wait();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn apply_macos_dock_icon() {
+    use objc2::AnyThread;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    static ICON_BYTES: &[u8] = include_bytes!("../icons/icon.png");
+
+    if let Some(mtm) = MainThreadMarker::new() {
+        let ns_data = NSData::with_bytes(ICON_BYTES);
+        let ns_image = NSImage::initWithData(NSImage::alloc(), &ns_data);
+        if let Some(image) = ns_image {
+            let app = NSApplication::sharedApplication(mtm);
+            unsafe {
+                app.setApplicationIconImage(Some(&image));
+            }
+            log::info!("Applied macOS dynamic dock icon");
+        }
     }
 }
 
@@ -578,6 +602,9 @@ pub fn run() {
         .manage(backend_proc)
         .invoke_handler(tauri::generate_handler![get_backend_status])
         .setup(move |app| {
+            #[cfg(target_os = "macos")]
+            apply_macos_dock_icon();
+
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()

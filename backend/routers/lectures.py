@@ -103,10 +103,30 @@ def _normalize_karaoke_lines(raw_data) -> List[dict]:
     if not isinstance(raw_data, list):
         return []
 
-    # Determina la scala analizzando il timestamp massimo dell'intero array (Bug B1 fix)
-    # Se il valore massimo di fine riga è < 100000, i valori sono espressi in secondi
-    max_end = max((float(it.get("lineEnd", it.get("end", 0.0))) for it in raw_data if isinstance(it, dict)), default=0.0)
-    scale = 1000.0 if max_end < 100000 else 1.0
+    # Rilevamento robusto se i timestamp sono già in millisecondi analizzando la durata di parole o segmenti
+    is_ms = False
+    for item in raw_data:
+        if not isinstance(item, dict):
+            continue
+        for w in item.get("words", []):
+            try:
+                dur = float(w.get("end", 0.0)) - float(w.get("start", 0.0))
+                if dur >= 15.0:
+                    is_ms = True
+                    break
+            except Exception:
+                pass
+        if is_ms:
+            break
+        try:
+            seg_dur = float(item.get("lineEnd", item.get("end", 0.0))) - float(item.get("lineStart", item.get("start", 0.0)))
+            if seg_dur >= 30.0:
+                is_ms = True
+                break
+        except Exception:
+            pass
+
+    scale = 1.0 if is_ms else 1000.0
 
     for item in raw_data:
         if not isinstance(item, dict):
