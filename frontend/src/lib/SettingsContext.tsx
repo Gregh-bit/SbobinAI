@@ -65,7 +65,6 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       if (settingsData && typeof settingsData === 'object') {
         if (settingsData.storage_path && typeof settingsData.storage_path === 'string') {
           patch.storagePath = settingsData.storage_path;
-          patch.setupComplete = true;
         }
         if (settingsData.whisper_model && typeof settingsData.whisper_model === 'string') {
           patch.whisperModel = settingsData.whisper_model;
@@ -85,6 +84,9 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         }
         if (typeof settingsData.models_downloaded === 'boolean') {
           patch.modelsDownloaded = settingsData.models_downloaded;
+          if (settingsData.models_downloaded) {
+            patch.setupComplete = true;
+          }
         }
         if (settingsData.audio_format === 'm4a' || settingsData.audio_format === 'wav') {
           patch.audioFormat = settingsData.audio_format;
@@ -97,6 +99,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         );
         if (hasRealWhisper || (modelsData.installed_count && modelsData.installed_count > 0)) {
           patch.modelsDownloaded = true;
+          patch.setupComplete = true;
           if (!patch.whisperModel || patch.whisperModel === 'mock_mode' || patch.whisperModel === 'dual-tier-whisper') {
             patch.whisperModel = 'large-v3-turbo-q4';
           }
@@ -187,10 +190,17 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
   };
 
   const resetSetup = () => {
-    setSettings({
+    const fresh: AppSettings = {
       ...DEFAULT_SETTINGS,
       setupComplete: false,
-    });
+      modelsDownloaded: false,
+    };
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(fresh));
+      localStorage.removeItem(LEGACY_STORAGE_KEY);
+    } catch {}
+    setSettings(fresh);
+    api.settings.update({ models_downloaded: false }).catch(() => null);
   };
 
   return (
