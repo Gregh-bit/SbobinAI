@@ -18,7 +18,7 @@ interface State {
   currentVersion: string;
 }
 
-let state: State = { status: 'idle', version: null, progress: 0, error: null, currentVersion: '0.0.9' };
+let state: State = { status: 'idle', version: null, progress: 0, error: null, currentVersion: '0.0.10' };
 let handle: UpdateHandle | null = null;
 let startupDone = false;
 let versionFetched = false;
@@ -144,10 +144,9 @@ export async function checkAndAutoInstall(
     await relaunch();
     return true;
   } catch (e: any) {
-    console.warn('[Updater] checkAndAutoInstall errore:', e);
-    const msg = String(e?.message || e || 'Errore durante aggiornamento automatico');
-    setState({ status: 'error', error: msg });
-    onProgress?.({ status: 'error', error: msg });
+    console.warn('[Updater] checkAndAutoInstall errore (probabile offline o rete assente):', e);
+    setState({ status: 'idle', error: null });
+    onProgress?.({ status: 'idle' });
     return false;
   }
 }

@@ -1,4 +1,4 @@
-import { osBadge, isMac } from '../lib/platform';
+import { osBadge, isMac, fileManagerName, normalizeDisplayPath } from '../lib/platform';
 import { useEffect, useState, useRef } from 'react';
 import { 
   Sparkles, Folder, ArrowRight, ArrowLeft, 
@@ -98,6 +98,12 @@ export default function Wizard() {
   const [storagePath, setStoragePath] = useState(settings.storagePath || '~/Documents/SbobinAI');
   const [llmModel, setLlmModel] = useState<string>('mlx-community/Qwen3.5-4B-MLX-4bit');
   const [isSelectingFolder, setIsSelectingFolder] = useState(false);
+
+  useEffect(() => {
+    if (settings.storagePath && settings.storagePath !== '~/Documents/SbobinAI') {
+      setStoragePath(settings.storagePath);
+    }
+  }, [settings.storagePath]);
 
   // Stato Modelli Reale da Backend
   const [modelsStatus, setModelsStatus] = useState<ModelsStatusResponse | null>(null);
@@ -476,7 +482,7 @@ export default function Wizard() {
               <div className="flex items-center gap-3">
                 <div className="flex-1 flex items-center gap-2.5 px-4 py-3 rounded-2xl liquid-input font-mono text-xs text-white/95 overflow-hidden">
                   <Folder size={16} className="text-white/40 flex-shrink-0" />
-                  <span className="truncate">{storagePath}</span>
+                  <span className="truncate">{normalizeDisplayPath(storagePath)}</span>
                 </div>
                 <button
                   type="button"
@@ -484,13 +490,13 @@ export default function Wizard() {
                   disabled={isSelectingFolder}
                   className="px-4 py-3 rounded-2xl liquid-glass-pill border border-white/18 hover:border-white/28 hover:bg-white/[0.12] text-xs font-semibold text-white transition-all flex-shrink-0 disabled:opacity-50 cursor-pointer shadow-liquid-sm"
                 >
-                  {isSelectingFolder ? 'Apertura Finder...' : 'Scegli cartella...'}
+                  {isSelectingFolder ? `Apertura ${fileManagerName}...` : 'Scegli cartella...'}
                 </button>
               </div>
 
               <div className="pt-2 flex items-center gap-2 text-xs text-white/50">
                 <CheckCircle2 size={14} className="text-emerald-400 flex-shrink-0" />
-                <span>I file saranno sempre accessibili direttamente dal Finder di macOS.</span>
+                <span>I file saranno sempre accessibili direttamente tramite {fileManagerName}.</span>
               </div>
             </div>
           </div>

@@ -9,6 +9,18 @@ Server FastAPI principale con:
 """
 from __future__ import annotations
 
+import sys
+# Su Windows assicura che stdout e stderr usino UTF-8 con fallback 'replace'
+# per evitare crash da UnicodeEncodeError (es. charmap cp1252) su print/logger
+if sys.platform == "win32":
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import os
 # macOS SSL Certificates & HuggingFace Transfer Configuration
 try:
@@ -64,7 +76,7 @@ logger = logging.getLogger("sbobinai")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Inizializza il DB all'avvio, bonifica i file orfani, esegue cleanup allo spegnimento."""
-    logger.info("🚀 SbobinAI Backend avviato")
+    logger.info("[App] SbobinAI Backend avviato")
     init_db()
     # Bonifica automatica file orfani e compattazione DB all'avvio
     try:
@@ -75,7 +87,7 @@ async def lifespan(app: FastAPI):
 
     # Su MacBook Air M1 con 8GB di RAM, Whisper viene caricato on-demand solo all'avvio del live
     yield
-    logger.info("🛑 SbobinAI Backend in shutdown")
+    logger.info("[App] SbobinAI Backend in shutdown")
 
 
 # ── App ────────────────────────────────────────────────────────────────────────
@@ -96,6 +108,7 @@ app.add_middleware(
         "http://127.0.0.1:4173",
         "tauri://localhost",
         "http://tauri.localhost",
+        "https://tauri.localhost",
     ],
     allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,

@@ -23,15 +23,27 @@ async function throwResponseError(res: Response): Promise<never> {
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const headers = new Headers(options?.headers);
   if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
-  const res = await fetch(`${BASE_URL}${path}`, {
-    ...options,
-    headers,
-  });
-  if (!res.ok) {
-    await throwResponseError(res);
+  let signal = options?.signal;
+  let timer: any = null;
+  if (!signal && typeof AbortController !== 'undefined') {
+    const controller = new AbortController();
+    timer = setTimeout(() => controller.abort(), 30000);
+    signal = controller.signal;
   }
-  if (res.status === 204) return undefined as T;
-  return res.json();
+  try {
+    const res = await fetch(`${BASE_URL}${path}`, {
+      ...options,
+      headers,
+      signal,
+    });
+    if (!res.ok) {
+      await throwResponseError(res);
+    }
+    if (res.status === 204) return undefined as T;
+    return res.json();
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 export async function checkBackendHealth(timeoutMs = 1500): Promise<boolean> {
@@ -232,7 +244,7 @@ export const api = {
     cancelDownload: (modelId?: string) =>
       request<{ status: string; message: string; freed_mb: number }>('/models/cancel-download', {
         method: 'POST',
-        body: modelId ? JSON.stringify({ model_id: modelId }) : undefined,
+        body: JSON.stringify({ model_id: modelId || 'all' }),
       }),
   },
   ai: {

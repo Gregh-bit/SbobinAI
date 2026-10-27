@@ -8,7 +8,7 @@ import {
 import { clsx } from 'clsx';
 import { useSettings } from '../lib/SettingsContext';
 import { pickFolder } from '../lib/tauri';
-import { osBadge } from '../lib/platform';
+import { osBadge, fileManagerName, normalizeDisplayPath } from '../lib/platform';
 import { useUpdater } from '../lib/useUpdater';
 import { api } from '../lib/api';
 import type { ModelsStatusResponse, ModelInfo } from '../types';
@@ -325,7 +325,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       try {
         // POST /settings/storage (una sola volta, atteso) gestito da updateSettings
         await updateSettings({ storagePath: selected });
-        showNotification(`Cartella di archiviazione aggiornata nel Finder.`, 'success');
+        showNotification(`Cartella di archiviazione aggiornata in ${fileManagerName}.`, 'success');
         fetchStorageStats();
       } catch (err: any) {
         setStoragePath(previous);
@@ -444,7 +444,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       badgeBorder: 'border-[#0A84FF]/30',
       badgeText: 'text-[#5AC8FA]',
       icon: FileAudio,
-      path: `${storagePath}/audio`,
+      path: normalizeDisplayPath(`${storagePath}/audio`),
       desc: 'File master ad alta risoluzione 16-bit PCM 16kHz per trascrizione e ascolto.',
       details: 'Audio fedele non compresso',
     },
@@ -459,7 +459,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       badgeBorder: 'border-[#30D158]/30',
       badgeText: 'text-[#6EE7B7]',
       icon: Database,
-      path: `${storagePath}/sqlite/sbobinai.db`,
+      path: normalizeDisplayPath(`${storagePath}/sqlite/sbobinai.db`),
       desc: 'Corsi, trascrizioni parola per parola con timestamp, flashcard e note.',
       details: 'Transazionale WAL / VACUUM',
     },
@@ -474,7 +474,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       badgeBorder: 'border-[#FF9F0A]/30',
       badgeText: 'text-[#FDBA74]',
       icon: Layers,
-      path: `${storagePath}/lancedb`,
+      path: normalizeDisplayPath(`${storagePath}/lancedb`),
       desc: 'Embeddings a 1024 dimensioni per ricerca semantica e quiz intelligente.',
       details: 'Vector DB zero-copy locale',
     },
@@ -489,7 +489,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       badgeBorder: 'border-[#FF375F]/30',
       badgeText: 'text-[#FDA4AF]',
       icon: Folder,
-      path: `${storagePath}/uploads`,
+      path: normalizeDisplayPath(`${storagePath}/uploads`),
       desc: 'Slide PDF, appunti in PDF e allegati di supporto caricati per i corsi.',
       details: 'Dispense universitarie',
     },
@@ -981,7 +981,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       className="group/lib flex-1 px-4 py-2.5 rounded-2xl liquid-input font-mono text-xs text-white/95 truncate hover:bg-white/[0.08] transition-all cursor-pointer flex items-center justify-between text-left"
                       title="Clicca per copiare il percorso della libreria"
                     >
-                      <span className="truncate">{storagePath}</span>
+                      <span className="truncate">{normalizeDisplayPath(storagePath)}</span>
                       <Copy size={13} className="opacity-0 group-hover/lib:opacity-100 transition-opacity flex-shrink-0 text-white/45 ml-2" />
                     </button>
                     <button
@@ -990,7 +990,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       className="px-4 py-2.5 rounded-2xl liquid-glass-pill border border-white/18 hover:border-white/28 hover:bg-white/[0.10] text-xs font-semibold text-white transition-all flex items-center gap-2 flex-shrink-0 cursor-pointer shadow-liquid-sm whitespace-nowrap"
                     >
                       <Folder size={14} className="text-white/70" />
-                      <span>Sfoglia nel Finder...</span>
+                      <span>Sfoglia in {fileManagerName}...</span>
                     </button>
                   </div>
                 </div>
@@ -1708,7 +1708,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       <div className="flex items-center gap-2">
                         <h4 className="text-sm font-bold text-white">Aggiornamenti</h4>
                         <span className="text-[10px] font-mono font-medium px-2 py-0.5 rounded-full bg-white/[0.08] text-white/70 border border-white/10">
-                          v{updater.currentVersion || '0.0.9'}
+                          v{updater.currentVersion || '0.0.10'}
                         </span>
                       </div>
                       <p className="text-[11px] text-white/50 mt-0.5">
@@ -1772,7 +1772,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       {updater.status === 'checking' ? 'Controllo in corso...' : 'Controlla aggiornamenti'}
                     </button>
                     <span className="text-[11px] text-white/40 font-medium">
-                      Versione installata: <strong className="font-mono text-white/80">v{updater.currentVersion || '0.0.9'}</strong>
+                      Versione installata: <strong className="font-mono text-white/80">v{updater.currentVersion || '0.0.10'}</strong>
                     </span>
                     {updater.status === 'uptodate' && <span className="text-[11px] text-emerald-300 font-medium">Sei all'ultima versione</span>}
                     {updater.status === 'available' && (

@@ -205,7 +205,12 @@ def _download_hf_worker(model_id: str, spec: ai_models.ModelSpec, cancel_event: 
         err_msg = str(exc)
         logger.error(f"[Models] Errore durante il download di {model_id}: {err_msg}", exc_info=True)
         try:
-            log_dir = os.path.expanduser("~/Library/Logs/SbobinAI")
+            if sys.platform == "win32":
+                log_dir = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local"), "SbobinAI", "logs")
+            elif sys.platform == "darwin":
+                log_dir = os.path.expanduser("~/Library/Logs/SbobinAI")
+            else:
+                log_dir = os.path.expanduser("~/.sbobinai/logs")
             os.makedirs(log_dir, exist_ok=True)
             with open(os.path.join(log_dir, "backend.log"), "a", encoding="utf-8") as f:
                 f.write(f"\n[DOWNLOAD ERROR] [{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Modello {model_id}: {err_msg}\n")

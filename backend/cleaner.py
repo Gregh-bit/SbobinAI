@@ -235,7 +235,7 @@ def cleanup_orphan_files(db: Session = None) -> Dict[str, Any]:
                                 os.remove(fpath)
                                 total_freed_bytes += sz
                                 deleted_audio_files.append(fpath)
-                                logger.info(f"[Cleaner] 🗑️ File audio orfano rimosso: {fpath} ({sz / (1024*1024):.2f} MB)")
+                                logger.info(f"[Cleaner] [-] File audio orfano rimosso: {fpath} ({sz / (1024*1024):.2f} MB)")
                             except Exception as rm_err:
                                 logger.warning(f"[Cleaner] Impossibile rimuovere {fpath}: {rm_err}")
             except Exception as adir_err:
@@ -273,7 +273,7 @@ def cleanup_orphan_files(db: Session = None) -> Dict[str, Any]:
                                 shutil.rmtree(ipath, ignore_errors=True)
                                 total_freed_bytes += sz
                                 deleted_upload_dirs.append(ipath)
-                                logger.info(f"[Cleaner] 🗑️ Cartella uploads orfana rimossa: {ipath} ({sz / 1024:.1f} KB)")
+                                logger.info(f"[Cleaner] [-] Cartella uploads orfana rimossa: {ipath} ({sz / 1024:.1f} KB)")
                             except Exception as u_err:
                                 logger.warning(f"[Cleaner] Errore rimozione cartella uploads {ipath}: {u_err}")
             except Exception as udir_err:
@@ -294,7 +294,7 @@ def cleanup_orphan_files(db: Session = None) -> Dict[str, Any]:
                         os.remove(old_db)
                         total_freed_bytes += sz
                         deleted_db_files.append(old_db)
-                        logger.info(f"[Cleaner] 🗑️ Vecchio DB orfano rimosso: {old_db} ({sz / 1024:.1f} KB)")
+                        logger.info(f"[Cleaner] [-] Vecchio DB orfano rimosso: {old_db} ({sz / 1024:.1f} KB)")
                     except Exception as db_err:
                         logger.warning(f"[Cleaner] Errore rimozione {old_db}: {db_err}")
 
@@ -308,7 +308,7 @@ def cleanup_orphan_files(db: Session = None) -> Dict[str, Any]:
 
     freed_mb = round(total_freed_bytes / (1024 * 1024), 2)
     logger.info(
-        f"[Cleaner] ✅ Pulizia completata: {len(deleted_audio_files)} audio rimossi, "
+        f"[Cleaner] [OK] Pulizia completata: {len(deleted_audio_files)} audio rimossi, "
         f"{len(deleted_upload_dirs)} cartelle rimosse, {freed_mb} MB liberati sul disco."
     )
 

@@ -231,10 +231,9 @@ def compute_and_cache_lecture_timestamps(lecture_id: int) -> dict:
                 model_path = ai_models.local_model_path(_WHISPER_SPEC)
                 if model_path:
                     with _transcription_lock:
+                        audio_input = _decode_audio_file(audio_path)
                         if USE_MLX:
                             import mlx_whisper
-                            # Decodifica con PyAV: supporta sia WAV che M4A/AAC senza richiedere l'eseguibile ffmpeg
-                            audio_input = _decode_audio_file(audio_path)
                             res = mlx_whisper.transcribe(
                                 audio_input,
                                 path_or_hf_repo=model_path,
@@ -246,9 +245,9 @@ def compute_and_cache_lecture_timestamps(lecture_id: int) -> dict:
                             )
                             raw_segs = list(res.get("segments") or [])
                         else:
-                            from faster_whisper import WhisperModel
-                            fw_model = WhisperModel(model_path, device="cpu", compute_type="int8")
-                            segs_gen, _ = fw_model.transcribe(audio_path, language="it", word_timestamps=True)
+                            from transcriber import _load_faster_whisper
+                            fw_model = _load_faster_whisper(model_path)
+                            segs_gen, _ = fw_model.transcribe(audio_input, language="it", word_timestamps=True)
                             raw_segs = list(segs_gen)
 
                     raw_converted = []

@@ -134,6 +134,8 @@ fn python_can_run_backend(py: &Path) -> bool {
     silent_command(py)
         .args(["-c", "import uvicorn, fastapi"])
         .env("PATH", get_full_path_env())
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONIOENCODING", "utf-8")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -326,7 +328,8 @@ fn extract_embedded_backend(target_dir: &Path) -> Result<(), String> {
     write_embedded!("routers/study.py", include_str!("../../../backend/routers/study.py"));
     write_embedded!("routers/subjects.py", include_str!("../../../backend/routers/subjects.py"));
 
-    log::info!("Estratto backend incorporato con successo in {:?}", target_dir);
+    let _ = std::fs::write(target_dir.join(".version"), env!("CARGO_PKG_VERSION"));
+    log::info!("Estratto backend incorporato con successo (v{}) in {:?}", env!("CARGO_PKG_VERSION"), target_dir);
     Ok(())
 }
 
@@ -378,8 +381,16 @@ fn resolve_backend_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
         }
     }
 
-    // 3. Verifica percorsi in Application Support / AppData
+    // 3. Verifica cartella backend utente in AppData / Application Support:
+    // Se la versione è cambiata o mancano file, ri-estrae automaticamente la versione aggiornata
     let app_data_backend = get_app_backend_data_dir(app);
+    let ver_file = app_data_backend.join(".version");
+    let current_ver = env!("CARGO_PKG_VERSION");
+    let needs_extract = !has_main(&app_data_backend)
+        || std::fs::read_to_string(&ver_file).unwrap_or_default().trim() != current_ver;
+    if needs_extract {
+        let _ = extract_embedded_backend(&app_data_backend);
+    }
     if has_main(&app_data_backend) {
         return Some(app_data_backend);
     }
@@ -749,6 +760,8 @@ fn run_backend_bootstrap(
         .current_dir(&backend_dir)
         .env("PATH", &path_env)
         .env("PYTHONPATH", &backend_dir)
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONIOENCODING", "utf-8")
         .stdin(Stdio::null());
 
     #[cfg(not(debug_assertions))]
@@ -813,9 +826,14 @@ fn run_backend_bootstrap(
                 std::thread::sleep(Duration::from_millis(500));
             }
 
+            let log_hint = if cfg!(windows) {
+                r"%LOCALAPPDATA%\SbobinAI\logs\backend.log"
+            } else {
+                "~/Library/Logs/SbobinAI/backend.log"
+            };
             let mut s = state.0.lock().unwrap();
             s.status = "error".into();
-            s.message = "Il motore locale non ha risposto entro 30s. Controlla ~/Library/Logs/SbobinAI/backend.log.".into();
+            s.message = format!("Il motore locale non ha risposto entro 30s. Controlla {log_hint}.");
             s.error = Some("Timeout avvio server locale".into());
         }
         Err(e) => {

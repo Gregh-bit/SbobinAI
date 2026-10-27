@@ -447,7 +447,7 @@ class AudioEngine:
                 self._write_recording(blank_frame)
             time.sleep(0.030)
 
-    def stop(self) -> str:
+    def stop(self, audio_format: Optional[str] = None) -> str:
         """
         Interrompe la registrazione ed esporta un file .wav completo nella directory audio.
         La copia avviene a blocchi da 1 MB (nessuna copia dell'intera lezione in RAM) e il file

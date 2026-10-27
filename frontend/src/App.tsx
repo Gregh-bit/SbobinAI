@@ -55,6 +55,15 @@ function BackendLoadingGate({ children }: { children: React.ReactNode }) {
             return;
           }
           if (tauriStatus.port_ready) {
+            // Se c'è un aggiornamento in corso all'avvio, attendi che si concluda o riavvii
+            if (
+              bootUpdate.status === 'downloading' ||
+              bootUpdate.status === 'installing' ||
+              bootUpdate.status === 'relaunching'
+            ) {
+              setTimeout(check, 800);
+              return;
+            }
             setIsReady(true);
             return;
           }
@@ -111,13 +120,18 @@ function BackendLoadingGate({ children }: { children: React.ReactNode }) {
               <p className="text-red-400 font-semibold mb-1">Si è verificato un problema</p>
               <p className="text-red-200/80 mb-3 break-words">{error}</p>
               <button
-                onClick={() => {
+                onClick={async () => {
                   setError(null);
-                  setRetryCount((c) => c + 1);
+                  try {
+                    const { relaunch } = await import('@tauri-apps/plugin-process');
+                    await relaunch();
+                  } catch {
+                    setRetryCount((c) => c + 1);
+                  }
                 }}
                 className="w-full py-2 px-3 rounded-lg bg-red-500/20 hover:bg-red-500/30 border border-red-500/40 text-red-200 text-xs font-medium transition cursor-pointer"
               >
-                Riprova
+                Riavvia applicazione
               </button>
             </div>
           ) : (

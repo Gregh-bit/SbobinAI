@@ -63,7 +63,7 @@ def _get_default_settings_file() -> str:
     if sys.platform == "darwin":
         app_dir = os.path.expanduser("~/Library/Application Support/com.sbobinai.app")
     elif sys.platform == "win32":
-        app_dir = os.path.expandvars(r"%LOCALAPPDATA%\SbobinAI")
+        app_dir = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local"), "SbobinAI")
     else:
         app_dir = os.path.expanduser("~/.sbobinai")
     try:

@@ -412,9 +412,9 @@ def _process_imported_audio_bg(subject_id: int, audio_path: str, orig_filename: 
                 logger.warning(f"[Audio Ingest] Pre-calcolo timestamp fallito: {e_ts}")
 
         clear_metal_cache()
-        logger.info(f"[Audio Ingest] ✅ Completato con successo! Lezione '{clean_title}' (ID {lec_id}) salvata e indicizzata.")
+        logger.info(f"[Audio Ingest] [OK] Completato con successo! Lezione '{clean_title}' (ID {lec_id}) salvata e indicizzata.")
     except Exception as exc:
-        logger.error(f"[Audio Ingest] ❌ Errore durante l'elaborazione dell'audio '{orig_filename}': {exc}", exc_info=True)
+        logger.error(f"[Audio Ingest] [ERRORE] Errore durante l'elaborazione dell'audio '{orig_filename}': {exc}", exc_info=True)
         clear_metal_cache()
 
 

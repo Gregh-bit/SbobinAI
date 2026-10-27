@@ -26,6 +26,15 @@ export const osBadge: string | null = isMac
 /** Etichetta del tasto modificatore principale: "⌘" su macOS, "Ctrl+" altrove. */
 export const modKeyLabel: string = isMac ? '⌘' : 'Ctrl+';
 
+/** Nome del gestore file di sistema: "Finder" su macOS, "Esplora file" su Windows */
+export const fileManagerName: string = isMac ? 'Finder' : 'Esplora file';
+
+/** Normalizza i separatori di percorso per la visualizzazione */
+export function normalizeDisplayPath(p: string): string {
+  if (!p) return p;
+  return isWindows ? p.replace(/\//g, '\\') : p.replace(/\\/g, '/');
+}
+
 /** Formatta una scorciatoia, es. shortcutLabel('B') → "⌘B" / "Ctrl+B"; con shift → "⌘⇧B" / "Ctrl+Shift+B". */
 export function shortcutLabel(key: string, shift = false): string {
   const s = shift ? (isMac ? '⇧' : 'Shift+') : '';

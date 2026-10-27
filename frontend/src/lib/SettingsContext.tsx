@@ -90,9 +90,9 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         }
         if (typeof settingsData.models_downloaded === 'boolean') {
           patch.modelsDownloaded = settingsData.models_downloaded;
-          if (settingsData.models_downloaded) {
-            patch.setupComplete = true;
-          }
+        }
+        if (typeof settingsData.setup_complete === 'boolean') {
+          patch.setupComplete = settingsData.setup_complete;
         }
         if (settingsData.audio_format === 'm4a' || settingsData.audio_format === 'wav') {
           patch.audioFormat = settingsData.audio_format;
@@ -105,7 +105,6 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         );
         if (hasRealWhisper || (modelsData.installed_count && modelsData.installed_count > 0)) {
           patch.modelsDownloaded = true;
-          patch.setupComplete = true;
           if (!patch.whisperModel || patch.whisperModel === 'mock_mode' || patch.whisperModel === 'dual-tier-whisper') {
             patch.whisperModel = 'large-v3-turbo-q4';
           }
@@ -133,7 +132,14 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     // Il percorso di archiviazione si cambia SOLO tramite POST /settings/storage (migrazione dati),
     // mai dentro il PATCH /settings. In caso di errore viene propagato al chiamante.
     if (partial.storagePath) {
-      await api.settings.setStorage(partial.storagePath);
+      try {
+        const res = await api.settings.setStorage(partial.storagePath);
+        if (res?.storage_path) {
+          partial.storagePath = res.storage_path;
+        }
+      } catch (err) {
+        console.warn('[SettingsContext] Errore migrazione storage:', err);
+      }
     }
     setSettings((prev) => ({ ...prev, ...partial }));
     // Sincronizza anche con il backend
@@ -166,15 +172,18 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       ...customSettings,
       setupComplete: true,
     };
-    setSettings(updated);
     // Prima il percorso di archiviazione (POST dedicato, atteso), poi il resto via PATCH
     if (customSettings?.storagePath) {
       try {
-        await api.settings.setStorage(customSettings.storagePath);
+        const res = await api.settings.setStorage(customSettings.storagePath);
+        if (res?.storage_path) {
+          updated.storagePath = res.storage_path;
+        }
       } catch (e) {
         console.warn('[SettingsContext] Errore impostazione percorso archiviazione:', e);
       }
     }
+    setSettings(updated);
     const backendPayload: Record<string, any> = {};
     if (updated.whisperModel) backendPayload.whisper_model = updated.whisperModel;
     if (updated.llmModel) {

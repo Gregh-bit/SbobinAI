@@ -5,6 +5,18 @@ Tabelle: subjects, lectures, bookmarks
 """
 from __future__ import annotations
 
+import os
+import sys
+# Su Windows assicura che stdout e stderr usino UTF-8 con fallback 'replace'
+if sys.platform == "win32":
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -20,7 +32,7 @@ from config import ensure_storage_dirs, get_db_path
 
 dirs = ensure_storage_dirs()
 DB_PATH = dirs["db_path"]
-DATABASE_URL = f"sqlite:///{DB_PATH}"
+DATABASE_URL = f"sqlite:///{os.path.abspath(DB_PATH).replace('\\', '/')}"
 
 @event.listens_for(Engine, "connect")
 def set_sqlite_pragma(dbapi_connection, connection_record):
@@ -44,7 +56,7 @@ def rebind_database() -> None:
     global engine, SessionLocal, DB_PATH, DATABASE_URL
     dirs = ensure_storage_dirs()
     DB_PATH = dirs["db_path"]
-    DATABASE_URL = f"sqlite:///{DB_PATH}"
+    DATABASE_URL = f"sqlite:///{os.path.abspath(DB_PATH).replace('\\', '/')}"
     try:
         engine.dispose()
     except Exception:
@@ -56,7 +68,7 @@ def rebind_database() -> None:
     )
     SessionLocal.configure(bind=engine)
     init_db()
-    print(f"[DB] Database ri-collegato → {DB_PATH}")
+    print(f"[DB] Database ri-collegato -> {DB_PATH}")
 
 
 
@@ -139,7 +151,7 @@ def init_db() -> None:
                     conn.commit()
                 except Exception:
                     pass
-    print(f"[DB] Database inizializzato → {DB_PATH}")
+    print(f"[DB] Database inizializzato -> {DB_PATH}")
 
 
 init_db()
