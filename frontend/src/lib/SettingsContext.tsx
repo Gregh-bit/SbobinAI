@@ -5,6 +5,7 @@ import { api } from './api';
 export interface AppSettings {
   setupComplete: boolean;
   modelsDownloaded: boolean;
+  autoUpdate: boolean;
   storagePath: string;
   whisperModel: string;
   llmModel: string;
@@ -24,6 +25,7 @@ interface SettingsContextType {
 const DEFAULT_SETTINGS: AppSettings = {
   setupComplete: false,
   modelsDownloaded: false,
+  autoUpdate: true,
   storagePath: '~/Documents/SbobinAI',
   whisperModel: 'large-v3-turbo-q4',
   llmModel: 'mlx-community/Qwen3.5-4B-MLX-4bit',
@@ -47,7 +49,11 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         if (parsed.storagePath === '~/Documents/UniCoPilot' || parsed.storagePath?.endsWith('/Documents/UniCoPilot')) {
           parsed.storagePath = '~/Documents/SbobinAI';
         }
-        return { ...DEFAULT_SETTINGS, ...parsed };
+        return {
+          ...DEFAULT_SETTINGS,
+          ...parsed,
+          autoUpdate: parsed.autoUpdate ?? true,
+        };
       }
     } catch (e) {
       console.warn('Errore lettura impostazioni da localStorage:', e);
@@ -215,6 +221,19 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       {children}
     </SettingsContext.Provider>
   );
+}
+
+export function isAutoUpdateEnabled(): boolean {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY) || localStorage.getItem(LEGACY_STORAGE_KEY);
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      if (typeof parsed.autoUpdate === 'boolean') {
+        return parsed.autoUpdate;
+      }
+    }
+  } catch {}
+  return true; // Di default sempre attivo (ON)
 }
 
 export function useSettings(): SettingsContextType {

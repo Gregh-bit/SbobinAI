@@ -18,7 +18,7 @@ interface State {
   currentVersion: string;
 }
 
-let state: State = { status: 'idle', version: null, progress: 0, error: null, currentVersion: '0.0.8' };
+let state: State = { status: 'idle', version: null, progress: 0, error: null, currentVersion: '0.0.9' };
 let handle: UpdateHandle | null = null;
 let startupDone = false;
 let versionFetched = false;
@@ -87,6 +87,68 @@ async function runInstall(): Promise<void> {
   } catch (e: any) {
     console.error('[Updater] Installazione fallita:', e);
     setState({ status: 'error', error: String(e?.message || e || "Errore durante l'aggiornamento") });
+  }
+}
+
+export type BootUpdateEvent = {
+  status: 'idle' | 'checking' | 'available' | 'downloading' | 'installing' | 'relaunching' | 'uptodate' | 'error';
+  version?: string;
+  progress?: number;
+  error?: string;
+};
+
+export type BootUpdateProgressCallback = (event: BootUpdateEvent) => void;
+
+/**
+ * Controllo e installazione automatica dell'aggiornamento durante la schermata di caricamento iniziale (boot gate).
+ * Se è disponibile una nuova release, la scarica mostrando la progressione e riavvia l'app in autonomia.
+ */
+export async function checkAndAutoInstall(
+  onProgress?: BootUpdateProgressCallback
+): Promise<boolean> {
+  if (!isTauri()) return false;
+  try {
+    onProgress?.({ status: 'checking' });
+    const { check } = await import('@tauri-apps/plugin-updater');
+    const update = await check();
+    if (!update) {
+      onProgress?.({ status: 'uptodate' });
+      return false;
+    }
+
+    const version = update.version;
+    onProgress?.({ status: 'available', version, progress: 0 });
+    setState({ status: 'downloading', version, progress: 0 });
+
+    let total = 0;
+    let downloaded = 0;
+
+    await update.downloadAndInstall((event: any) => {
+      if (event.event === 'Started') {
+        total = event.data?.contentLength ?? 0;
+        onProgress?.({ status: 'downloading', version, progress: 0 });
+      } else if (event.event === 'Progress') {
+        downloaded += event.data?.chunkLength ?? 0;
+        const pct = total > 0 ? Math.min(100, Math.round((downloaded / total) * 100)) : 0;
+        setState({ progress: pct });
+        onProgress?.({ status: 'downloading', version, progress: pct });
+      } else if (event.event === 'Finished') {
+        setState({ progress: 100, status: 'installing' });
+        onProgress?.({ status: 'installing', version, progress: 100 });
+      }
+    });
+
+    setState({ status: 'installing' });
+    onProgress?.({ status: 'relaunching', version, progress: 100 });
+    const { relaunch } = await import('@tauri-apps/plugin-process');
+    await relaunch();
+    return true;
+  } catch (e: any) {
+    console.warn('[Updater] checkAndAutoInstall errore:', e);
+    const msg = String(e?.message || e || 'Errore durante aggiornamento automatico');
+    setState({ status: 'error', error: msg });
+    onProgress?.({ status: 'error', error: msg });
+    return false;
   }
 }
 

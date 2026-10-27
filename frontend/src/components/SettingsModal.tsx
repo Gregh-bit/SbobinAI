@@ -1702,23 +1702,67 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                 </div>
 
                 {/* Sezione Aggiornamenti */}
-                <div className="p-4 rounded-3xl liquid-glass border border-white/[0.12] space-y-3">
+                <div className="p-4 rounded-3xl liquid-glass border border-white/[0.12] space-y-4">
                   <div className="flex items-start justify-between gap-3">
                     <div>
                       <div className="flex items-center gap-2">
                         <h4 className="text-sm font-bold text-white">Aggiornamenti</h4>
                         <span className="text-[10px] font-mono font-medium px-2 py-0.5 rounded-full bg-white/[0.08] text-white/70 border border-white/10">
-                          v{updater.currentVersion || '0.0.8'}
+                          v{updater.currentVersion || '0.0.9'}
                         </span>
                       </div>
                       <p className="text-[11px] text-white/50 mt-0.5">
                         {updater.supported
-                          ? "SbobinAI controlla automaticamente gli aggiornamenti all'avvio."
+                          ? "Mantieni SbobinAI sempre aggiornato con le ultime correzioni e modelli."
                           : "Gli aggiornamenti automatici sono disponibili solo nell'app desktop."}
                       </p>
                     </div>
                   </div>
-                  <div className="flex items-center gap-3 flex-wrap">
+
+                  {/* Toggle Aggiornamento Automatico */}
+                  <div className="flex items-center justify-between p-3 rounded-2xl bg-white/[0.04] border border-white/[0.08]">
+                    <div className="space-y-0.5 pr-4">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-semibold text-white">Aggiornamento automatico</span>
+                        <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                          Consigliato
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-white/50 leading-relaxed">
+                        Controlla e installa automaticamente le nuove versioni ad ogni apertura dell'app, risolvendo tempestivamente bug e problemi di avvio.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={settings.autoUpdate}
+                      disabled={!updater.supported}
+                      onClick={() => {
+                        const next = !settings.autoUpdate;
+                        void updateSettings({ autoUpdate: next });
+                        showNotification(
+                          next
+                            ? 'Aggiornamento automatico attivato (predefinito).'
+                            : 'Aggiornamento automatico disattivato.',
+                          'info'
+                        );
+                      }}
+                      className={clsx(
+                        'relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none disabled:opacity-40 disabled:cursor-not-allowed',
+                        settings.autoUpdate ? 'bg-blue-500' : 'bg-white/20'
+                      )}
+                    >
+                      <span
+                        aria-hidden="true"
+                        className={clsx(
+                          'pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow-md ring-0 transition duration-200 ease-in-out',
+                          settings.autoUpdate ? 'translate-x-5' : 'translate-x-0'
+                        )}
+                      />
+                    </button>
+                  </div>
+
+                  <div className="flex items-center gap-3 flex-wrap pt-1">
                     <button
                       type="button"
                       disabled={!updater.supported || updater.status === 'checking' || updater.status === 'downloading' || updater.status === 'installing'}
@@ -1728,7 +1772,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       {updater.status === 'checking' ? 'Controllo in corso...' : 'Controlla aggiornamenti'}
                     </button>
                     <span className="text-[11px] text-white/40 font-medium">
-                      Versione installata: <strong className="font-mono text-white/80">v{updater.currentVersion || '0.0.8'}</strong>
+                      Versione installata: <strong className="font-mono text-white/80">v{updater.currentVersion || '0.0.9'}</strong>
                     </span>
                     {updater.status === 'uptodate' && <span className="text-[11px] text-emerald-300 font-medium">Sei all'ultima versione</span>}
                     {updater.status === 'available' && (

@@ -2,9 +2,11 @@
 import { useState } from 'react';
 import { Download, X } from 'lucide-react';
 import { useUpdater } from '../lib/useUpdater';
+import { useSettings } from '../lib/SettingsContext';
 
 export default function UpdateBanner() {
-  const { status, version, progress, error, install } = useUpdater({ autoCheck: true });
+  const { settings } = useSettings();
+  const { status, version, progress, error, install } = useUpdater({ autoCheck: settings.autoUpdate });
   const [dismissed, setDismissed] = useState(false);
 
   const busy = status === 'downloading' || status === 'installing';

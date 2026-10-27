@@ -6,7 +6,8 @@ import SubjectDashboard from './components/SubjectDashboard';
 import EmptyState from './components/EmptyState';
 import UpdateBanner from './components/UpdateBanner';
 import ErrorBoundary from './components/ErrorBoundary';
-import { SettingsProvider, useSettings } from './lib/SettingsContext';
+import { SettingsProvider, useSettings, isAutoUpdateEnabled } from './lib/SettingsContext';
+import { checkAndAutoInstall, type BootUpdateEvent } from './lib/useUpdater';
 import type { Lecture, Subject } from './types';
 
 // Lazy loading componenti pesanti non visibili all'avvio (<100ms startup)
@@ -18,11 +19,20 @@ function BackendLoadingGate({ children }: { children: React.ReactNode }) {
   const [statusMessage, setStatusMessage] = useState("Sto preparando l'ambiente per l'uso, aspetta ancora un po'...");
   const [error, setError] = useState<string | null>(null);
   const [retryCount, setRetryCount] = useState(0);
+  const [bootUpdate, setBootUpdate] = useState<BootUpdateEvent>({ status: 'idle' });
+
+  // Controllo e installazione automatica aggiornamenti all'avvio (se attivo, default ON)
+  useEffect(() => {
+    if (!isAutoUpdateEnabled()) return;
+    void checkAndAutoInstall((event) => {
+      setBootUpdate(event);
+    });
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
     let attempts = 0;
-    const maxAttempts = 75; // ~60 secondi
+    const maxAttempts = 300; // ~4 minuti
 
     const check = async () => {
       if (cancelled) return;
@@ -33,12 +43,12 @@ function BackendLoadingGate({ children }: { children: React.ReactNode }) {
         const tauriStatus: any = await invoke('get_backend_status');
         if (tauriStatus && !cancelled) {
           if (tauriStatus.message) {
-            const msg: string = tauriStatus.message;
-            if (msg.includes('pronto') || msg.includes('8000') || msg.includes('FastAPI') || msg.includes('Avvio')) {
-              setStatusMessage('Quasi pronto, ultimi preparativi...');
-            } else {
-              setStatusMessage("Sto preparando l'ambiente per l'uso, aspetta ancora un po'...");
-            }
+            setStatusMessage(tauriStatus.message);
+          }
+          // Se il backend sta attivamente preparando l'ambiente o installando dipendenze,
+          // non far scattare il timeout: azzera i tentativi finché il processo è in corso.
+          if (tauriStatus.status === 'initializing_venv' || tauriStatus.status === 'installing_deps') {
+            attempts = 0;
           }
           if (tauriStatus.status === 'error') {
             setError(tauriStatus.error || tauriStatus.message || 'Si è verificato un problema durante la preparazione.');
@@ -116,6 +126,52 @@ function BackendLoadingGate({ children }: { children: React.ReactNode }) {
               <span className="text-xs text-white/75 font-medium">
                 {statusMessage}
               </span>
+            </div>
+          )}
+
+          {/* Indicatore Aggiornamento in Corso all'avvio (anche su schermo di errore) */}
+          {(bootUpdate.status === 'available' ||
+            bootUpdate.status === 'downloading' ||
+            bootUpdate.status === 'installing' ||
+            bootUpdate.status === 'relaunching') && (
+            <div className="mt-5 w-full max-w-xs p-3.5 rounded-2xl bg-blue-500/10 border border-blue-400/30 text-left shadow-lg backdrop-blur-md animate-fade-in">
+              <div className="flex items-center justify-between gap-2 mb-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <div className="w-3.5 h-3.5 rounded-full border-2 border-blue-400/30 border-t-blue-400 animate-spin shrink-0" />
+                  <span className="text-xs font-semibold text-blue-200 truncate">
+                    {bootUpdate.status === 'installing' || bootUpdate.status === 'relaunching'
+                      ? 'Installazione e riavvio...'
+                      : 'Aggiornamento in corso...'}
+                  </span>
+                </div>
+                {bootUpdate.version && (
+                  <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-blue-400/20 text-blue-200 border border-blue-400/30 shrink-0">
+                    v{bootUpdate.version}
+                  </span>
+                )}
+              </div>
+
+              {/* Barra di avanzamento */}
+              <div className="w-full h-1.5 rounded-full bg-white/10 overflow-hidden relative">
+                <div
+                  className="h-full bg-gradient-to-r from-blue-500 to-indigo-400 transition-all duration-300 rounded-full"
+                  style={{
+                    width:
+                      bootUpdate.status === 'installing' || bootUpdate.status === 'relaunching'
+                        ? '100%'
+                        : `${Math.max(5, bootUpdate.progress || 0)}%`,
+                  }}
+                />
+              </div>
+
+              <div className="flex justify-between items-center mt-1.5 text-[10px] text-blue-200/70 font-mono">
+                <span>
+                  {bootUpdate.status === 'installing' || bootUpdate.status === 'relaunching'
+                    ? "Riavvio automatico dell'app..."
+                    : `Scaricamento (${bootUpdate.progress || 0}%)`}
+                </span>
+                <span>{bootUpdate.progress || 0}%</span>
+              </div>
             </div>
           )}
         </div>

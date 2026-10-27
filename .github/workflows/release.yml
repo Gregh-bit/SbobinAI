@@ -90,7 +90,14 @@ jobs:
           if [ -z "$TAG_NAME" ]; then
             TAG_NAME=$(gh release list --limit 1 | awk '{print $1}')
           fi
-          EXE_FILE=$(find frontend/src-tauri/target -name "*setup*.exe" -o -name "*.exe" | head -n 1)
+          # Seleziona prioritariamente l'installer NSIS (-setup.exe), non il binario raw privo di installer
+          EXE_FILE=$(find frontend/src-tauri/target -type f -name "*setup*.exe" | head -n 1)
+          if [ -z "$EXE_FILE" ]; then
+            EXE_FILE=$(find frontend/src-tauri/target/release/bundle -type f -name "*.exe" | head -n 1)
+          fi
+          if [ -z "$EXE_FILE" ]; then
+            EXE_FILE=$(find frontend/src-tauri/target -type f -name "*.exe" | head -n 1)
+          fi
           if [ -n "$EXE_FILE" ] && [ -n "$TAG_NAME" ]; then
             cp "$EXE_FILE" SbobinAI-Windows.exe
             gh release upload "$TAG_NAME" SbobinAI-Windows.exe --clobber
