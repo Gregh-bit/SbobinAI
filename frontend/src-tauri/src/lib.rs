@@ -119,15 +119,62 @@ fn find_base_python() -> Option<PathBuf> {
     }
     #[cfg(windows)]
     {
-        if let Some(home) = get_home_dir() {
-            candidates.push(home.join(r"AppData\Local\Programs\Python\Python312\python.exe"));
-            candidates.push(home.join(r"AppData\Local\Programs\Python\Python311\python.exe"));
-            candidates.push(home.join(r"AppData\Local\Programs\Python\Python310\python.exe"));
+        // 1. Cerca in PATH tramite where.exe (trova qualsiasi python installato con PATH attivo)
+        for tool in &["python.exe", "python", "py.exe", "py"] {
+            if let Ok(output) = Command::new("where.exe").arg(tool).env("PATH", get_full_path_env()).output() {
+                if output.status.success() {
+                    for line in String::from_utf8_lossy(&output.stdout).lines() {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            let p = PathBuf::from(trimmed);
+                            if p.is_file() && !candidates.contains(&p) {
+                                candidates.push(p);
+                            }
+                        }
+                    }
+                }
+            }
         }
-        candidates.push(PathBuf::from(r"C:\Program Files\Python312\python.exe"));
-        candidates.push(PathBuf::from(r"C:\Program Files\Python311\python.exe"));
-        candidates.push(PathBuf::from(r"C:\Python312\python.exe"));
-        candidates.push(PathBuf::from("python.exe"));
+
+        // 2. Chiedi al Python Launcher di Windows (py.exe) il percorso dell'eseguibile Python 3
+        if let Ok(output) = Command::new("py")
+            .args(["-3", "-c", "import sys; print(sys.executable)"])
+            .env("PATH", get_full_path_env())
+            .output()
+        {
+            if output.status.success() {
+                let stdout_str = String::from_utf8_lossy(&output.stdout);
+                let trimmed = stdout_str.trim();
+                if !trimmed.is_empty() {
+                    let p = PathBuf::from(trimmed);
+                    if p.is_file() && !candidates.contains(&p) {
+                        candidates.push(p);
+                    }
+                }
+            }
+        }
+
+        // 3. Cartelle standard utente in AppData (installazioni ufficiali per utente singolo)
+        if let Some(home) = get_home_dir() {
+            for ver in &["Python314", "Python313", "Python312", "Python311", "Python310", "Python39"] {
+                candidates.push(home.join(format!(r"AppData\Local\Programs\Python\{}\python.exe", ver)));
+            }
+            candidates.push(home.join(r"AppData\Local\Microsoft\WindowsApps\python.exe"));
+            candidates.push(home.join(r"AppData\Local\Microsoft\WindowsApps\python3.exe"));
+            candidates.push(home.join(r"miniconda3\python.exe"));
+            candidates.push(home.join(r"anaconda3\python.exe"));
+            candidates.push(home.join(r".local\bin\python.exe"));
+            candidates.push(home.join(r"scoop\apps\python\current\python.exe"));
+        }
+
+        // 4. Cartelle standard di sistema Program Files (installazioni per tutti gli utenti)
+        for ver in &["Python314", "Python313", "Python312", "Python311", "Python310", "Python39"] {
+            candidates.push(PathBuf::from(format!(r"C:\Program Files\{}\python.exe", ver)));
+            candidates.push(PathBuf::from(format!(r"C:\Program Files (x86)\{}\python.exe", ver)));
+            candidates.push(PathBuf::from(format!(r"C:\{}\python.exe", ver)));
+        }
+        candidates.push(PathBuf::from(r"C:\Windows\py.exe"));
+        candidates.push(PathBuf::from(r"C:\ProgramData\chocolatey\bin\python.exe"));
     }
     for c in candidates {
         if c.is_file() {
@@ -234,15 +281,37 @@ fn ensure_virtualenv(
     }
 
     let path_env = get_full_path_env();
-    let mut uv_bin = PathBuf::from("uv");
+    let mut uv_bin = if cfg!(windows) {
+        PathBuf::from("uv.exe")
+    } else {
+        PathBuf::from("uv")
+    };
     if let Some(home) = get_home_dir() {
-        let local_uv = home.join(".local/bin/uv");
-        if local_uv.is_file() {
-            uv_bin = local_uv;
-        } else {
-            let cargo_uv = home.join(".cargo/bin/uv");
-            if cargo_uv.is_file() {
-                uv_bin = cargo_uv;
+        #[cfg(windows)]
+        {
+            for candidate in &[
+                home.join(r".local\bin\uv.exe"),
+                home.join(r"AppData\Local\Programs\uv\uv.exe"),
+                home.join(r"AppData\Local\uv\uv.exe"),
+                home.join(r"AppData\Roaming\uv\uv.exe"),
+                home.join(r".cargo\bin\uv.exe"),
+            ] {
+                if candidate.is_file() {
+                    uv_bin = candidate.clone();
+                    break;
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let local_uv = home.join(".local/bin/uv");
+            if local_uv.is_file() {
+                uv_bin = local_uv;
+            } else {
+                let cargo_uv = home.join(".cargo/bin/uv");
+                if cargo_uv.is_file() {
+                    uv_bin = cargo_uv;
+                }
             }
         }
     }
@@ -279,6 +348,36 @@ fn ensure_virtualenv(
                 }
             }
         }
+        #[cfg(windows)]
+        {
+            {
+                let mut s = state.0.lock().unwrap();
+                s.status = "initializing_venv".into();
+                s.message = "Sto preparando l'ambiente per l'uso, aspetta ancora un po'...".into();
+            }
+            let _ = Command::new("powershell")
+                .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "irm https://astral.sh/uv/install.ps1 | iex"])
+                .env("PATH", &path_env)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+
+            if let Some(home) = get_home_dir() {
+                for candidate in &[
+                    home.join(r".local\bin\uv.exe"),
+                    home.join(r"AppData\Local\Programs\uv\uv.exe"),
+                    home.join(r"AppData\Local\uv\uv.exe"),
+                    home.join(r"AppData\Roaming\uv\uv.exe"),
+                    home.join(r".cargo\bin\uv.exe"),
+                ] {
+                    if candidate.is_file() {
+                        uv_bin = candidate.clone();
+                        has_uv = true;
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     if has_uv {
@@ -302,15 +401,20 @@ fn ensure_virtualenv(
             s.status = "installing_deps".into();
             s.message = "Sto preparando l'ambiente per l'uso, aspetta ancora un po'...".into();
         }
+        let mut pip_args: Vec<&str> = vec![
+            "pip",
+            "install",
+            "-r",
+            req_file.to_str().unwrap_or_default(),
+            "--python",
+            python_bin.to_str().unwrap_or_default(),
+        ];
+        if cfg!(windows) {
+            pip_args.push("--extra-index-url");
+            pip_args.push("https://abetlen.github.io/llama-cpp-python/whl/cpu");
+        }
         let status = Command::new(&uv_bin)
-            .args([
-                "pip",
-                "install",
-                "-r",
-                req_file.to_str().unwrap_or_default(),
-                "--python",
-                python_bin.to_str().unwrap_or_default(),
-            ])
+            .args(&pip_args)
             .env("PATH", &path_env)
             .status()
             .map_err(|e| format!("Errore configurazione componenti: {e}"))?;
@@ -347,8 +451,13 @@ fn ensure_virtualenv(
         } else {
             target_venv.join("bin/pip")
         };
+        let mut pip_args: Vec<&str> = vec!["install", "-r", req_file.to_str().unwrap_or_default()];
+        if cfg!(windows) {
+            pip_args.push("--extra-index-url");
+            pip_args.push("https://abetlen.github.io/llama-cpp-python/whl/cpu");
+        }
         let status = Command::new(&pip_bin)
-            .args(["install", "-r", req_file.to_str().unwrap_or_default()])
+            .args(&pip_args)
             .env("PATH", &path_env)
             .status()
             .map_err(|e| format!("Errore installazione dipendenze con pip: {e}"))?;
