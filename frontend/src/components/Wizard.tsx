@@ -1,4 +1,4 @@
-import { osBadge, isMac, fileManagerName, normalizeDisplayPath } from '../lib/platform';
+import { isMac, fileManagerName, normalizeDisplayPath } from '../lib/platform';
 import { useEffect, useState, useRef } from 'react';
 import { 
   Sparkles, Folder, ArrowRight, ArrowLeft, 
@@ -119,6 +119,8 @@ export default function Wizard() {
   const [isCancelling, setIsCancelling] = useState(false);
   const [isTriggering, setIsTriggering] = useState(false);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [isFadingOut, setIsFadingOut] = useState(false);
+  const [isCompletedSuccess, setIsCompletedSuccess] = useState(false);
 
   // Ref per accedere sempre ai valori correnti nel loop del polling
   const queueRef = useRef({ downloadQueue, queueIndex, activeDownloadModel, isDownloadingScreen });
@@ -200,17 +202,16 @@ export default function Wizard() {
                 setDownloadError(formatFriendlyError(e));
               }
             } else {
-              // Tutti i modelli della coda sono stati completati con successo
-              queueRef.current.isDownloadingScreen = false;
-              queueRef.current.activeDownloadModel = null;
-              queueRef.current.downloadQueue = [];
-              queueRef.current.queueIndex = 0;
-              setIsDownloadingScreen(false);
-              setActiveDownloadModel(null);
-              setDownloadQueue([]);
-              setQueueIndex(0);
+              // Tutti i modelli della coda sono stati completati con successo!
+              // Non tornare allo step 4: mostra completamento e avvia dissolvenza fluida verso l'app principale
+              setIsCompletedSuccess(true);
               setDownloadError(null);
-              void handleFinishSetup();
+              setTimeout(() => {
+                setIsFadingOut(true);
+              }, 400);
+              setTimeout(async () => {
+                await handleFinishSetup();
+              }, 950);
             }
           } else if (curInfo?.status === 'error') {
             setDownloadError(curInfo.error || 'Errore durante la connessione con il repository.');
@@ -325,8 +326,10 @@ export default function Wizard() {
       if (llmModel !== 'later' && !llmDone) queue.push(llmModel);
 
       if (queue.length === 0) {
-        setIsDownloadingScreen(false);
-        await handleFinishSetup();
+        setIsFadingOut(true);
+        setTimeout(async () => {
+          await handleFinishSetup();
+        }, 500);
         return;
       }
 
@@ -440,7 +443,10 @@ export default function Wizard() {
   };
 
   return (
-    <div className="fixed inset-0 w-screen h-screen bg-[#0d1017]/95 backdrop-blur-md text-white flex flex-col select-none overflow-hidden z-50 rounded-[12px]">
+    <div className={clsx(
+      "fixed inset-0 w-screen h-screen bg-[#0d1017]/95 backdrop-blur-md text-white flex flex-col select-none overflow-hidden z-50 rounded-[12px] transition-all duration-700 ease-in-out",
+      isFadingOut ? "opacity-0 pointer-events-none scale-[0.99]" : "opacity-100"
+    )}>
       
       {/* Decorative ambient background glows */}
       <div 
@@ -508,11 +514,7 @@ export default function Wizard() {
           </div>
         )}
 
-        <div className="min-w-[200px] flex justify-end pointer-events-none">
-          <span className="text-[11px] font-mono text-white/30 px-2.5 py-1 rounded-full border border-white/[0.06] bg-white/[0.02]">
-            {osBadge ?? 'SbobinAI'}
-          </span>
-        </div>
+        <div className="min-w-[200px]" />
       </header>
 
       {/* ── Main Body ── */}
@@ -1026,10 +1028,11 @@ export default function Wizard() {
                         <AlertCircle size={40} className="text-red-400 mb-1" />
                         <span className="text-xs font-semibold text-red-300">Errore Download</span>
                       </div>
-                    ) : progressPct >= 100 ? (
+                    ) : (progressPct >= 100 || isCompletedSuccess) ? (
                       <div className="flex flex-col items-center animate-fade-in">
                         <CheckCircle2 size={42} className="text-emerald-400 mb-1" />
                         <span className="text-xs font-semibold text-emerald-300">Completato ✓</span>
+                        <span className="text-[10px] text-white/50 mt-1">Accesso a SbobinAI...</span>
                       </div>
                     ) : (
                       <>
@@ -1057,6 +1060,8 @@ export default function Wizard() {
                     <span>
                       {downloadError
                         ? 'Errore durante il download dal repository'
+                        : isCompletedSuccess
+                        ? 'Tutti i modelli sono pronti! Apertura applicazione...'
                         : activeInfo?.stage || (
                             progressPct < 90
                               ? `Download in corso (${queueIndex + 1}/${downloadQueue.length || 1})...`
@@ -1143,7 +1148,7 @@ export default function Wizard() {
         ) : (
           <>
             <div>
-              {step > 1 ? (
+              {step > 1 && (
                 <button
                   type="button"
                   onClick={() => setStep((s) => (s - 1) as 1 | 2 | 3 | 4)}
@@ -1152,8 +1157,6 @@ export default function Wizard() {
                   <ArrowLeft size={14} />
                   <span>Indietro</span>
                 </button>
-              ) : (
-                <span className="text-xs text-white/30">Passo 1 di 4</span>
               )}
             </div>
 
@@ -1171,7 +1174,12 @@ export default function Wizard() {
                 /* ── STEP 4: TUTTO INSTALLATO -> INIZIA A STUDIARE ── */
                 <button
                   type="button"
-                  onClick={handleFinishSetup}
+                  onClick={async () => {
+                    setIsFadingOut(true);
+                    setTimeout(async () => {
+                      await handleFinishSetup();
+                    }, 500);
+                  }}
                   className="flex items-center gap-2 px-7 py-2.5 rounded-2xl text-xs font-semibold text-white bg-emerald-500 hover:bg-emerald-600 shadow-[0_0_20px_rgba(16,185,129,0.4)] transition-all cursor-pointer"
                 >
                   <CheckCircle2 size={15} />

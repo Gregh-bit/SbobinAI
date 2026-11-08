@@ -312,7 +312,7 @@ function MainApp() {
         </Suspense>
       ) : (
         /* Main App Workspace */
-        <div className="flex h-screen overflow-hidden bg-transparent select-none rounded-[12px]">
+        <div className="flex h-screen overflow-hidden bg-transparent select-none rounded-[12px] animate-fade-in">
           <Sidebar
             subjects={subjects}
             selectedId={selectedSubject?.id ?? null}

@@ -93,6 +93,11 @@ def test_ws_mock_session_start_chunk_bookmark_stop(client, subject, post_calls):
     assert "Fubini" in lec["raw_transcript"]
     assert lec["duration_seconds"] is not None
     assert live_session.get_session(subject["id"]) is None
+    import time
+    for _ in range(40):
+        if post_calls:
+            break
+        time.sleep(0.05)
     assert post_calls and post_calls[0]["lecture_id"] == lecture_id
 
 
