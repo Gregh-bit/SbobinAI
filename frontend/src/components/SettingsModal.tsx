@@ -3,11 +3,11 @@ import {
   X, Folder, Cpu, Mic, HardDrive, Check, 
   RotateCcw, Sliders, Trash2, Download, Loader2,
   RefreshCw, CheckCircle2, ShieldCheck, Database, FileAudio, 
-  Layers, AlertTriangle, Sparkles, Volume2, Shield, Copy
+  Layers, AlertTriangle, AlertCircle, Sparkles, Volume2, Shield, Copy
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import { useSettings } from '../lib/SettingsContext';
-import { pickFolder } from '../lib/tauri';
+import { pickFolder, isTauri } from '../lib/tauri';
 import { osBadge, fileManagerName, normalizeDisplayPath } from '../lib/platform';
 import { useUpdater } from '../lib/useUpdater';
 import { api } from '../lib/api';
@@ -78,6 +78,9 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
   const [confirmReset, setConfirmReset] = useState(false);
   const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
   const [confirmDeleteModelId, setConfirmDeleteModelId] = useState<string | null>(null);
+  const [showUninstallModal, setShowUninstallModal] = useState(false);
+  const [isUninstalling, setIsUninstalling] = useState(false);
+  const [deleteStorageFolder, setDeleteStorageFolder] = useState(false);
 
   // Stato Modelli Reali dal Backend
   const [modelsStatus, setModelsStatus] = useState<ModelsStatusResponse | null>(null);
@@ -195,20 +198,27 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
     const isDownloading = isWhisperDl || isLlmDl || isEmbDl || actionInProgress !== null;
     if (!isDownloading) return;
 
-    const timer = setInterval(() => {
-      fetchModelsStatus(true);
-    }, 1000);
+    let isFetching = false;
+    const timer = setInterval(async () => {
+      if (isFetching) return;
+      isFetching = true;
+      try {
+        await fetchModelsStatus(true);
+      } finally {
+        isFetching = false;
+      }
+    }, 1200);
     return () => clearInterval(timer);
   }, [isOpen, modelsStatus, actionInProgress, fetchModelsStatus]);
 
   // Gestione tasto ESC
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      if (e.key === 'Escape' && !isUninstalling) onClose();
     };
     if (isOpen) window.addEventListener('keydown', handleKey);
     return () => window.removeEventListener('keydown', handleKey);
-  }, [isOpen, onClose]);
+  }, [isOpen, onClose, isUninstalling]);
 
   // Avvio download di un modello con aggiornamento ottimistico istantaneo
   const handleDownloadModel = async (modelId: string) => {
@@ -383,6 +393,41 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
     onClose();
   };
 
+  const handleUninstallApp = async () => {
+    setIsUninstalling(true);
+    try {
+      if (isTauri()) {
+        const { invoke } = await import('@tauri-apps/api/core');
+        await invoke('uninstall_sbobinai', { 
+          keepStoragePath: storagePath,
+          deleteStorageFolder: deleteStorageFolder,
+        });
+      } else {
+        try {
+          await api.models.deleteAll();
+        } catch {}
+      }
+
+      // Pulisce le chiavi di configurazione locali dell'app
+      try {
+        if (deleteStorageFolder) {
+          localStorage.clear();
+        } else {
+          localStorage.removeItem('sbobinai_settings_v1');
+          localStorage.removeItem('unicopilot_settings_v1');
+        }
+        sessionStorage.clear();
+      } catch (e) {
+        console.warn('Errore pulizia storage locale:', e);
+      }
+    } catch (err: any) {
+      console.error('Errore durante la disinstallazione:', err);
+      setIsUninstalling(false);
+      setShowUninstallModal(false);
+      showNotification('Errore durante la disinstallazione: ' + (err?.message || String(err)), 'error');
+    }
+  };
+
   if (!isOpen) return null;
 
   const totalInstalledMb = modelsStatus?.total_installed_mb ?? 0;
@@ -498,7 +543,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
   return (
     <div 
       className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-md animate-fade-in select-none"
-      onClick={onClose}
+      onClick={() => { if (!isUninstalling) onClose(); }}
     >
       <div 
         className="relative w-[880px] max-w-[94vw] h-[640px] max-h-[90vh] rounded-3xl liquid-glass border border-white/[0.14] shadow-liquid-lg overflow-hidden flex flex-col"
@@ -517,8 +562,9 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
           </div>
 
           <button
-            onClick={onClose}
-            className="w-7 h-7 rounded-full flex items-center justify-center text-white/40 hover:text-white/90 hover:bg-white/[0.08] transition-colors cursor-pointer"
+            onClick={() => { if (!isUninstalling) onClose(); }}
+            disabled={isUninstalling}
+            className="w-7 h-7 rounded-full flex items-center justify-center text-white/40 hover:text-white/90 hover:bg-white/[0.08] transition-colors cursor-pointer disabled:opacity-30 disabled:pointer-events-none"
             title="Chiudi (Esc)"
           >
             <X size={15} strokeWidth={2} />
@@ -1192,13 +1238,29 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                                     <div className="w-full h-2 rounded-full bg-white/10 overflow-hidden relative">
                                       <div
                                         className="h-full bg-gradient-to-r from-blue-500 via-indigo-500 to-emerald-400 rounded-full transition-all duration-300"
-                                        style={{ width: `${Math.max(4, m.progress || 0)}%` }}
+                                        style={{ width: `${Math.min(100, Math.max(4, m.progress || 0))}%` }}
                                       />
                                     </div>
                                     <div className="flex justify-between text-[10px] font-mono text-white/50">
-                                      <span>{m.downloaded_mb || 0} MB scaricati</span>
+                                      <span>{Math.min(m.downloaded_mb || 0, m.total_mb || 580)} MB scaricati</span>
                                       <span>Totale: ~{m.total_mb || '580'} MB</span>
                                     </div>
+                                  </div>
+                                )}
+
+                                {m.status === 'error' && !isDownloading && (
+                                  <div className="w-full pt-2 border-t border-red-500/20 text-xs text-red-300 flex items-center justify-between gap-2 animate-fade-in">
+                                    <div className="flex items-center gap-1.5 truncate max-w-[75%]">
+                                      <AlertCircle size={13} className="text-red-400 shrink-0" />
+                                      <span className="truncate">{m.error || "Errore durante il download dei pesi."}</span>
+                                    </div>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDownloadModel(m.id)}
+                                      className="px-2.5 py-1 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-200 text-[10px] font-semibold shrink-0 cursor-pointer"
+                                    >
+                                      Riprova
+                                    </button>
                                   </div>
                                 )}
                               </div>
@@ -1354,13 +1416,29 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                                   <div className="w-full h-2 rounded-full bg-white/10 overflow-hidden relative">
                                     <div
                                       className="h-full bg-gradient-to-r from-blue-500 via-indigo-500 to-emerald-400 rounded-full transition-all duration-300"
-                                      style={{ width: `${Math.max(4, m.progress || 0)}%` }}
+                                      style={{ width: `${Math.min(100, Math.max(4, m.progress || 0))}%` }}
                                     />
                                   </div>
                                   <div className="flex justify-between text-[10px] font-mono text-white/50">
-                                    <span>{m.downloaded_mb || 0} MB scaricati</span>
+                                    <span>{Math.min(m.downloaded_mb || 0, m.total_mb || 2300)} MB scaricati</span>
                                     <span>Totale: ~{m.total_mb || '2300'} MB</span>
                                   </div>
+                                </div>
+                              )}
+
+                              {m.status === 'error' && !isDownloading && (
+                                <div className="w-full pt-2 border-t border-red-500/20 text-xs text-red-300 flex items-center justify-between gap-2 animate-fade-in">
+                                  <div className="flex items-center gap-1.5 truncate max-w-[75%]">
+                                    <AlertCircle size={13} className="text-red-400 shrink-0" />
+                                    <span className="truncate">{m.error || "Errore durante il download dei pesi."}</span>
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleDownloadModel(m.id)}
+                                    className="px-2.5 py-1 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-200 text-[10px] font-semibold shrink-0 cursor-pointer"
+                                  >
+                                    Riprova
+                                  </button>
                                 </div>
                               )}
                             </div>
@@ -1708,7 +1786,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       <div className="flex items-center gap-2">
                         <h4 className="text-sm font-bold text-white">Aggiornamenti</h4>
                         <span className="text-[10px] font-mono font-medium px-2 py-0.5 rounded-full bg-white/[0.08] text-white/70 border border-white/10">
-                          v{updater.currentVersion || '0.0.10'}
+                          v{updater.currentVersion || '0.0.11'}
                         </span>
                       </div>
                       <p className="text-[11px] text-white/50 mt-0.5">
@@ -1772,7 +1850,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       {updater.status === 'checking' ? 'Controllo in corso...' : 'Controlla aggiornamenti'}
                     </button>
                     <span className="text-[11px] text-white/40 font-medium">
-                      Versione installata: <strong className="font-mono text-white/80">v{updater.currentVersion || '0.0.10'}</strong>
+                      Versione installata: <strong className="font-mono text-white/80">v{updater.currentVersion || '0.0.11'}</strong>
                     </span>
                     {updater.status === 'uptodate' && <span className="text-[11px] text-emerald-300 font-medium">Sei all'ultima versione</span>}
                     {updater.status === 'available' && (
@@ -1816,6 +1894,31 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                     <span>{confirmReset ? 'Sei sicuro? Clicca per riavviare il Wizard' : 'Riavvia Configurazione Wizard'}</span>
                   </button>
                 </div>
+
+                {/* ── Sezione Disinstallazione Completa SbobinAI (Zona Pericolosa) ── */}
+                <div className="p-4 rounded-3xl bg-red-500/[0.04] border border-red-500/20 shadow-liquid-sm space-y-3">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <Trash2 size={14} className="text-red-400" />
+                      <h4 className="text-xs font-bold text-red-300">Disinstalla SbobinAI</h4>
+                    </div>
+                    <p className="text-[11px] text-white/50 mt-1 leading-relaxed">
+                      Disinstalla completamente SbobinAI dal computer eliminando ogni componente scaricato (motore Python, modelli AI, cache e l'applicazione stessa).
+                      <span className="block text-emerald-400/90 font-medium mt-1">
+                        La cartella selezionata per salvare i file in locale ({normalizeDisplayPath(storagePath)}) rimarrà intatta.
+                      </span>
+                    </p>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => setShowUninstallModal(true)}
+                    className="flex items-center gap-2 px-4 py-2 rounded-2xl text-xs font-semibold bg-red-500/15 hover:bg-red-500/25 border border-red-500/30 text-red-200 hover:text-white transition-all shadow-liquid-sm cursor-pointer"
+                  >
+                    <Trash2 size={13} />
+                    <span>Disinstalla SbobinAI</span>
+                  </button>
+                </div>
               </div>
             )}
 
@@ -1850,6 +1953,186 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
             </div>
           </div>
         )}
+
+        {/* ── Modal di Conferma Disinstallazione Completa ── */}
+        <AnimatePresence>
+          {showUninstallModal && (
+            <motion.div
+              initial={{ opacity: 0, scale: 0.96 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.96 }}
+              transition={{ duration: 0.18 }}
+              className="absolute inset-0 z-50 bg-[#0B0F19]/95 backdrop-blur-xl flex flex-col items-center justify-center p-6 text-center select-none"
+            >
+              {!isUninstalling ? (
+                <div className="max-w-lg w-full space-y-4 animate-scale-up text-left max-h-[85vh] overflow-y-auto pr-1">
+                  <div className="flex items-center gap-3 border-b border-white/10 pb-3">
+                    <div className="w-10 h-10 rounded-2xl bg-red-500/15 border border-red-500/30 flex items-center justify-center text-red-400 shadow-liquid-sm flex-shrink-0">
+                      <Trash2 size={20} />
+                    </div>
+                    <div>
+                      <h3 className="text-base font-bold text-white tracking-tight">
+                        Disinstallazione di SbobinAI
+                      </h3>
+                      <p className="text-xs text-white/50 leading-relaxed">
+                        Scegli come gestire la cartella con le tue lezioni e registrazioni.
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* ── SELETTORE OPZIONI DISINSTALLAZIONE ── */}
+                  <div className="space-y-2.5 pt-1">
+                    <label className="text-[11px] font-semibold text-white/70 uppercase tracking-wider block">
+                      Opzione di disinstallazione:
+                    </label>
+
+                    {/* Opzione 1: Conserva la cartella delle lezioni */}
+                    <div
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => setDeleteStorageFolder(false)}
+                      className={clsx(
+                        "p-3.5 rounded-2xl border transition-all cursor-pointer flex items-start gap-3",
+                        !deleteStorageFolder
+                          ? "bg-blue-500/15 border-blue-500/50 shadow-liquid-sm"
+                          : "bg-white/[0.03] border-white/10 hover:bg-white/[0.06]"
+                      )}
+                    >
+                      <div className={clsx(
+                        "w-4 h-4 rounded-full border mt-0.5 flex items-center justify-center flex-shrink-0 transition-colors",
+                        !deleteStorageFolder ? "border-blue-400 bg-blue-500" : "border-white/30 bg-transparent"
+                      )}>
+                        {!deleteStorageFolder && <div className="w-1.5 h-1.5 rounded-full bg-white" />}
+                      </div>
+                      <div className="space-y-1 flex-1">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-semibold text-white">
+                            Mantieni la cartella delle lezioni
+                          </span>
+                          <span className="text-[10px] font-medium text-emerald-400 bg-emerald-500/15 px-2 py-0.5 rounded-full border border-emerald-500/30">
+                            Consigliato
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-white/60 leading-relaxed">
+                          Conserva le registrazioni audio, gli appunti e i documenti in:
+                        </p>
+                        <span className="font-mono text-[11px] text-white/90 bg-black/40 px-2 py-0.5 rounded border border-white/10 block break-all mt-1">
+                          {normalizeDisplayPath(storagePath)}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Opzione 2: Pulizia totale con eliminazione cartella lezioni */}
+                    <div
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => setDeleteStorageFolder(true)}
+                      className={clsx(
+                        "p-3.5 rounded-2xl border transition-all cursor-pointer flex items-start gap-3",
+                        deleteStorageFolder
+                          ? "bg-red-500/15 border-red-500/50 shadow-liquid-sm"
+                          : "bg-white/[0.03] border-white/10 hover:bg-white/[0.06]"
+                      )}
+                    >
+                      <div className={clsx(
+                        "w-4 h-4 rounded-full border mt-0.5 flex items-center justify-center flex-shrink-0 transition-colors",
+                        deleteStorageFolder ? "border-red-400 bg-red-500" : "border-white/30 bg-transparent"
+                      )}>
+                        {deleteStorageFolder && <div className="w-1.5 h-1.5 rounded-full bg-white" />}
+                      </div>
+                      <div className="space-y-1 flex-1">
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-semibold text-red-300">
+                            Elimina anche la cartella delle lezioni (Pulizia totale)
+                          </span>
+                          <span className="text-[10px] font-medium text-red-400 bg-red-500/15 px-2 py-0.5 rounded-full border border-red-500/30">
+                            Zero tracce
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-white/60 leading-relaxed">
+                          Elimina <strong className="text-red-300 font-semibold">ogni singola traccia</strong> dell'app dal computer, compresa la cartella con audio e lezioni. Reinstallare SbobinAI dopo sarà come farlo per la prima volta.
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* ── Box Informativo Dinamico ── */}
+                  {!deleteStorageFolder ? (
+                    <div className="p-3 rounded-2xl bg-emerald-500/10 border border-emerald-500/25 text-left flex items-start gap-2.5">
+                      <CheckCircle2 size={16} className="text-emerald-400 flex-shrink-0 mt-0.5" />
+                      <div className="text-[11px] text-white/70 space-y-0.5">
+                        <span className="font-semibold text-emerald-300 block">
+                          I tuoi file personali non verranno toccati
+                        </span>
+                        <p className="text-white/60 leading-relaxed">
+                          Verranno rimossi: applicazione, modelli AI scaricati (Whisper/LLM), ambiente Python, log e cache di sistema. Le registrazioni in <span className="font-mono text-white/80">{normalizeDisplayPath(storagePath)}</span> rimarranno intatte.
+                        </p>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="p-3 rounded-2xl bg-red-500/15 border border-red-500/30 text-left flex items-start gap-2.5">
+                      <AlertTriangle size={16} className="text-red-400 flex-shrink-0 mt-0.5" />
+                      <div className="text-[11px] text-red-200/90 space-y-0.5">
+                        <span className="font-semibold text-red-300 block">
+                          Attenzione: Eliminazione totale irreversibile
+                        </span>
+                        <p className="leading-relaxed text-red-200/80">
+                          Verrà eliminata <span className="font-bold underline">anche</span> la cartella <span className="font-mono underline">{normalizeDisplayPath(storagePath)}</span> con tutte le registrazioni audio, gli appunti e il database. Nessuna traccia rimarrà sul sistema.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* ── Pulsanti Azione ── */}
+                  <div className="flex items-center justify-end gap-3 pt-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowUninstallModal(false)}
+                      className="px-4 py-2 rounded-2xl text-xs font-semibold bg-white/[0.08] hover:bg-white/[0.16] border border-white/14 text-white/80 transition-all cursor-pointer"
+                    >
+                      Annulla
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleUninstallApp}
+                      className={clsx(
+                        "flex items-center gap-2 px-5 py-2 rounded-2xl text-xs font-semibold text-white shadow-liquid-sm transition-all cursor-pointer",
+                        deleteStorageFolder
+                          ? "bg-red-600 hover:bg-red-700 border border-red-400/40"
+                          : "bg-red-500 hover:bg-red-600 border border-red-500/40"
+                      )}
+                    >
+                      <Trash2 size={13} />
+                      <span>
+                        {deleteStorageFolder ? 'Elimina Definitivamente Ogni Traccia' : 'Disinstalla SbobinAI'}
+                      </span>
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="max-w-sm w-full space-y-4 animate-fade-in flex flex-col items-center">
+                  <div className="relative">
+                    <div className="w-16 h-16 rounded-full border-4 border-red-500/20 border-t-red-500 animate-spin" />
+                    <Trash2 size={22} className="absolute inset-0 m-auto text-red-400" />
+                  </div>
+                  <div className="space-y-1 text-center">
+                    <h3 className="text-sm font-bold text-white">
+                      {deleteStorageFolder ? 'Pulizia totale in corso...' : 'Disinstallazione in corso...'}
+                    </h3>
+                    <p className="text-xs text-white/50 leading-relaxed">
+                      {deleteStorageFolder
+                        ? 'Eliminazione lezioni, audio, modelli AI, pulizia ambiente Python e cancellazione di ogni traccia.'
+                        : 'Eliminazione dei modelli AI, pulizia dell\'ambiente Python e disinstallazione dell\'applicazione.'}
+                    </p>
+                    <p className="text-[11px] text-white/40 pt-2">
+                      L'applicazione si chiuderà automaticamente al termine.
+                    </p>
+                  </div>
+                </div>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
 
       </div>
     </div>

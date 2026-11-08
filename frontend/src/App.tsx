@@ -8,6 +8,7 @@ import UpdateBanner from './components/UpdateBanner';
 import ErrorBoundary from './components/ErrorBoundary';
 import { SettingsProvider, useSettings, isAutoUpdateEnabled } from './lib/SettingsContext';
 import { checkAndAutoInstall, type BootUpdateEvent } from './lib/useUpdater';
+import { getBackendStatus, relaunchApp } from './lib/tauri';
 import type { Lecture, Subject } from './types';
 
 // Lazy loading componenti pesanti non visibili all'avvio (<100ms startup)
@@ -15,6 +16,7 @@ const Wizard = lazy(() => import('./components/Wizard'));
 const SettingsModal = lazy(() => import('./components/SettingsModal'));
 
 function BackendLoadingGate({ children }: { children: React.ReactNode }) {
+  const { settings, syncWithBackend } = useSettings();
   const [isReady, setIsReady] = useState(false);
   const [statusMessage, setStatusMessage] = useState("Sto preparando l'ambiente per l'uso, aspetta ancora un po'...");
   const [error, setError] = useState<string | null>(null);
@@ -39,8 +41,7 @@ function BackendLoadingGate({ children }: { children: React.ReactNode }) {
 
       // 1. Controlla lo stato dettagliato da Tauri (se attivo)
       try {
-        const { invoke } = await import('@tauri-apps/api/core');
-        const tauriStatus: any = await invoke('get_backend_status');
+        const tauriStatus = await getBackendStatus();
         if (tauriStatus && !cancelled) {
           if (tauriStatus.message) {
             setStatusMessage(tauriStatus.message);
@@ -64,6 +65,7 @@ function BackendLoadingGate({ children }: { children: React.ReactNode }) {
               setTimeout(check, 800);
               return;
             }
+            void syncWithBackend();
             setIsReady(true);
             return;
           }
@@ -77,6 +79,7 @@ function BackendLoadingGate({ children }: { children: React.ReactNode }) {
       if (cancelled) return;
 
       if (healthy) {
+        void syncWithBackend();
         setIsReady(true);
         return;
       }
@@ -97,7 +100,19 @@ function BackendLoadingGate({ children }: { children: React.ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [retryCount]);
+  }, [retryCount, bootUpdate.status]);
+
+  const isBootUpdating =
+    bootUpdate.status === 'downloading' ||
+    bootUpdate.status === 'installing' ||
+    bootUpdate.status === 'relaunching';
+
+  // Se l'utente è al primo avvio (setup non completato) e non c'è un aggiornamento critico in corso,
+  // mostra SUBITO il Wizard (apertura istantanea <100ms) senza attendere il backend.
+  // La preparazione del motore continuerà in background e verrà gestita allo step di download.
+  if (!settings.setupComplete && !isBootUpdating) {
+    return <>{children}</>;
+  }
 
   if (!isReady) {
     return (
@@ -123,8 +138,7 @@ function BackendLoadingGate({ children }: { children: React.ReactNode }) {
                 onClick={async () => {
                   setError(null);
                   try {
-                    const { relaunch } = await import('@tauri-apps/plugin-process');
-                    await relaunch();
+                    await relaunchApp();
                   } catch {
                     setRetryCount((c) => c + 1);
                   }
@@ -211,19 +225,22 @@ function MainApp() {
       const data = await api.subjects.list();
       setSubjects(data);
       setSelectedSubject((prev) => (prev ? prev : (data[0] || null)));
+      setLoadingSubjects(false);
     } catch {
       // Backend in fase di avvio: riprova ogni secondo per 5 volte
       if (retries > 0) {
         setTimeout(() => loadSubjects(retries - 1), 1000);
+      } else {
+        setLoadingSubjects(false);
       }
-    } finally {
-      setLoadingSubjects(false);
     }
   }, []);
 
   useEffect(() => {
-    loadSubjects();
-  }, [loadSubjects]);
+    if (settings.setupComplete) {
+      loadSubjects();
+    }
+  }, [settings.setupComplete, loadSubjects]);
 
   const handleAddSubject = async (form: {
     name: string;
@@ -341,10 +358,10 @@ function MainApp() {
 
 export default function App() {
   return (
-    <BackendLoadingGate>
-      <SettingsProvider>
+    <SettingsProvider>
+      <BackendLoadingGate>
         <MainApp />
-      </SettingsProvider>
-    </BackendLoadingGate>
+      </BackendLoadingGate>
+    </SettingsProvider>
   );
 }

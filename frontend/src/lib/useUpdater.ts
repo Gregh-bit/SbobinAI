@@ -18,7 +18,7 @@ interface State {
   currentVersion: string;
 }
 
-let state: State = { status: 'idle', version: null, progress: 0, error: null, currentVersion: '0.0.10' };
+let state: State = { status: 'idle', version: null, progress: 0, error: null, currentVersion: '0.0.11' };
 let handle: UpdateHandle | null = null;
 let startupDone = false;
 let versionFetched = false;
@@ -50,9 +50,15 @@ async function runCheck(silent: boolean): Promise<void> {
     const { check } = await import('@tauri-apps/plugin-updater');
     const update = await check();
     if (update) {
+      try {
+        (handle as any)?.close?.();
+      } catch {}
       handle = update as unknown as UpdateHandle;
       setState({ status: 'available', version: update.version });
     } else {
+      try {
+        (handle as any)?.close?.();
+      } catch {}
       handle = null;
       setState({ status: 'uptodate', version: null });
     }

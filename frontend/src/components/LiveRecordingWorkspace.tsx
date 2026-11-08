@@ -315,7 +315,12 @@ function LiveRecordingWorkspaceComponent({
                   type="text"
                   value={chatInput}
                   onChange={(e) => setChatInput(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleChatSend()}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                      e.preventDefault();
+                      handleChatSend();
+                    }
+                  }}
                   placeholder="Chiedi al volo..."
                   className="flex-1 px-3 py-2 rounded-xl liquid-input text-xs text-white placeholder-white/30 focus:outline-none"
                 />

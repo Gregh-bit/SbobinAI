@@ -7,8 +7,8 @@ import {
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import { useSettings } from '../lib/SettingsContext';
-import { pickFolder } from '../lib/tauri';
-import { api } from '../lib/api';
+import { pickFolder, getBackendStatus, relaunchApp, type TauriBackendStatus } from '../lib/tauri';
+import { api, checkBackendHealth } from '../lib/api';
 import type { ModelsStatusResponse } from '../types';
 
 const STEPS = [
@@ -105,6 +105,11 @@ export default function Wizard() {
     }
   }, [settings.storagePath]);
 
+  // Stato Backend e Bootstrap in background
+  const [isBackendReady, setIsBackendReady] = useState(false);
+  const [backendStatus, setBackendStatus] = useState<TauriBackendStatus | null>(null);
+  const [isWaitingForBackend, setIsWaitingForBackend] = useState(false);
+
   // Stato Modelli Reale da Backend
   const [modelsStatus, setModelsStatus] = useState<ModelsStatusResponse | null>(null);
   const [downloadQueue, setDownloadQueue] = useState<string[]>([]);
@@ -118,12 +123,56 @@ export default function Wizard() {
   // Ref per accedere sempre ai valori correnti nel loop del polling
   const queueRef = useRef({ downloadQueue, queueIndex, activeDownloadModel, isDownloadingScreen });
   queueRef.current = { downloadQueue, queueIndex, activeDownloadModel, isDownloadingScreen };
+  const retryCooldownRef = useRef(0);
+  const isCheckingRef = useRef(false);
 
-  // Verifica continua dello stato dei modelli
+  // 1. Controllo asincrono dello stato del backend (preparazione venv e pip install in background)
   useEffect(() => {
     let isMounted = true;
 
+    const checkBackend = async () => {
+      if (!isMounted) return;
+
+      try {
+        const tStatus = await getBackendStatus();
+        if (!isMounted) return;
+        if (tStatus) {
+          setBackendStatus(tStatus);
+          if (tStatus.port_ready) {
+            setIsBackendReady(true);
+            return;
+          }
+        }
+      } catch {
+        // Ignora errori di comunicazione IPC temporanei
+      }
+
+      const healthy = await checkBackendHealth(800);
+      if (!isMounted) return;
+      if (healthy) {
+        setIsBackendReady(true);
+        return;
+      }
+    };
+
+    if (!isBackendReady) {
+      checkBackend();
+      const timer = setInterval(checkBackend, 900);
+      return () => {
+        isMounted = false;
+        clearInterval(timer);
+      };
+    }
+  }, [isBackendReady]);
+
+  // 2. Verifica continua dello stato dei modelli (attiva solo quando il backend è pronto)
+  useEffect(() => {
+    if (!isBackendReady) return;
+    let isMounted = true;
+
     const checkStatus = async () => {
+      if (!isMounted || isCheckingRef.current || Date.now() < retryCooldownRef.current) return;
+      isCheckingRef.current = true;
       try {
         const res = await api.models.status();
         if (!isMounted) return;
@@ -161,6 +210,7 @@ export default function Wizard() {
               setDownloadQueue([]);
               setQueueIndex(0);
               setDownloadError(null);
+              void handleFinishSetup();
             }
           } else if (curInfo?.status === 'error') {
             setDownloadError(curInfo.error || 'Errore durante la connessione con il repository.');
@@ -168,6 +218,8 @@ export default function Wizard() {
         }
       } catch (err) {
         console.warn('[Wizard] Errore verifica modelli:', err);
+      } finally {
+        isCheckingRef.current = false;
       }
     };
 
@@ -178,7 +230,7 @@ export default function Wizard() {
       isMounted = false;
       clearInterval(timer);
     };
-  }, [isDownloadingScreen]);
+  }, [isBackendReady, isDownloadingScreen]);
 
   const handleChooseFolder = async () => {
     setIsSelectingFolder(true);
@@ -222,24 +274,36 @@ export default function Wizard() {
     ...(modelsStatus?.llm || []),
   ];
   const activeInfo = allKnownModels.find((m) => m.id === activeDownloadModel);
-  const progressPct = activeInfo?.progress ?? 0;
-  const downloadedMb = activeInfo?.downloaded_mb ?? 0;
-  const totalMb = activeInfo?.total_mb ?? (MODEL_SIZE_ESTIMATES[activeDownloadModel || ''] || 500);
+  const progressPct = Math.min(100, Math.max(0, activeInfo?.progress ?? 0));
+  const totalMb = activeInfo?.total_mb && activeInfo.total_mb > 0
+    ? Math.round(activeInfo.total_mb)
+    : (MODEL_SIZE_ESTIMATES[activeDownloadModel || ''] || 500);
+  const rawDownloadedMb = activeInfo?.downloaded_mb ?? 0;
+  const downloadedMb = progressPct >= 100 ? totalMb : Math.min(rawDownloadedMb, totalMb);
 
-  // Avvio download dei componenti in coda sequenziale
-  const handleStartDownloads = async () => {
+  // Avvio effettivo del download sequenziale dei modelli sul backend
+  const startModelDownloadsQueue = async () => {
     try {
       setIsTriggering(true);
       setDownloadError(null);
 
-      // Assicurati che lo stato modelli sia disponibile, con fallback resiliente
+      // 1. Registra sul backend la cartella storage selezionata dall'utente allo Step 2
+      if (storagePath) {
+        try {
+          await api.settings.setStorage(storagePath);
+        } catch (e) {
+          console.warn('[Wizard] Errore sincronizzazione storagePath:', e);
+        }
+      }
+
+      // 2. Assicurati che lo stato modelli sia disponibile
       let currentStatus = modelsStatus;
       if (!currentStatus) {
         try {
           currentStatus = await api.models.status();
           setModelsStatus(currentStatus);
         } catch (e) {
-          console.warn('[Wizard] Impossibile recuperare stato modelli, uso fallback:', e);
+          console.warn('[Wizard] Impossibile recuperare stato modelli:', e);
         }
       }
 
@@ -261,6 +325,7 @@ export default function Wizard() {
       if (llmModel !== 'later' && !llmDone) queue.push(llmModel);
 
       if (queue.length === 0) {
+        setIsDownloadingScreen(false);
         await handleFinishSetup();
         return;
       }
@@ -289,9 +354,34 @@ export default function Wizard() {
     }
   };
 
+  // Click su "Scarica" nello Step 4
+  const handleStartDownloads = async () => {
+    setDownloadError(null);
+
+    // Se il motore backend sta ancora preparando l'ambiente locale in background,
+    // mostra la schermata di download visualizzando la preparazione del motore (Fase 1)
+    if (!isBackendReady) {
+      setIsWaitingForBackend(true);
+      setIsDownloadingScreen(true);
+      return;
+    }
+
+    // Altrimenti avvia subito la sequenza di download dei modelli (Fase 2)
+    await startModelDownloadsQueue();
+  };
+
+  // Se eravamo in attesa che il backend completasse la preparazione, avvia i download non appena pronto
+  useEffect(() => {
+    if (isWaitingForBackend && isBackendReady) {
+      setIsWaitingForBackend(false);
+      void startModelDownloadsQueue();
+    }
+  }, [isWaitingForBackend, isBackendReady]);
+
   const handleRetryCurrent = async () => {
     if (!activeDownloadModel) return;
     setDownloadError(null);
+    retryCooldownRef.current = Date.now() + 2000;
     try {
       await api.models.download(activeDownloadModel);
     } catch (err: any) {
@@ -300,6 +390,12 @@ export default function Wizard() {
   };
 
   const handleInterruptDownload = async () => {
+    if (isWaitingForBackend) {
+      setIsWaitingForBackend(false);
+      setIsDownloadingScreen(false);
+      return;
+    }
+
     if (!activeDownloadModel) {
       setIsDownloadingScreen(false);
       return;
@@ -369,8 +465,11 @@ export default function Wizard() {
           <div className="flex items-center gap-2 px-3.5 py-1.5 rounded-full liquid-glass-subtle border border-blue-500/30 text-xs text-blue-300 font-medium">
             <Loader2 size={12} className="animate-spin text-blue-400" />
             <span>
-              Installazione Componente ({queueIndex + 1}/{downloadQueue.length || 1}):{' '}
-              {getModelDisplayName(activeDownloadModel || '')}
+              {isWaitingForBackend ? (
+                'Fase 1: Preparazione Motore Locale'
+              ) : (
+                `Installazione Componente (${queueIndex + 1}/${downloadQueue.length || 1}): ${getModelDisplayName(activeDownloadModel || '')}`
+              )}
             </span>
           </div>
         ) : (
@@ -585,6 +684,35 @@ export default function Wizard() {
               </p>
             </div>
 
+            {/* Stato motore locale */}
+            {backendStatus?.status === 'error' ? (
+              <div className="p-4 rounded-2xl bg-red-500/15 border border-red-500/30 text-red-200 text-xs flex items-center justify-between gap-3 animate-fade-in">
+                <div className="flex items-center gap-2.5">
+                  <AlertCircle size={16} className="text-red-400 flex-shrink-0" />
+                  <span>{backendStatus.error || backendStatus.message || 'Errore nella preparazione del motore locale.'}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={relaunchApp}
+                  className="px-3 py-1.5 rounded-lg bg-red-500/25 hover:bg-red-500/40 text-red-100 text-xs font-medium cursor-pointer"
+                >
+                  Riavvia
+                </button>
+              </div>
+            ) : !isBackendReady ? (
+              <div className="p-3.5 rounded-2xl liquid-glass border border-blue-400/25 flex items-center justify-between text-xs text-blue-200">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="w-3.5 h-3.5 rounded-full border-2 border-blue-400/30 border-t-blue-400 animate-spin flex-shrink-0" />
+                  <span className="truncate">
+                    <strong>Motore di sistema:</strong> {backendStatus?.message || "Configurazione dell'ambiente locale in corso..."}
+                  </span>
+                </div>
+                <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-blue-400/15 text-blue-200 border border-blue-400/25 flex-shrink-0">
+                  In background
+                </span>
+              </div>
+            ) : null}
+
             {/* Eventuale messaggio di errore globale */}
             {downloadError && (
               <div className="p-4 rounded-2xl bg-red-500/15 border border-red-500/30 text-red-200 text-xs flex items-center justify-between gap-3 animate-fade-in">
@@ -746,121 +874,227 @@ export default function Wizard() {
         {/* ── SCHERMATA DOWNLOAD A TUTTO SCHERMO CON PROGRESS BAR A CERCHIO ── */}
         {isDownloadingScreen && (
           <div className="flex-1 flex flex-col items-center justify-center p-8 max-w-lg mx-auto text-center animate-fade-in space-y-7 my-auto">
-            <div className="space-y-1">
-              <span className="text-[11px] font-mono uppercase tracking-wider text-blue-400 font-semibold px-3 py-1 rounded-full bg-blue-500/10 border border-blue-500/20 inline-block">
-                Installazione Componenti ({queueIndex + 1} di {downloadQueue.length || 1})
-              </span>
-              <h2 className="text-xl font-bold tracking-tight text-white">
-                Download {getModelDisplayName(activeDownloadModel || '')} ({formatMbOrGb(MODEL_SIZE_ESTIMATES[activeDownloadModel || ''] || 500)})
-              </h2>
-            </div>
-
-            {/* SVG Circular Progress Ring */}
-            <div className="relative w-56 h-56 flex items-center justify-center">
-              <svg className="w-56 h-56 -rotate-90 transform" viewBox="0 0 160 160">
-                <circle
-                  cx="80"
-                  cy="80"
-                  r="64"
-                  stroke="rgba(255, 255, 255, 0.08)"
-                  strokeWidth="8"
-                  fill="transparent"
-                />
-                <circle
-                  cx="80"
-                  cy="80"
-                  r="64"
-                  stroke="url(#download-ring-gradient)"
-                  strokeWidth="8"
-                  strokeDasharray={402.12}
-                  strokeDashoffset={402.12 - (Math.min(100, Math.max(0, progressPct)) / 100) * 402.12}
-                  strokeLinecap="round"
-                  fill="transparent"
-                  className="transition-all duration-300 ease-out"
-                />
-                <defs>
-                  <linearGradient id="download-ring-gradient" x1="0%" y1="0%" x2="100%" y2="100%">
-                    <stop offset="0%" stopColor="#3b82f6" />
-                    <stop offset="50%" stopColor="#6366f1" />
-                    <stop offset="100%" stopColor="#10b981" />
-                  </linearGradient>
-                </defs>
-              </svg>
-
-              <div className="absolute inset-0 flex flex-col items-center justify-center text-center select-none pointer-events-none">
-                {downloadError ? (
-                  <div className="flex flex-col items-center animate-fade-in px-4">
-                    <AlertCircle size={40} className="text-red-400 mb-1" />
-                    <span className="text-xs font-semibold text-red-300">Errore Download</span>
-                  </div>
-                ) : progressPct >= 100 ? (
-                  <div className="flex flex-col items-center animate-fade-in">
-                    <CheckCircle2 size={42} className="text-emerald-400 mb-1" />
-                    <span className="text-xs font-semibold text-emerald-300">Completato ✓</span>
-                  </div>
-                ) : (
-                  <>
-                    <span className="text-4xl font-bold font-mono tracking-tight text-white">
-                      {progressPct}%
-                    </span>
-                    <span className="text-xs font-mono text-white/50 mt-1">
-                      {downloadedMb} / ~{totalMb} MB
-                    </span>
-                  </>
-                )}
-              </div>
-            </div>
-
-            {/* Testi dinamici sotto la progress bar */}
-            <div className="space-y-3 max-w-sm">
-              <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-white/[0.06] border border-white/[0.12] text-xs font-medium text-white/90">
-                {downloadError ? (
-                  <AlertCircle size={13} className="text-red-400" />
-                ) : progressPct >= 100 ? (
-                  <CheckCircle2 size={13} className="text-emerald-400" />
-                ) : (
-                  <Loader2 size={13} className="text-blue-400 animate-spin" />
-                )}
-                <span>
-                  {downloadError
-                    ? 'Errore durante il download dal repository'
-                    : activeInfo?.stage || (
-                        progressPct < 90
-                          ? `Download in corso (${queueIndex + 1}/${downloadQueue.length || 1})...`
-                          : 'Ottimizzazione pesi in locale...'
-                      )}
-                </span>
-              </div>
-
-              <p className="text-xs text-white/50 leading-relaxed">
-                {downloadError
-                  ? `${downloadError}`
-                  : 'I componenti risiedono interamente nella memoria locale del tuo computer.'}
-              </p>
-
-              {downloadError && (
-                <div className="pt-2 flex items-center justify-center gap-3">
-                  <button
-                    type="button"
-                    onClick={handleRetryCurrent}
-                    className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold bg-blue-500 hover:bg-blue-600 text-white transition-colors cursor-pointer"
-                  >
-                    <RefreshCw size={12} />
-                    <span>Riprova</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setIsDownloadingScreen(false);
-                      setActiveDownloadModel(null);
-                    }}
-                    className="px-4 py-2 rounded-xl text-xs font-medium text-white/70 hover:text-white bg-white/10 hover:bg-white/15 transition-colors cursor-pointer"
-                  >
-                    Torna al Wizard
-                  </button>
+            {isWaitingForBackend ? (
+              /* ── FASE 1: ATTESA E CONFIGURAZIONE MOTORE LOCALE IN BACKGROUND ── */
+              <>
+                <div className="space-y-1">
+                  <span className="text-[11px] font-mono uppercase tracking-wider text-blue-400 font-semibold px-3 py-1 rounded-full bg-blue-500/10 border border-blue-500/20 inline-block">
+                    Fase 1: Preparazione Ambiente
+                  </span>
+                  <h2 className="text-xl font-bold tracking-tight text-white">
+                    Configurazione Motore SbobinAI
+                  </h2>
                 </div>
-              )}
-            </div>
+
+                {/* SVG Progress Ring con animazione fluida */}
+                <div className="relative w-56 h-56 flex items-center justify-center">
+                  <svg className="w-56 h-56 -rotate-90 transform animate-spin" style={{ animationDuration: '4s' }} viewBox="0 0 160 160">
+                    <circle
+                      cx="80"
+                      cy="80"
+                      r="64"
+                      stroke="rgba(255, 255, 255, 0.08)"
+                      strokeWidth="8"
+                      fill="transparent"
+                    />
+                    <circle
+                      cx="80"
+                      cy="80"
+                      r="64"
+                      stroke="url(#engine-ring-gradient)"
+                      strokeWidth="8"
+                      strokeDasharray={402.12}
+                      strokeDashoffset={180}
+                      strokeLinecap="round"
+                      fill="transparent"
+                    />
+                    <defs>
+                      <linearGradient id="engine-ring-gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                        <stop offset="0%" stopColor="#3b82f6" />
+                        <stop offset="50%" stopColor="#6366f1" />
+                        <stop offset="100%" stopColor="#10b981" />
+                      </linearGradient>
+                    </defs>
+                  </svg>
+
+                  <div className="absolute inset-0 flex flex-col items-center justify-center text-center select-none pointer-events-none px-4">
+                    {backendStatus?.status === 'error' ? (
+                      <div className="flex flex-col items-center animate-fade-in">
+                        <AlertCircle size={40} className="text-red-400 mb-1" />
+                        <span className="text-xs font-semibold text-red-300">Errore Motore</span>
+                      </div>
+                    ) : (
+                      <>
+                        <Loader2 size={36} className="animate-spin text-blue-400 mb-2" />
+                        <span className="text-xs font-semibold text-white/90">Preparazione...</span>
+                        <span className="text-[10px] font-mono text-white/50 mt-0.5">Runtime Locale</span>
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {/* Testi dinamici sotto la progress bar */}
+                <div className="space-y-3 max-w-sm">
+                  <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-white/[0.06] border border-white/[0.12] text-xs font-medium text-white/90">
+                    {backendStatus?.status === 'error' ? (
+                      <AlertCircle size={13} className="text-red-400" />
+                    ) : (
+                      <Loader2 size={13} className="text-blue-400 animate-spin" />
+                    )}
+                    <span>
+                      {backendStatus?.message || "Sto preparando l'ambiente per l'uso, aspetta ancora un po'..."}
+                    </span>
+                  </div>
+
+                  <p className="text-xs text-white/50 leading-relaxed">
+                    {backendStatus?.status === 'error'
+                      ? (backendStatus.error || 'Si è verificato un errore durante la configurazione.')
+                      : "Al primo avvio SbobinAI prepara il motore Python locale. Il download dei modelli inizierà automaticamente al termine."}
+                  </p>
+
+                  {backendStatus?.status === 'error' && (
+                    <div className="pt-2 flex items-center justify-center gap-3">
+                      <button
+                        type="button"
+                        onClick={relaunchApp}
+                        className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold bg-red-500 hover:bg-red-600 text-white transition-colors cursor-pointer"
+                      >
+                        <RefreshCw size={12} />
+                        <span>Riavvia applicazione</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsWaitingForBackend(false);
+                          setIsDownloadingScreen(false);
+                        }}
+                        className="px-4 py-2 rounded-xl text-xs font-medium text-white/70 hover:text-white bg-white/10 hover:bg-white/15 transition-colors cursor-pointer"
+                      >
+                        Torna al Wizard
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </>
+            ) : (
+              /* ── FASE 2: DOWNLOAD MODELLI AI CON SVG PROGRESS RING ── */
+              <>
+                <div className="space-y-1">
+                  <span className="text-[11px] font-mono uppercase tracking-wider text-blue-400 font-semibold px-3 py-1 rounded-full bg-blue-500/10 border border-blue-500/20 inline-block">
+                    Installazione Componenti ({queueIndex + 1} di {downloadQueue.length || 1})
+                  </span>
+                  <h2 className="text-xl font-bold tracking-tight text-white">
+                    Download {getModelDisplayName(activeDownloadModel || '')} ({formatMbOrGb(MODEL_SIZE_ESTIMATES[activeDownloadModel || ''] || 500)})
+                  </h2>
+                </div>
+
+                {/* SVG Circular Progress Ring */}
+                <div className="relative w-56 h-56 flex items-center justify-center">
+                  <svg className="w-56 h-56 -rotate-90 transform" viewBox="0 0 160 160">
+                    <circle
+                      cx="80"
+                      cy="80"
+                      r="64"
+                      stroke="rgba(255, 255, 255, 0.08)"
+                      strokeWidth="8"
+                      fill="transparent"
+                    />
+                    <circle
+                      cx="80"
+                      cy="80"
+                      r="64"
+                      stroke="url(#download-ring-gradient)"
+                      strokeWidth="8"
+                      strokeDasharray={402.12}
+                      strokeDashoffset={402.12 - (Math.min(100, Math.max(0, progressPct)) / 100) * 402.12}
+                      strokeLinecap="round"
+                      fill="transparent"
+                      className="transition-all duration-300 ease-out"
+                    />
+                    <defs>
+                      <linearGradient id="download-ring-gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                        <stop offset="0%" stopColor="#3b82f6" />
+                        <stop offset="50%" stopColor="#6366f1" />
+                        <stop offset="100%" stopColor="#10b981" />
+                      </linearGradient>
+                    </defs>
+                  </svg>
+
+                  <div className="absolute inset-0 flex flex-col items-center justify-center text-center select-none pointer-events-none">
+                    {downloadError ? (
+                      <div className="flex flex-col items-center animate-fade-in px-4">
+                        <AlertCircle size={40} className="text-red-400 mb-1" />
+                        <span className="text-xs font-semibold text-red-300">Errore Download</span>
+                      </div>
+                    ) : progressPct >= 100 ? (
+                      <div className="flex flex-col items-center animate-fade-in">
+                        <CheckCircle2 size={42} className="text-emerald-400 mb-1" />
+                        <span className="text-xs font-semibold text-emerald-300">Completato ✓</span>
+                      </div>
+                    ) : (
+                      <>
+                        <span className="text-4xl font-bold font-mono tracking-tight text-white">
+                          {progressPct}%
+                        </span>
+                        <span className="text-xs font-mono text-white/50 mt-1">
+                          {downloadedMb} / ~{totalMb} MB
+                        </span>
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {/* Testi dinamici sotto la progress bar */}
+                <div className="space-y-3 max-w-sm">
+                  <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-white/[0.06] border border-white/[0.12] text-xs font-medium text-white/90">
+                    {downloadError ? (
+                      <AlertCircle size={13} className="text-red-400" />
+                    ) : progressPct >= 100 ? (
+                      <CheckCircle2 size={13} className="text-emerald-400" />
+                    ) : (
+                      <Loader2 size={13} className="text-blue-400 animate-spin" />
+                    )}
+                    <span>
+                      {downloadError
+                        ? 'Errore durante il download dal repository'
+                        : activeInfo?.stage || (
+                            progressPct < 90
+                              ? `Download in corso (${queueIndex + 1}/${downloadQueue.length || 1})...`
+                              : 'Ottimizzazione pesi in locale...'
+                          )}
+                    </span>
+                  </div>
+
+                  <p className="text-xs text-white/50 leading-relaxed">
+                    {downloadError
+                      ? `${downloadError}`
+                      : 'I componenti risiedono interamente nella memoria locale del tuo computer.'}
+                  </p>
+
+                  {downloadError && (
+                    <div className="pt-2 flex items-center justify-center gap-3">
+                      <button
+                        type="button"
+                        onClick={handleRetryCurrent}
+                        className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold bg-blue-500 hover:bg-blue-600 text-white transition-colors cursor-pointer"
+                      >
+                        <RefreshCw size={12} />
+                        <span>Riprova</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void handleInterruptDownload();
+                        }}
+                        className="px-4 py-2 rounded-xl text-xs font-medium text-white/70 hover:text-white bg-white/10 hover:bg-white/15 transition-colors cursor-pointer"
+                      >
+                        Torna al Wizard
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
           </div>
         )}
 
@@ -873,24 +1107,38 @@ export default function Wizard() {
       )}>
         {isDownloadingScreen ? (
           <div>
-            <button
-              type="button"
-              onClick={handleInterruptDownload}
-              disabled={isCancelling}
-              className="flex items-center gap-2 px-6 py-2.5 rounded-2xl text-xs font-semibold bg-red-500/20 text-red-200 border border-red-500/35 hover:bg-red-500/30 transition-all cursor-pointer shadow-liquid-sm disabled:opacity-50"
-            >
-              {isCancelling ? (
-                <>
-                  <Loader2 size={14} className="animate-spin text-red-300" />
-                  <span>Interruzione in corso...</span>
-                </>
-              ) : (
-                <>
-                  <X size={14} className="text-red-300" />
-                  <span>Interrompi</span>
-                </>
-              )}
-            </button>
+            {isWaitingForBackend ? (
+              <button
+                type="button"
+                onClick={() => {
+                  setIsWaitingForBackend(false);
+                  setIsDownloadingScreen(false);
+                }}
+                className="flex items-center gap-2 px-6 py-2.5 rounded-2xl text-xs font-semibold bg-white/10 text-white/80 border border-white/15 hover:bg-white/20 transition-all cursor-pointer shadow-liquid-sm"
+              >
+                <ArrowLeft size={14} />
+                <span>Torna al Wizard</span>
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={handleInterruptDownload}
+                disabled={isCancelling}
+                className="flex items-center gap-2 px-6 py-2.5 rounded-2xl text-xs font-semibold bg-red-500/20 text-red-200 border border-red-500/35 hover:bg-red-500/30 transition-all cursor-pointer shadow-liquid-sm disabled:opacity-50"
+              >
+                {isCancelling ? (
+                  <>
+                    <Loader2 size={14} className="animate-spin text-red-300" />
+                    <span>Interruzione in corso...</span>
+                  </>
+                ) : (
+                  <>
+                    <X size={14} className="text-red-300" />
+                    <span>Interrompi</span>
+                  </>
+                )}
+              </button>
+            )}
           </div>
         ) : (
           <>

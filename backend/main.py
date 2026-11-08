@@ -45,6 +45,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional, Set, Tuple
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
+from fastapi.websockets import WebSocketState
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
@@ -197,6 +198,28 @@ def _persist_detected_questions(session: LiveSession) -> None:
         db_sess.close()
 
 
+_ws_locks: dict[WebSocket, asyncio.Lock] = {}
+
+
+async def _safe_send_json(ws: WebSocket, payload: dict) -> bool:
+    """Invia un payload JSON su WebSocket serializzando le scritture con un lock per socket."""
+    if getattr(ws, "client_state", None) != WebSocketState.CONNECTED:
+        _ws_locks.pop(ws, None)
+        return False
+    lock = _ws_locks.get(ws)
+    if lock is None:
+        lock = asyncio.Lock()
+        _ws_locks[ws] = lock
+    try:
+        async with lock:
+            await ws.send_json(payload)
+        return True
+    except Exception as e:
+        logger.debug(f"[WS] Errore safe_send_json: {e}")
+        _ws_locks.pop(ws, None)
+        return False
+
+
 async def _generate_flash_answer_task(session: LiveSession, question: str, question_id: str, ws: WebSocket):
     """Genera la risposta flash in 3 punti elenco con l'LLM locale e aggiorna il WebSocket."""
     try:
@@ -235,20 +258,18 @@ async def _generate_flash_answer_task(session: LiveSession, question: str, quest
             await asyncio.to_thread(_persist_detected_questions, session)
 
         # Invia l'aggiornamento definitivo via WebSocket
-        try:
-            await ws.send_json({
-                "type": "question_detected",
-                "payload": {
-                    "id": question_id,
-                    "question": question,
-                    "confidence": 0.98,
-                    "suggested_answer": flash_answer,
-                    "trigger": "TRIGGER_RAG",
-                }
-            })
+        sent = await _safe_send_json(ws, {
+            "type": "question_detected",
+            "payload": {
+                "id": question_id,
+                "question": question,
+                "confidence": 0.98,
+                "suggested_answer": flash_answer,
+                "trigger": "TRIGGER_RAG",
+            }
+        })
+        if sent:
             logger.info(f"[Flash Answer] Risposta generata e inviata via WS per '{question[:30]}...'")
-        except Exception:
-            pass
     except Exception as exc:
         logger.warning(f"[Flash Answer] Errore generazione risposta flash: {exc}")
 
@@ -367,13 +388,10 @@ async def _transcription_worker(session: LiveSession, ws: WebSocket):
         nonlocal current_status
         if current_status != new_status:
             current_status = new_status
-            try:
-                await ws.send_json({
-                    "type": "status",
-                    "payload": {"status": new_status}
-                })
-            except Exception:
-                pass
+            await _safe_send_json(ws, {
+                "type": "status",
+                "payload": {"status": new_status}
+            })
 
     try:
         while session.is_active:
@@ -419,19 +437,17 @@ async def _transcription_worker(session: LiveSession, ws: WebSocket):
                 logger.error(f"[WS Worker] Errore trascrizione: {t_err}")
                 text = ""
 
-            if text and session.is_active and not session.is_paused:
+            if text and session.is_active:
                 session.push_transcript(text)
                 elapsed = session.elapsed_seconds()
-                try:
-                    await ws.send_json({
-                        "type": "transcript_chunk",
-                        "payload": {
-                            "text": text,
-                            "elapsed": elapsed,
-                        }
-                    })
-                except Exception as ws_err:
-                    logger.debug(f"[WS Worker] Errore invio transcript_chunk: {ws_err}")
+                sent = await _safe_send_json(ws, {
+                    "type": "transcript_chunk",
+                    "payload": {
+                        "text": text,
+                        "elapsed": elapsed,
+                    }
+                })
+                if not sent:
                     break
 
                 # ── TRIGGER RAG & Rilevamento Domande Docente (SOLO su testo definitivo Whisper Large) ──
@@ -458,32 +474,80 @@ async def _announce_questions(session: LiveSession, text: str, ws: WebSocket) ->
             suggested_answer="Generazione risposta flash in corso...",
         )
         logger.info(f"TRIGGER_RAG: [Domanda del prof rilevata] {q}")
-        try:
-            await ws.send_json({
-                "type": "question_detected",
-                "payload": {
-                    "id": q_obj["id"],
-                    "question": q_obj["question"],
-                    "confidence": q_obj["confidence"],
-                    "suggested_answer": q_obj["suggestedAnswer"],
-                    "trigger": "TRIGGER_RAG",
-                }
-            })
-        except Exception as ws_err:
-            logger.debug(f"[WS Question] Errore invio WebSocket: {ws_err}")
+        await _safe_send_json(ws, {
+            "type": "question_detected",
+            "payload": {
+                "id": q_obj["id"],
+                "question": q_obj["question"],
+                "confidence": q_obj["confidence"],
+                "suggested_answer": q_obj["suggestedAnswer"],
+                "trigger": "TRIGGER_RAG",
+            }
+        })
 
         # Avvia risposta flash istantanea
         _spawn(_generate_flash_answer_task(session, q, q_obj["id"], ws))
 
 
+async def _post_lecture_pipeline(
+    subject_id: int,
+    lecture_id: int,
+    audio_path: Optional[str],
+    full_transcript: str,
+    user_fmt: str,
+) -> None:
+    """Pipeline asincrona post-lezione eseguita in sequenza ordinata per evitare race condition."""
+    # 1. Calcola i timestamp sincronizzati mentre Whisper è ancora in memoria
+    if audio_path and os.path.exists(audio_path) and full_transcript and len(full_transcript.strip()) > 30:
+        try:
+            from routers.lectures import compute_and_cache_lecture_timestamps
+            await asyncio.to_thread(compute_and_cache_lecture_timestamps, lecture_id)
+        except Exception as exc:
+            logger.warning(f"[WS Pipeline] Errore calcolo timestamps lezione {lecture_id}: {exc}")
+
+    # 2. Comprime in M4A se richiesto, rinomina eventuale cache timestamps e aggiorna DB
+    if audio_path and user_fmt == "m4a" and audio_path.endswith(".wav") and os.path.exists(audio_path):
+        try:
+            from audio_engine import compress_wav_to_m4a
+            m4a_path = await asyncio.to_thread(compress_wav_to_m4a, audio_path, 48000, True)
+            if m4a_path and m4a_path != audio_path and os.path.exists(m4a_path):
+                with SessionLocal() as db_sess:
+                    lec = db_sess.query(Lecture).filter(Lecture.id == lecture_id).first()
+                    if lec:
+                        lec.audio_path = m4a_path
+                        db_sess.commit()
+                # Rinomina la cache timestamps dal wav al m4a se esiste
+                old_ts = audio_path + ".timestamps.json"
+                new_ts = m4a_path + ".timestamps.json"
+                if os.path.exists(old_ts) and not os.path.exists(new_ts):
+                    try:
+                        os.replace(old_ts, new_ts)
+                    except Exception:
+                        pass
+                logger.info(f"[WS Pipeline] Audio lezione {lecture_id} compresso M4A salvato nel DB: {m4a_path}")
+        except Exception as exc:
+            logger.warning(f"[WS Pipeline] Compressione M4A non riuscita per lezione {lecture_id}: {exc}")
+
+    # 3. Ora che Whisper ha terminato e i file sono pronti, genera capitoli con LLM + RAG LanceDB
+    if full_transcript and len(full_transcript.strip()) > 30:
+        try:
+            await _post_lecture_summary_and_index(
+                subject_id=subject_id,
+                lecture_id=lecture_id,
+                full_transcript=full_transcript,
+            )
+        except Exception as exc:
+            logger.warning(f"[WS Pipeline] Errore riassunto/RAG per lezione {lecture_id}: {exc}")
+
+
 async def _finalize_session(session: LiveSession, subject_id: int) -> Tuple[float, Optional[str]]:
     """
-    Chiude una sessione live in modo idempotente:
-    1. ferma worker e microfono ed esporta il WAV,
-    2. trascrive i blocchi vocali ancora in coda (l'ultima frase prima dello stop),
+    Chiude una sessione live in modo idempotente e reattivo:
+    1. ferma worker ed esporta subito il file WAV (istantaneo),
+    2. trascrive al più un eventuale ultimo blocco vocale rimasto in coda con timeout stretto,
     3. rimuove la sessione dal registry e libera la memoria del transcriber,
-    4. salva trascrizione, durata, audio e domande su SQLite,
-    5. avvia in background la generazione del capitolo e l'indicizzazione.
+    4. salva trascrizione, durata, audio e domande su SQLite immediatamente,
+    5. delega compressione M4A, generazione capitolo e timestamp in una pipeline sequenziale in background.
     """
     if session.finalized:
         return session.elapsed_seconds(), None
@@ -495,30 +559,34 @@ async def _finalize_session(session: LiveSession, subject_id: int) -> Tuple[floa
     task = session.transcription_task
     if task and not task.done():
         task.cancel()
-        await asyncio.wait({task}, timeout=10)
+        try:
+            await asyncio.wait({task}, timeout=2.0)
+        except Exception:
+            pass
 
     audio_path: Optional[str] = None
     try:
         if session.audio_engine.is_running:
-            # stop() svuota anche l'ultimo blocco vocale nella speech_queue
-            audio_path = await asyncio.to_thread(session.audio_engine.stop)
+            # stop(audio_format="wav") è istantaneo (scrittura PCM su file senza codec blocking)
+            audio_path = await asyncio.wait_for(
+                asyncio.to_thread(session.audio_engine.stop, audio_format="wav"),
+                timeout=8.0,
+            )
     except Exception as exc:
         logger.error(f"[WS] Errore arresto AudioEngine: {exc}")
 
-    # Trascrive ciò che è rimasto in coda (altrimenti la fine della lezione andrebbe persa)
+    # Trascrive al più l'ultimo frammento residuo con timeout limitato
     if not session.transcriber.mock_mode:
-        while True:
+        try:
+            chunk = session.audio_engine.speech_queue.get_nowait()
             try:
-                chunk = session.audio_engine.speech_queue.get_nowait()
-            except queue.Empty:
-                break
-            try:
-                tail = await session.transcriber.transcribe(chunk)
+                tail = await asyncio.wait_for(session.transcriber.transcribe(chunk), timeout=3.0)
+                if tail:
+                    session.push_transcript(tail)
             except Exception as exc:
-                logger.error(f"[WS] Errore trascrizione coda finale: {exc}")
-                break
-            if tail:
-                session.push_transcript(tail)
+                logger.debug(f"[WS] Coda finale non completata in tempo: {exc}")
+        except queue.Empty:
+            pass
 
     # Registry + rilascio memoria transcriber (evita doppia invocazione di stop su audio_engine)
     try:
@@ -550,17 +618,20 @@ async def _finalize_session(session: LiveSession, subject_id: int) -> Tuple[floa
     finally:
         db_sess.close()
 
-    if full_transcript and len(full_transcript.strip()) > 30:
-        _spawn(_post_lecture_summary_and_index(
-            subject_id=subject_id,
-            lecture_id=session.lecture_id,
-            full_transcript=full_transcript,
-        ))
+    # Avvia la pipeline post-lezione in background (non blocca la risposta WebSocket dello stop)
+    try:
+        from config import load_settings
+        user_fmt = load_settings().get("audio_format", "m4a")
+    except Exception:
+        user_fmt = "m4a"
 
-    # Pre-calcola subito i timestamp sincronizzati parola per parola a fine registrazione
-    if session.lecture_id:
-        from routers.lectures import compute_and_cache_lecture_timestamps
-        _spawn(asyncio.to_thread(compute_and_cache_lecture_timestamps, session.lecture_id))
+    _spawn(_post_lecture_pipeline(
+        subject_id=subject_id,
+        lecture_id=session.lecture_id,
+        audio_path=audio_path,
+        full_transcript=full_transcript,
+        user_fmt=user_fmt,
+    ))
 
     logger.info(
         f"[WS] Sessione chiusa: lezione={session.lecture_id}, durata={duration:.1f}s, "
@@ -574,7 +645,7 @@ async def _finalize_session(session: LiveSession, subject_id: int) -> Tuple[floa
 # Origini ammesse per il WebSocket (il CORS non si applica ai WebSocket):
 # dev server Vite, Tauri macOS/Linux (tauri://localhost) e Tauri Windows (http(s)://tauri.localhost)
 _ALLOWED_WS_ORIGIN = re.compile(
-    r"^(https?://(localhost|127\.0\.0\.1)(:\d+)?|tauri://localhost|https?://tauri\.localhost)$"
+    r"^(null|tauri://localhost|https?://tauri\.localhost(:\d+)?/?|https?://(localhost|127\.0\.0\.1)(:\d+)?/?)$"
 )
 
 
@@ -611,7 +682,7 @@ async def live_lecture_ws(
       { "type": "error",            "payload": { "message": "..." } }
     """
     origin = websocket.headers.get("origin")
-    if origin and not _ALLOWED_WS_ORIGIN.match(origin):
+    if origin and origin != "null" and not _ALLOWED_WS_ORIGIN.match(origin):
         logger.warning(f"[WS] Connessione rifiutata da origine non ammessa: {origin}")
         await websocket.close(code=1008)
         return
@@ -620,7 +691,7 @@ async def live_lecture_ws(
     logger.info(f"[WS] Connessione live aperta per materia {subject_id}")
 
     async def send_error(message: str) -> None:
-        await websocket.send_json({"type": "error", "payload": {"message": message}})
+        await _safe_send_json(websocket, {"type": "error", "payload": {"message": message}})
 
     session: LiveSession | None = None
     try:
@@ -645,6 +716,16 @@ async def live_lecture_ws(
                 title = str(payload.get("title") or "Nuova Lezione")[:255]
                 lecture_id = payload.get("lecture_id")
 
+                # Una sessione già aperta (su questo socket o su un socket precedente rimasto appeso)
+                # viene prima salvata e chiusa all'esterno del blocco DB per evitare lock contention SQLite.
+                if session is not None:
+                    await _finalize_session(session, subject_id)
+                    session = None
+                stale = get_session(subject_id)
+                if stale is not None:
+                    logger.warning(f"[WS] Sessione precedente ancora attiva per materia {subject_id}: la salvo e la chiudo.")
+                    await _finalize_session(stale, subject_id)
+
                 from database import Lecture as LectureModel, Subject
                 with SessionLocal() as db:
                     subject = db.query(Subject).filter(Subject.id == subject_id).first()
@@ -668,16 +749,6 @@ async def live_lecture_ws(
                             await send_error(f"Lezione {lecture_id} non trovata per la materia {subject_id}")
                             continue
 
-                    # Una sessione già aperta (su questo socket o su un socket precedente rimasto appeso)
-                    # viene prima salvata e chiusa, mai scartata.
-                    if session is not None:
-                        await _finalize_session(session, subject_id)
-                        session = None
-                    stale = get_session(subject_id)
-                    if stale is not None:
-                        logger.warning(f"[WS] Sessione precedente ancora attiva per materia {subject_id}: la salvo e la chiudo.")
-                        await _finalize_session(stale, subject_id)
-
                     if lecture_id is None:
                         # Crea una nuova Lecture nel DB se non fornita
                         lecture = LectureModel(subject_id=subject_id, title=title)
@@ -699,8 +770,9 @@ async def live_lecture_ws(
 
                 mock_transcriber = (model == "mock_mode")
 
-                # Avvia sessione (AudioEngine in RAM + Transcriber)
-                session = start_session(
+                # Avvia sessione in thread pool per non bloccare l'event loop asyncio
+                session = await asyncio.to_thread(
+                    start_session,
                     subject_id=subject_id,
                     lecture_id=lecture_id,
                     whisper_keywords=whisper_keywords,
@@ -713,7 +785,7 @@ async def live_lecture_ws(
                     f"modello={model}, VAD={vad_level}"
                 )
 
-                await websocket.send_json({
+                await _safe_send_json(websocket, {
                     "type": "started",
                     "payload": {
                         "lecture_id": lecture_id,
@@ -734,7 +806,7 @@ async def live_lecture_ws(
                 text = str(payload.get("text") or "")
                 if text:
                     session.push_chunk(text)
-                    await websocket.send_json({
+                    await _safe_send_json(websocket, {
                         "type": "transcript_chunk",
                         "payload": {
                             "text": text,
@@ -761,7 +833,7 @@ async def live_lecture_ws(
                     db.refresh(bookmark)
                     bm_id = bookmark.id
                 logger.info(f"[WS] Segnalibro salvato @ {ts:.1f}s: '{note}'")
-                await websocket.send_json({
+                await _safe_send_json(websocket, {
                     "type": "bookmark_saved",
                     "payload": {"bookmark_id": bm_id, "timestamp": ts, "note": note}
                 })
@@ -793,7 +865,7 @@ async def live_lecture_ws(
                 try:
                     async for token in stream_chat_response(query=query, context=combined_context, model_id=llm_model):
                         full_answer += token
-                        await websocket.send_json({
+                        await _safe_send_json(websocket, {
                             "type": "chat_chunk",
                             "payload": {
                                 "chunk": token,
@@ -806,7 +878,7 @@ async def live_lecture_ws(
                     logger.error(f"[WS Chat] Errore streaming: {c_err}")
                     full_answer = f"Errore durante l'elaborazione della risposta: {c_err}"
 
-                await websocket.send_json({
+                await _safe_send_json(websocket, {
                     "type": "chat_response",
                     "payload": {
                         "answer": full_answer,
@@ -836,7 +908,7 @@ async def live_lecture_ws(
                             refined_text = await session.transcriber.transcribe(last_audio)
                             if refined_text:
                                 session.push_transcript(refined_text)
-                                await websocket.send_json({
+                                await _safe_send_json(websocket, {
                                     "type": "transcript_chunk",
                                     "payload": {
                                         "text": refined_text,
@@ -851,39 +923,30 @@ async def live_lecture_ws(
                     # 3. Stop motori (Calore Zero) & Svuotamento cache (Deep Sleep)
                     session.transcriber.release_metal_cache()
                     logger.info("[WS] Pausa completata: microfono chiuso, modelli a riposo, cache liberata")
-                    try:
-                        await websocket.send_json({"type": "paused"})
-                    except Exception:
-                        pass
+                    await _safe_send_json(websocket, {"type": "paused"})
 
             # ── RESUME (Ripresa registrazione da pausa) ────────────────────────
             elif msg_type == "resume":
                 if session and session.is_paused:
                     session.resume()
                     logger.info(f"[WS] Registrazione RIPRESA per lezione {session.lecture_id}: microfono e modelli riattivati.")
-                    try:
-                        await websocket.send_json({"type": "resumed"})
-                    except Exception:
-                        pass
+                    await _safe_send_json(websocket, {"type": "resumed"})
 
             # ── STOP ───────────────────────────────────────────────────────────
             elif msg_type == "stop":
                 if not session:
                     continue
-                duration, audio_path = await _finalize_session(session, subject_id)
+                duration, audio_path = await asyncio.shield(_finalize_session(session, subject_id))
                 total_chunks = len(session.full_transcript)
                 session = None
-                try:
-                    await websocket.send_json({
-                        "type": "stopped",
-                        "payload": {
-                            "duration": duration,
-                            "total_chunks": total_chunks,
-                            "audio_path": audio_path,
-                        }
-                    })
-                except Exception:
-                    pass
+                await _safe_send_json(websocket, {
+                    "type": "stopped",
+                    "payload": {
+                        "duration": duration,
+                        "total_chunks": total_chunks,
+                        "audio_path": audio_path,
+                    }
+                })
                 break
 
             else:
@@ -898,6 +961,7 @@ async def live_lecture_ws(
         except Exception:
             pass
     finally:
+        _ws_locks.pop(websocket, None)
         # Qualsiasi uscita (disconnessione, errore, crash) salva la lezione e libera il microfono
         # shield: anche se questo handler viene cancellato (shutdown, client sparito) il salvataggio termina
         if session is not None and not session.finalized:
@@ -1094,18 +1158,18 @@ def _prepare_course_context(subject_id: int, query: str, db: Session):
     clear_metal_cache()
 
     # Domande rilevate a lezione dal docente (Whisper Question Detector)
-    lectures = db.query(Lecture).filter(Lecture.subject_id == subject_id).all()
+    lectures = db.query(Lecture.id, Lecture.title, Lecture.detected_questions).filter(Lecture.subject_id == subject_id).all()
     all_detected_questions = []
-    for lec in lectures:
-        if lec.detected_questions:
+    for lec_id, lec_title, lec_dq in lectures:
+        if lec_dq:
             try:
-                q_list = json.loads(lec.detected_questions)
+                q_list = json.loads(lec_dq)
                 if isinstance(q_list, list):
                     for q_obj in q_list:
                         q_text = q_obj.get("question") if isinstance(q_obj, dict) else str(q_obj)
                         if q_text:
                             all_detected_questions.append({
-                                "lecture_title": lec.title or f"Lezione #{lec.id}",
+                                "lecture_title": lec_title or f"Lezione #{lec_id}",
                                 "question": q_text,
                                 "suggested_answer": str(q_obj.get("suggestedAnswer") or "") if isinstance(q_obj, dict) else ""
                             })

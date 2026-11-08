@@ -149,7 +149,7 @@ async def generate_quiz_endpoint(
             system_prompt,
             user_prompt,
             model_id=llm_model,
-            max_tokens=650 if n_q <= 5 else 130 * n_q,
+            max_tokens=max(900, 240 * n_q),
             assistant_prefix="```json\n[",
             task_label=f"Quiz: {subject.name}",
             kv_bits=4,
@@ -184,18 +184,24 @@ async def generate_quiz_endpoint(
                 else:
                     clean_json += "]"
 
+        # Sanitizza caratteri escape non validi (formule matematiche / LaTeX come \alpha, \frac)
+        sanitized_json = re.sub(r'\\(?![/"bfnrtu])', r'\\\\', clean_json)
+        sanitized_json = re.sub(r',\s*([}\]])', r'\1', sanitized_json)
+
         questions = []
         try:
-            questions = json.loads(clean_json)
+            questions = json.loads(sanitized_json)
         except Exception:
-            # Tentativo di recupero con regex se json.loads fallisce su piccoli errori di sintassi
-            import re
-            chunks = re.findall(r'\{\s*"id"[^}]+}', clean_json, re.DOTALL)
-            for c in chunks:
-                try:
-                    questions.append(json.loads(c))
-                except Exception:
-                    pass
+            try:
+                questions = json.loads(clean_json)
+            except Exception:
+                # Tentativo di recupero con regex se json.loads fallisce su piccoli errori di sintassi
+                chunks = re.findall(r'\{\s*"id"[^}]+}', sanitized_json, re.DOTALL)
+                for c in chunks:
+                    try:
+                        questions.append(json.loads(c))
+                    except Exception:
+                        pass
 
         if not isinstance(questions, list) or len(questions) == 0:
             raise ValueError(f"Output JSON non parsabile: {clean_json[:120]}")
@@ -354,29 +360,41 @@ async def evaluate_oral_answer_endpoint(
             detail="Modello LLM non installato. Apri le Impostazioni per scaricarlo."
         )
 
-    # 1. Salva file audio temporaneo
+    # 1. Salva file audio temporaneo e trascrivi
     temp_dir = tempfile.gettempdir()
     ext = os.path.splitext(audio.filename or "")[1].lower()
     if ext not in (".wav", ".webm", ".m4a", ".mp4", ".ogg", ".mp3"):
         ext = ".wav"
     temp_audio_path = os.path.join(temp_dir, f"oral_answer_{uuid.uuid4().hex[:8]}{ext}")
-    await asyncio.to_thread(_save_upload, audio, temp_audio_path)
 
-    # 2. Trascrizione con mlx-whisper (Greedy decoding, language 'it')
     student_transcript = ""
+    whisper_error = None
     try:
+        await asyncio.to_thread(_save_upload, audio, temp_audio_path)
         from transcriber import transcribe_file
         logger.info("[Oral Evaluation] Trascrizione vocale studente...")
         student_transcript, _dur = await asyncio.to_thread(transcribe_file, temp_audio_path, "it")
         student_transcript = (student_transcript or "").strip()
     except Exception as exc:
         logger.error(f"[Oral Evaluation] Errore trascrizione Whisper: {exc}")
+        whisper_error = str(exc)
     finally:
         if os.path.exists(temp_audio_path):
             try:
                 os.remove(temp_audio_path)
             except Exception:
                 pass
+
+    if whisper_error:
+        return {
+            "status": "error",
+            "student_transcript": "",
+            "grade": "N.C.",
+            "score_num": 0,
+            "good_points": "Errore durante l'elaborazione vocale.",
+            "missing_or_errors": f"Impossibile elaborare l'audio: {whisper_error}. Verifica il modello Whisper nelle Impostazioni.",
+            "ideal_formulation": "Riprova dopo aver verificato lo stato dei modelli locali.",
+        }
 
     if not student_transcript:
         return {
@@ -388,6 +406,14 @@ async def evaluate_oral_answer_endpoint(
             "missing_or_errors": "Assicurati che il microfono sia attivo e autorizzato nelle impostazioni di sistema.",
             "ideal_formulation": "Riprova formulando chiaramente a voce la tua spiegazione.",
         }
+
+    # 2. Scarica Whisper e libera cache unificata prima dell'inferenza LLM per evitare conflitti RAM su 8GB
+    try:
+        from llm_engine import unload_whisper, clear_metal_cache
+        unload_whisper(force=True)
+        clear_metal_cache()
+    except Exception:
+        pass
 
     # 3. Recupera contesto ufficiale da LanceDB e SQLite
     official_context = await asyncio.to_thread(
@@ -438,7 +464,7 @@ Fornisci ora la scheda di valutazione in JSON:"""
             system_prompt,
             user_prompt,
             model_id=llm_model,
-            max_tokens=650,
+            max_tokens=1000,
             assistant_prefix="```json\n",
             task_label=f"Valutazione Orale: {subject.name}",
             kv_bits=4,
@@ -456,11 +482,20 @@ Fornisci ora la scheda di valutazione in JSON:"""
         if start_idx != -1 and end_idx != -1:
             clean_json = clean_json[start_idx : end_idx + 1]
 
-        eval_data = json.loads(clean_json)
+        # Sanitizza caratteri escape non validi
+        clean_json_sanitized = re.sub(r'\\(?![/"bfnrtu])', r'\\\\', clean_json)
+        clean_json_sanitized = re.sub(r',\s*([}\]])', r'\1', clean_json_sanitized)
+
+        try:
+            eval_data = json.loads(clean_json_sanitized)
+        except Exception:
+            eval_data = json.loads(clean_json)
+
         if not isinstance(eval_data, dict):
             raise ValueError("Valutazione non in formato oggetto JSON")
+        raw_score = eval_data.get("score_num", 25)
         try:
-            score = max(0, min(30, int(eval_data.get("score_num", 25))))
+            score = max(0, min(30, int(round(float(str(raw_score))))))
         except (TypeError, ValueError):
             score = 25
         eval_data["score_num"] = score

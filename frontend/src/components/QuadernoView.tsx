@@ -330,11 +330,22 @@ export default function QuadernoView({
     } else {
       setBookmarks([]);
     }
+    if (audioRef.current) {
+      try {
+        audioRef.current.pause();
+        audioRef.current.currentTime = 0;
+      } catch {}
+    }
     setIsPlaying(false);
     setCurrentTime(0);
     setAudioDuration(selectedLecture?.duration_seconds || 0);
     return () => {
       alive = false;
+      if (audioRef.current) {
+        try {
+          audioRef.current.pause();
+        } catch {}
+      }
     };
   }, [selectedLecture?.id]);
 
@@ -365,8 +376,12 @@ export default function QuadernoView({
 
   const handleSeekAudio = (seconds: number) => {
     if (!selectedLecture?.audio_path || !audioRef.current) return;
-    audioRef.current.currentTime = Math.max(0, seconds);
-    setCurrentTime(seconds);
+    const maxDur = (audioDuration && !isNaN(audioDuration) && audioDuration > 0)
+      ? audioDuration
+      : (audioRef.current.duration > 0 ? audioRef.current.duration : 0);
+    const target = maxDur > 0 ? Math.max(0, Math.min(maxDur, seconds)) : Math.max(0, seconds);
+    audioRef.current.currentTime = target;
+    setCurrentTime(target);
     if (!isPlaying) {
       audioRef.current
         .play()
@@ -407,7 +422,9 @@ export default function QuadernoView({
 
   const handleSkipAudio = (offsetSeconds: number) => {
     if (!selectedLecture?.audio_path || !audioRef.current) return;
-    const maxDur = audioDuration || (audioRef.current.duration > 0 ? audioRef.current.duration : 99999);
+    const maxDur = (audioDuration && !isNaN(audioDuration) && audioDuration > 0)
+      ? audioDuration
+      : (audioRef.current.duration > 0 ? audioRef.current.duration : 99999);
     const newTime = Math.max(0, Math.min(maxDur, (audioRef.current.currentTime || 0) + offsetSeconds));
     audioRef.current.currentTime = newTime;
     setCurrentTime(newTime);
@@ -1296,6 +1313,10 @@ export default function QuadernoView({
                   onPlay={() => setIsPlaying(true)}
                   onPause={() => setIsPlaying(false)}
                   onEnded={() => setIsPlaying(false)}
+                  onError={() => {
+                    setIsPlaying(false);
+                    console.warn('[Audio] Errore caricamento sorgente audio.');
+                  }}
                 />
 
                 {/* Play / Pause button — Apple Music circular button */}

@@ -18,6 +18,7 @@ import platform
 import shutil
 import stat
 import sys
+import threading
 import time
 from typing import Iterable, List, Optional
 
@@ -204,10 +205,31 @@ def snapshot_is_complete(snapshot_dir: Optional[str], required: Iterable[str]) -
     return True
 
 
-def dir_size_mb(path: str) -> float:
-    """Dimensione su disco di una directory (dedup per inode: blob HF + symlink contati una volta)."""
+_size_cache: dict[str, tuple[float, float]] = {}
+_size_cache_lock = threading.Lock()
+
+
+def invalidate_dir_size_cache(path: Optional[str] = None) -> None:
+    """Invalida la cache delle dimensioni su disco."""
+    with _size_cache_lock:
+        if path:
+            _size_cache.pop(path, None)
+        else:
+            _size_cache.clear()
+
+
+def dir_size_mb(path: str, max_age_seconds: float = 6.0) -> float:
+    """Dimensione su disco di una directory (dedup per inode: blob HF + symlink contati una volta). Cache breve per evitare disk thrashing."""
     if not os.path.exists(path):
+        invalidate_dir_size_cache(path)
         return 0.0
+    now = time.time()
+    with _size_cache_lock:
+        if path in _size_cache:
+            ts, sz = _size_cache[path]
+            if now - ts < max_age_seconds:
+                return sz
+
     total = 0
     seen = set()
     for dirpath, _, filenames in os.walk(path):
@@ -221,7 +243,10 @@ def dir_size_mb(path: str) -> float:
                     total += st.st_size
             except OSError:
                 pass
-    return round(total / (1024 * 1024), 1)
+    sz = round(total / (1024 * 1024), 1)
+    with _size_cache_lock:
+        _size_cache[path] = (now, sz)
+    return sz
 
 
 # ── Rimozione file robusta (Windows: file bloccati / read-only / mmap) ───────
@@ -241,6 +266,7 @@ def safe_rmtree(path: str, retries: int = 5, delay: float = 0.3) -> bool:
     """
     for attempt in range(retries):
         if not os.path.exists(path):
+            invalidate_dir_size_cache(path)
             return True
         try:
             if sys.version_info >= (3, 12):
@@ -250,9 +276,13 @@ def safe_rmtree(path: str, retries: int = 5, delay: float = 0.3) -> bool:
         except Exception as exc:
             logger.debug(f"[Platform] rmtree tentativo {attempt + 1} fallito per {path}: {exc}")
         if not os.path.exists(path):
+            invalidate_dir_size_cache(path)
             return True
         import gc
         gc.collect()
         time.sleep(delay * (attempt + 1))
-    return not os.path.exists(path)
+    success = not os.path.exists(path)
+    if success:
+        invalidate_dir_size_cache(path)
+    return success
 

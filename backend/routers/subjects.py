@@ -105,8 +105,19 @@ def create_subject(payload: SubjectCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(subject)
 
-    # Genera automaticamente il file InfoCorso.md
-    ensure_infocorso_file(subject)
+    # Genera automaticamente il file InfoCorso.md e indicizzalo per il RAG
+    info_content = ensure_infocorso_file(subject)
+    try:
+        from rag import index_material_document
+        index_material_document(
+            subject_id=subject.id,
+            material_id=f"infocorso-{subject.id}",
+            title="InfoCorso.md",
+            content=info_content,
+            source_type="infocorso",
+        )
+    except Exception as exc:
+        logger.debug(f"[Subjects] Indicizzazione InfoCorso: {exc}")
 
     out = SubjectOut.model_validate(subject)
     out.lecture_count = 0
@@ -120,7 +131,7 @@ def get_subject(subject_id: int, db: Session = Depends(get_db)):
     if not subject:
         raise HTTPException(status_code=404, detail="Materia non trovata.")
     out = SubjectOut.model_validate(subject)
-    out.lecture_count = len(subject.lectures)
+    out.lecture_count = db.query(func.count(Lecture.id)).filter(Lecture.subject_id == subject_id).scalar() or 0
     return out
 
 
@@ -144,11 +155,22 @@ def update_subject(subject_id: int, payload: SubjectUpdate, db: Session = Depend
     db.commit()
     db.refresh(subject)
 
-    # Aggiorna InfoCorso.md con i nuovi dati
-    ensure_infocorso_file(subject)
+    # Aggiorna InfoCorso.md con i nuovi dati e aggiorna i vettori
+    info_content = ensure_infocorso_file(subject)
+    try:
+        from rag import index_material_document
+        index_material_document(
+            subject_id=subject.id,
+            material_id=f"infocorso-{subject.id}",
+            title="InfoCorso.md",
+            content=info_content,
+            source_type="infocorso",
+        )
+    except Exception as exc:
+        logger.debug(f"[Subjects] Indicizzazione InfoCorso update: {exc}")
 
     out = SubjectOut.model_validate(subject)
-    out.lecture_count = len(subject.lectures)
+    out.lecture_count = db.query(func.count(Lecture.id)).filter(Lecture.subject_id == subject_id).scalar() or 0
     return out
 
 
@@ -212,9 +234,6 @@ def delete_subject(subject_id: int, db: Session = Depends(get_db)):
     # 4. Elimina la materia da SQLite
     db.delete(subject)
     db.commit()
-
-    # 5. Compattazione SQLite
-    vacuum_sqlite()
 
 
 @router.get("/{subject_id}/materials", response_model=List[MaterialOut])
@@ -296,7 +315,19 @@ def list_materials(subject_id: int, db: Session = Depends(get_db)):
                         import pymupdf
                         pdoc = pymupdf.open(fpath)
                         page_count = len(pdoc)
+                        text_chunks = []
+                        for page in pdoc:
+                            t = page.get_text()
+                            if t:
+                                text_chunks.append(t)
                         pdoc.close()
+                        if text_chunks:
+                            doc_content = "\n".join(text_chunks)
+                            try:
+                                with open(meta_path, "w", encoding="utf-8") as mf:
+                                    json.dump({"page_count": page_count, "content": doc_content}, mf, ensure_ascii=False)
+                            except Exception:
+                                pass
                     except Exception:
                         pass
                 elif fname.lower().endswith((".txt", ".md")):

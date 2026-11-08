@@ -103,3 +103,47 @@ def test_compress_wav_to_m4a_reduces_size_and_decodes(tmp_path):
     decoded = _decode_audio_file(m4a_path)
     assert abs(len(decoded) - 32000) < 1500
 
+
+def test_audio_engine_stereo_downmix_and_stop():
+    import numpy as np
+    from audio_engine import AudioEngine
+
+    engine = AudioEngine(lecture_id=999)
+    engine.is_running = True
+    engine.is_paused = False
+
+    # Simula 10 frame stereo da 480 campioni
+    stereo_frame = np.ones((480, 2), dtype=np.int16) * 1000
+    for _ in range(10):
+        engine._raw_stream_callback(stereo_frame, 480, None, None)
+
+    assert engine._recorded_bytes == 480 * 2 * 10
+
+    # Stop ed esportazione WAV
+    wav_path = engine.stop(audio_format="wav")
+    try:
+        assert os.path.exists(wav_path)
+        assert wav_path.endswith(".wav")
+        assert os.path.getsize(wav_path) >= engine._recorded_bytes + 44
+    finally:
+        if os.path.exists(wav_path):
+            os.remove(wav_path)
+
+
+def test_ws_origin_regex():
+    from main import _ALLOWED_WS_ORIGIN
+
+    assert _ALLOWED_WS_ORIGIN.match("null")
+    assert _ALLOWED_WS_ORIGIN.match("tauri://localhost")
+    assert _ALLOWED_WS_ORIGIN.match("http://tauri.localhost")
+    assert _ALLOWED_WS_ORIGIN.match("http://tauri.localhost/")
+    assert _ALLOWED_WS_ORIGIN.match("https://tauri.localhost")
+    assert _ALLOWED_WS_ORIGIN.match("https://tauri.localhost/")
+    assert _ALLOWED_WS_ORIGIN.match("http://localhost:1420")
+    assert _ALLOWED_WS_ORIGIN.match("http://localhost:1420/")
+    assert _ALLOWED_WS_ORIGIN.match("http://127.0.0.1:1420")
+    assert _ALLOWED_WS_ORIGIN.match("http://127.0.0.1:1420/")
+    assert not _ALLOWED_WS_ORIGIN.match("http://evil.com")
+    assert not _ALLOWED_WS_ORIGIN.match("http://localhost.evil.com")
+
+

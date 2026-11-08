@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { api } from './api';
-import { isTauri } from './tauri';
+import { isTauri, acquireWakeLock, releaseWakeLock } from './tauri';
 import { useSettings } from './SettingsContext';
 import type { 
   ChatMessage, DetectedQuestion, Lecture, Subject, 
@@ -28,8 +28,8 @@ function normalizeQuestion(text: string): string {
   return text.toLowerCase().replace(/[\?\.\,\s]/g, '');
 }
 
-// Tempo massimo di attesa del messaggio 'stopped' dal backend dopo l'invio di 'stop' (Bug B8 fix)
-const STOP_ACK_TIMEOUT_MS = 45000;
+// Tempo massimo di attesa del messaggio 'stopped' dal backend dopo l'invio di 'stop'
+const STOP_ACK_TIMEOUT_MS = 12000;
 
 interface UseLiveSessionProps {
   subject: Subject;
@@ -104,20 +104,27 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
     deletedQuestionTextsRef.current = new Set();
     activeChatQueryRef.current = null;
     cancelledChatResponsesRef.current = 0;
+    return () => {
+      void releaseWakeLock();
+    };
   }, [lecture?.id]);
 
   // ── Handle incoming WS messages ─────────────────────────────────────────────
   const handleWSMessage = useCallback((msg: WSMessage) => {
     switch (msg.type) {
-      case 'started':
+      case 'started': {
+        void acquireWakeLock(`SbobinAI - Registrazione lezione "${lecture?.title || subject.name}" in corso`);
+        const startedAtSec = (msg.payload?.session_started_at as number) || (Date.now() / 1000);
         if (timerRef.current) clearInterval(timerRef.current);
         timerRef.current = setInterval(() => {
           if (!isPausedRef.current) {
-            elapsedRef.current += 1;
-            setElapsed(elapsedRef.current);
+            const currentSec = Math.max(1, Math.round(Date.now() / 1000 - startedAtSec));
+            elapsedRef.current = currentSec;
+            setElapsed(currentSec);
           }
         }, 1000);
         break;
+      }
 
       case 'status': {
         const st = (msg.payload.status as 'idle' | 'listening' | 'transcribing') || 'idle';
@@ -294,6 +301,7 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
         break;
 
       case 'stopped':
+        void releaseWakeLock();
         stopTimer();
         setAudioStatus('idle');
         if (stopResolverRef.current) {
@@ -378,6 +386,7 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
     };
 
     return () => {
+      void releaseWakeLock();
       if (chatChunkTimerRef.current) {
         clearTimeout(chatChunkTimerRef.current);
         chatChunkTimerRef.current = null;
@@ -409,42 +418,50 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
     if (isStoppingRef.current) return;
     isStoppingRef.current = true;
     setIsStopping(true);
+    void releaseWakeLock();
     stopTimer();
 
-    // Attende la conferma 'stopped' (il backend ha salvato trascrizione e audio) oppure il timeout
-    let acknowledged = false;
-    const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      try {
-        const ackPromise = new Promise<boolean>((resolve) => {
-          const timeout = setTimeout(() => resolve(false), STOP_ACK_TIMEOUT_MS);
-          stopResolverRef.current = (ack: boolean) => {
-            clearTimeout(timeout);
-            resolve(ack);
-          };
-        });
-        ws.send(JSON.stringify({ type: 'stop', payload: {} }));
-        acknowledged = await ackPromise;
-      } catch (err) {
-        console.warn('Errore invio stop WebSocket:', err);
-      } finally {
-        stopResolverRef.current = null;
+    try {
+      // Attende la conferma 'stopped' (il backend ha salvato trascrizione e audio) oppure il timeout
+      let acknowledged = false;
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try {
+          const ackPromise = new Promise<boolean>((resolve) => {
+            const timeout = setTimeout(() => resolve(false), STOP_ACK_TIMEOUT_MS);
+            stopResolverRef.current = (ack: boolean) => {
+              clearTimeout(timeout);
+              resolve(ack);
+            };
+          });
+          ws.send(JSON.stringify({ type: 'stop', payload: {} }));
+          acknowledged = await ackPromise;
+        } catch (err) {
+          console.warn('Errore invio stop WebSocket:', err);
+        } finally {
+          stopResolverRef.current = null;
+        }
       }
-    }
 
-    // Fallback: se il backend non ha confermato, salva almeno durata e domande lato client
-    if (!acknowledged && lecture) {
-      try {
-        await api.lectures.update(lecture.id, {
-          duration_seconds: elapsedRef.current,
-          detected_questions: detectedQuestions.length > 0 ? JSON.stringify(detectedQuestions) : null,
-        });
-      } catch {
-        // ignore
+      // Fallback: se il backend non ha confermato, salva almeno durata, testo parziale e domande lato client
+      if (!acknowledged && lecture) {
+        try {
+          const rawText = chunks.map((c) => c.text).join(' ').trim();
+          await api.lectures.update(lecture.id, {
+            duration_seconds: elapsedRef.current,
+            raw_transcript: rawText || undefined,
+            detected_questions: detectedQuestions.length > 0 ? JSON.stringify(detectedQuestions) : null,
+          });
+        } catch {
+          // ignore
+        }
       }
+      onStop();
+    } finally {
+      setIsStopping(false);
+      isStoppingRef.current = false;
     }
-    onStop();
-  }, [lecture, onStop, detectedQuestions]);
+  }, [lecture, onStop, detectedQuestions, chunks]);
 
   const handleChatSend = useCallback((textToSend?: string) => {
     const q = (textToSend || chatInput).trim();

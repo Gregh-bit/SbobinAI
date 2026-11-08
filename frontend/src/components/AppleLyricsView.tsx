@@ -106,23 +106,24 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
     return result;
   }, [lines]);
 
-  // ── Animation Loop ottimizzato (Sincronizzazione fluidissima ~60 FPS) ──
+  // ── Animation Loop ottimizzato (Sincronizzazione fluidissima ~60 FPS, 0% CPU in pausa) ──
   useEffect(() => {
+    if (!isPlaying) return;
     let animId: number;
 
     const tick = () => {
       const audio = audioRef.current;
       if (audio && !audio.paused) {
         setCurrentMs(Math.round(audio.currentTime * 1000));
+        animId = requestAnimationFrame(tick);
       }
-      animId = requestAnimationFrame(tick);
     };
 
     animId = requestAnimationFrame(tick);
     return () => {
       cancelAnimationFrame(animId);
     };
-  }, [audioRef]);
+  }, [audioRef, isPlaying]);
 
   // Ascolto eventi audio nativi per scrubbing istantaneo
   useEffect(() => {

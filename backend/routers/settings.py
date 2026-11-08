@@ -34,8 +34,8 @@ def _normalize_whisper_state(current: Dict[str, Any]) -> bool:
             changed = True
         if curr_whisper in WHISPER_MODELS and curr_whisper != "mock_mode":
             is_dl, _ = is_whisper_downloaded(WHISPER_MODELS[curr_whisper])
-            if is_dl and not current.get("models_downloaded"):
-                current["models_downloaded"] = True
+            if current.get("models_downloaded") != is_dl:
+                current["models_downloaded"] = is_dl
                 changed = True
     except Exception:
         pass
@@ -55,6 +55,7 @@ class SettingsUpdateRequest(BaseModel):
     vad_sensitivity: Optional[int] = None
     models_downloaded: Optional[bool] = None
     audio_format: Optional[str] = None
+    setup_complete: Optional[bool] = None
 
 
 @router.get("/")

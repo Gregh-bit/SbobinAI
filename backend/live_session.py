@@ -110,23 +110,23 @@ class LiveSession:
         if not text or not text.strip():
             return
         clean_text = text.strip()
-        now = time.time()
+        now = self.elapsed_seconds()
         chunk = TranscriptChunk(text=clean_text, timestamp=now)
         self._buffer.append(chunk)
         self.full_transcript.append(clean_text)
 
-        # Rimuovi chunk più vecchi di RING_BUFFER_SECONDS
+        # Rimuovi chunk piu vecchi di RING_BUFFER_SECONDS calcolati sul tempo effettivo di lezione
         cutoff = now - RING_BUFFER_SECONDS
         while self._buffer and self._buffer[0].timestamp < cutoff:
             self._buffer.popleft()
 
     def push_chunk(self, text: str) -> None:
-        """Alias compatibilità per push_transcript."""
+        """Alias compatibilita per push_transcript."""
         self.push_transcript(text)
 
     def get_recent_context(self, minutes: int = RING_BUFFER_MINUTES) -> str:
-        """Restituisce il testo degli ultimi `minutes` minuti come stringa unica."""
-        cutoff = time.time() - (minutes * 60)
+        """Restituisce il testo degli ultimi `minutes` minuti di lezione effettiva."""
+        cutoff = self.elapsed_seconds() - (minutes * 60)
         # Snapshot sicuro per evitare RuntimeError: deque mutated during iteration
         snapshot = list(self._buffer)
         recent = [c.text for c in snapshot if c.timestamp >= cutoff]
@@ -194,10 +194,13 @@ def start_session(
     model_name: Optional[str] = None,
     vad_sensitivity: int = 2,
 ) -> LiveSession:
-    """Avvia (o riavvia) una sessione live per una materia."""
-    # Se ce n'era una precedente non chiusa, chiudila per liberare risorse audio
-    if subject_id in _active_sessions:
-        end_session(subject_id)
+    """Avvia (o riavvia) una sessione live per una materia garantendo una sola registrazione attiva nell'app."""
+    # Se c'erano sessioni precedenti aperte su qualsiasi materia, chiudile per liberare il microfono hardware
+    for old_sid in list(_active_sessions.keys()):
+        try:
+            end_session(old_sid)
+        except Exception:
+            pass
 
     session = LiveSession(
         subject_id=subject_id,

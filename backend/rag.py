@@ -120,6 +120,8 @@ def reset_connection() -> None:
     with _table_lock:
         _db_conn = None
         _db_conn_path = None
+    with _query_cache_lock:
+        _query_vector_cache.clear()
 
 
 def get_lancedb_table():
@@ -226,7 +228,6 @@ def unload_embedding_model() -> None:
                 pass
         del model
     reset_connection()
-    _cached_query_vector_tuple.cache_clear()
     clear_metal_cache()
     logger.info("[RAG] Modello embedding scaricato e cache LanceDB azzerata.")
 
@@ -320,26 +321,39 @@ def compute_embeddings(
 
 # ── Query Embedding Cache ─────────────────────────────────────────────────────
 
-@lru_cache(maxsize=256)
-def _cached_query_vector_tuple(query: str, model_id: Optional[str] = None) -> Optional[Tuple[float, ...]]:
-    vecs = compute_embeddings([query], is_query=True, model_id=model_id)
-    if vecs is None or len(vecs) == 0:
-        return None
-    return tuple(vecs[0].tolist())
+_query_vector_cache: dict[Tuple[str, Optional[str]], Tuple[float, ...]] = {}
+_query_cache_lock = threading.Lock()
+_QUERY_CACHE_MAXSIZE = 256
 
 
 def get_cached_query_vector(query: str, model_id: Optional[str] = None) -> Optional[np.ndarray]:
     """
-    Calcola (o recupera da cache LRU maxsize=256) il vettore di embedding normalizzato a 1024-dim
+    Calcola (o recupera da cache memoria thread-safe maxsize=256) il vettore di embedding normalizzato a 1024-dim
     per una query di ricerca. Evita ricalcoli GPU/CPU identici durante sessioni di studio e chat.
+    Non memorizza in cache risultati None per evitare stale-state prima del download del modello.
     """
     clean_q = query.strip()
     if not clean_q:
         return None
-    cached_tup = _cached_query_vector_tuple(clean_q, model_id)
-    if cached_tup is None:
+    cache_key = (clean_q, model_id)
+    with _query_cache_lock:
+        if cache_key in _query_vector_cache:
+            return np.array(_query_vector_cache[cache_key], dtype=np.float32)
+
+    vecs = compute_embeddings([clean_q], is_query=True, model_id=model_id)
+    if vecs is None or len(vecs) == 0:
         return None
-    return np.array(cached_tup, dtype=np.float32)
+
+    tup = tuple(vecs[0].tolist())
+    with _query_cache_lock:
+        if len(_query_vector_cache) >= _QUERY_CACHE_MAXSIZE:
+            try:
+                first_key = next(iter(_query_vector_cache))
+                del _query_vector_cache[first_key]
+            except (StopIteration, KeyError):
+                pass
+        _query_vector_cache[cache_key] = tup
+    return np.array(tup, dtype=np.float32)
 
 
 # ── Text Chunking ─────────────────────────────────────────────────────────────

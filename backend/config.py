@@ -36,7 +36,10 @@ def _documents_dir() -> str:
             out = ctypes.c_wchar_p()
             if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None, ctypes.byref(out)) == 0:
                 path = out.value
-                ctypes.windll.ole32.CoTaskMemFree(out)
+                ole32 = ctypes.windll.ole32
+                ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+                ole32.CoTaskMemFree.restype = None
+                ole32.CoTaskMemFree(out)
                 if path:
                     return path
         except Exception:
@@ -45,7 +48,7 @@ def _documents_dir() -> str:
 
 
 def _same_path(a: str, b: str) -> bool:
-    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+    return os.path.normcase(os.path.abspath(os.path.expanduser(a))) == os.path.normcase(os.path.abspath(os.path.expanduser(b)))
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -86,6 +89,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "vad_sensitivity": 2,
     "models_downloaded": False,
     "audio_format": "m4a",
+    "setup_complete": False,
 }
 
 
@@ -325,9 +329,20 @@ def update_storage_path(new_path: str, migrate_data: bool = True) -> Dict[str, A
         os.makedirs(new_lancedb, exist_ok=True)
         _active_storage_root = expanded_new
 
+    old_audio = os.path.join(old_root, "audio")
+
     # Migrazione se abilitata
     if migrate_data and os.path.exists(old_root):
-        # 1. DB SQLite
+        # 1. DB SQLite (forza checkpoint WAL per consolidare le transazioni pendenti)
+        try:
+            from database import engine
+            from sqlalchemy import text
+            with engine.connect() as conn:
+                conn.execute(text("PRAGMA wal_checkpoint(TRUNCATE);"))
+            engine.dispose()
+        except Exception as e_wal:
+            logger.debug(f"[Config] Checkpoint WAL pre-migrazione: {e_wal}")
+
         old_db = os.path.join(old_root, "sqlite", "sbobinai.db")
         if not os.path.exists(old_db):
             old_db = os.path.join(old_root, "sqlite", "unicopilot.db")
@@ -335,12 +350,16 @@ def update_storage_path(new_path: str, migrate_data: bool = True) -> Dict[str, A
         if os.path.exists(old_db) and not os.path.exists(new_db):
             try:
                 shutil.copy2(old_db, new_db)
+                for suffix in ("-wal", "-shm"):
+                    old_wal = old_db + suffix
+                    new_wal = new_db + suffix
+                    if os.path.exists(old_wal) and not os.path.exists(new_wal):
+                        shutil.copy2(old_wal, new_wal)
                 logger.info(f"[Config] Database spostato in {new_db}")
             except Exception as e:
                 logger.error(f"[Config] Errore copia DB: {e}")
 
         # 2. Cartella Audio
-        old_audio = os.path.join(old_root, "audio")
         if os.path.exists(old_audio):
             for fname in os.listdir(old_audio):
                 src = os.path.join(old_audio, fname)

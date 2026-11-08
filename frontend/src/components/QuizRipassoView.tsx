@@ -115,9 +115,13 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
   useEffect(() => {
     return () => {
       if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      if (mediaRecorderRef.current) {
         try {
-          mediaRecorderRef.current.stop();
+          mediaRecorderRef.current.onstop = null;
+          mediaRecorderRef.current.ondataavailable = null;
+          if (mediaRecorderRef.current.state !== 'inactive') {
+            mediaRecorderRef.current.stop();
+          }
           mediaRecorderRef.current.stream.getTracks().forEach((t) => t.stop());
         } catch {}
       }

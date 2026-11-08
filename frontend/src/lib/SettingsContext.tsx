@@ -1,5 +1,5 @@
 // lib/SettingsContext.tsx — Context React per la gestione persistente delle impostazioni di SbobinAI
-import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
+import { createContext, useContext, useEffect, useState, useCallback, type ReactNode } from 'react';
 import { api } from './api';
 
 export interface AppSettings {
@@ -20,6 +20,7 @@ interface SettingsContextType {
   updateSettings: (newSettings: Partial<AppSettings>) => Promise<void>;
   completeSetup: (customSettings?: Partial<AppSettings>) => Promise<void>;
   resetSetup: () => void;
+  syncWithBackend: () => Promise<void>;
 }
 
 const DEFAULT_SETTINGS: AppSettings = {
@@ -61,12 +62,13 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     return DEFAULT_SETTINGS;
   });
 
-  // Sincronizza le impostazioni reali e lo stato effettivo dei modelli dal backend all'avvio
-  useEffect(() => {
-    Promise.all([
-      api.settings.get().catch(() => null),
-      api.models.status().catch(() => null),
-    ]).then(([settingsData, modelsData]) => {
+  // Sincronizza le impostazioni reali e lo stato effettivo dei modelli dal backend
+  const syncWithBackend = useCallback(async () => {
+    try {
+      const [settingsData, modelsData] = await Promise.all([
+        api.settings.get().catch(() => null),
+        api.models.status().catch(() => null),
+      ]);
       const patch: Partial<AppSettings> = {};
       if (settingsData && typeof settingsData === 'object') {
         if (settingsData.storage_path && typeof settingsData.storage_path === 'string') {
@@ -103,8 +105,9 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         const hasRealWhisper = modelsData.whisper?.some(
           (m: any) => m.id !== 'mock_mode' && m.downloaded
         );
-        if (hasRealWhisper || (modelsData.installed_count && modelsData.installed_count > 0)) {
-          patch.modelsDownloaded = true;
+        const hasAnyInstalled = (modelsData.installed_count && modelsData.installed_count > 0) || Boolean(hasRealWhisper);
+        patch.modelsDownloaded = Boolean(hasRealWhisper);
+        if (hasAnyInstalled) {
           if (!patch.whisperModel || patch.whisperModel === 'mock_mode' || patch.whisperModel === 'dual-tier-whisper') {
             patch.whisperModel = 'large-v3-turbo-q4';
           }
@@ -114,10 +117,14 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       if (Object.keys(patch).length > 0) {
         setSettings((prev) => ({ ...prev, ...patch }));
       }
-    }).catch((err) => {
-      console.warn('[SettingsContext] Impossibile contattare backend per sincronizzazione iniziale:', err);
-    });
+    } catch (err) {
+      console.warn('[SettingsContext] Impossibile contattare backend per sincronizzazione:', err);
+    }
   }, []);
+
+  useEffect(() => {
+    void syncWithBackend();
+  }, [syncWithBackend]);
 
   // Salva ogni modifica nel localStorage
   useEffect(() => {
@@ -139,6 +146,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         }
       } catch (err) {
         console.warn('[SettingsContext] Errore migrazione storage:', err);
+        throw err;
       }
     }
     setSettings((prev) => ({ ...prev, ...partial }));
@@ -180,7 +188,8 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
           updated.storagePath = res.storage_path;
         }
       } catch (e) {
-        console.warn('[SettingsContext] Errore impostazione percorso archiviazione:', e);
+        console.error('[SettingsContext] Errore impostazione percorso archiviazione:', e);
+        updated.storagePath = settings.storagePath;
       }
     }
     setSettings(updated);
@@ -225,6 +234,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         updateSettings,
         completeSetup,
         resetSetup,
+        syncWithBackend,
       }}
     >
       {children}

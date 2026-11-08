@@ -14,7 +14,7 @@ export default function UpdateBanner() {
   if (!visible) return null;
 
   return (
-    <div className="fixed bottom-5 right-5 z-[100] w-[320px] p-4 rounded-3xl liquid-glass border border-white/[0.14] shadow-liquid-sm space-y-3 animate-fade-in">
+    <div className="fixed bottom-5 right-5 z-40 w-[320px] p-4 rounded-3xl liquid-glass border border-white/[0.14] shadow-liquid-sm space-y-3 animate-fade-in">
       <div className="flex items-start gap-3">
         <div className="w-9 h-9 rounded-2xl bg-blue-500/20 border border-blue-400/30 flex items-center justify-center text-blue-300 flex-shrink-0">
           <Download size={16} />

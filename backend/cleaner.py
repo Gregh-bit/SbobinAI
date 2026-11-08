@@ -108,23 +108,23 @@ def cleanup_orphan_files(db: Session = None) -> Dict[str, Any]:
     total_freed_bytes = 0
 
     try:
-        # 1. Raccogli dati dal DB SQLite
-        lectures = db.query(Lecture).all()
-        subjects = db.query(Subject).all()
+        # 1. Raccogli dati dal DB SQLite in modo efficiente (senza caricare testi integrali in RAM)
+        lecture_rows = db.query(Lecture.id, Lecture.audio_path).all()
+        subject_rows = db.query(Subject.id).all()
 
         valid_audio_paths: Set[str] = set()
         valid_audio_basenames: Set[str] = set()
         valid_lecture_ids: Set[int] = set()
 
-        for lec in lectures:
-            valid_lecture_ids.add(lec.id)
-            if lec.audio_path:
-                norm_p = os.path.abspath(os.path.normpath(lec.audio_path))
+        for lid, apath in lecture_rows:
+            valid_lecture_ids.add(lid)
+            if apath:
+                norm_p = os.path.abspath(os.path.normpath(apath))
                 valid_audio_paths.add(norm_p)
                 valid_audio_paths.add(os.path.realpath(norm_p))
                 valid_audio_basenames.add(os.path.basename(norm_p))
 
-        valid_subject_ids: Set[int] = {s.id for s in subjects}
+        valid_subject_ids: Set[int] = {s[0] for s in subject_rows}
 
         # Rileva sessioni live attive e importazioni audio in corso per evitare cancellazioni premature
         active_lecture_ids: Set[int] = set()
@@ -297,6 +297,48 @@ def cleanup_orphan_files(db: Session = None) -> Dict[str, Any]:
                         logger.info(f"[Cleaner] [-] Vecchio DB orfano rimosso: {old_db} ({sz / 1024:.1f} KB)")
                     except Exception as db_err:
                         logger.warning(f"[Cleaner] Errore rimozione {old_db}: {db_err}")
+
+        # 4.5. Bonifica record vettoriali orfani in LanceDB
+        try:
+            from rag import get_lancedb_table
+            tbl = get_lancedb_table()
+            if tbl is not None:
+                if valid_subject_ids:
+                    subj_str = ", ".join(map(str, valid_subject_ids))
+                    tbl.delete(f"subject_id NOT IN ({subj_str})")
+                if valid_lecture_ids:
+                    lec_str = ", ".join(map(str, valid_lecture_ids))
+                    tbl.delete(f"lecture_id > 0 AND lecture_id NOT IN ({lec_str})")
+        except Exception as lancedb_clean_err:
+            logger.debug(f"[Cleaner] Bonifica vettori orfani LanceDB: {lancedb_clean_err}")
+
+        # 4.8. Bonifica download parziali .incomplete o lock orfani nella cache Hugging Face
+        try:
+            from platform_utils import hf_cache_dir, safe_rmtree, invalidate_dir_size_cache
+            hf_cache = hf_cache_dir()
+            if os.path.isdir(hf_cache):
+                for root, dirs, _ in os.walk(hf_cache):
+                    for d in list(dirs):
+                        if d == ".incomplete" or d.endswith(".incomplete"):
+                            incomp_path = os.path.join(root, d)
+                            try:
+                                sz = sum(
+                                    os.path.getsize(os.path.join(r, f))
+                                    for r, _, files in os.walk(incomp_path)
+                                    for f in files
+                                    if os.path.isfile(os.path.join(r, f))
+                                )
+                                if safe_rmtree(incomp_path):
+                                    total_freed_bytes += sz
+                                    logger.info(f"[Cleaner] [-] Directory incompleta HuggingFace rimossa: {incomp_path} ({sz / (1024*1024):.2f} MB)")
+                            except Exception:
+                                pass
+                locks_dir = os.path.join(hf_cache, ".locks")
+                if os.path.isdir(locks_dir):
+                    safe_rmtree(locks_dir, retries=1)
+                invalidate_dir_size_cache()
+        except Exception as hf_clean_err:
+            logger.debug(f"[Cleaner] Bonifica file temporanei Hugging Face: {hf_clean_err}")
 
         # 5. Compattazione database e vector store
         vac_ok = vacuum_sqlite()

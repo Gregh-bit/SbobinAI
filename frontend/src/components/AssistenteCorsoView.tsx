@@ -81,6 +81,10 @@ export default function AssistenteCorsoView({ subject }: Props) {
       abortControllerRef.current?.abort();
       if (recognitionRef.current) {
         try {
+          recognitionRef.current.onstart = null;
+          recognitionRef.current.onresult = null;
+          recognitionRef.current.onerror = null;
+          recognitionRef.current.onend = null;
           recognitionRef.current.stop();
         } catch {
           // ignore
@@ -352,7 +356,12 @@ export default function AssistenteCorsoView({ subject }: Props) {
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && handleSend()}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                e.preventDefault();
+                handleSend();
+              }
+            }}
             placeholder={`Chiedi qualsiasi cosa su ${subject.name}...`}
             className="flex-1 bg-transparent px-3 py-2 text-xs text-white placeholder-white/30 focus:outline-none"
           />

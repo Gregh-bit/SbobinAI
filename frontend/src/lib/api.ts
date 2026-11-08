@@ -316,6 +316,9 @@ export const api = {
       ),
   },
   ws: {
-    liveLecture: (subjectId: number) => new WebSocket(`${WS_URL}/ws/live-lecture/${subjectId}`),
+    liveLecture: (subjectId: number) => {
+      const targetUrl = (WS_URL || 'ws://127.0.0.1:8000').replace('//localhost', '//127.0.0.1');
+      return new WebSocket(`${targetUrl}/ws/live-lecture/${subjectId}`);
+    },
   },
 };

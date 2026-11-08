@@ -9,7 +9,7 @@ import threading
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi.responses import FileResponse
-from sqlalchemy.orm import Session, defer, defer
+from sqlalchemy.orm import Session
 
 from database import Bookmark, Lecture, Subject, get_db
 from schemas import BookmarkCreate, BookmarkOut, LectureCreate, LectureOut, LectureUpdate
@@ -26,11 +26,7 @@ _NON_NULLABLE_FIELDS = ("title", "date", "source_type", "in_quaderno")
 @router.get("/by-subject/{subject_id}", response_model=List[LectureOut])
 def list_lectures(subject_id: int, quaderno_only: bool = False, db: Session = Depends(get_db)):
     """Restituisce le lezioni di una materia, ordinate per data."""
-    query = (
-        db.query(Lecture)
-        .options(defer(Lecture.raw_transcript), defer(Lecture.processed_notes))
-        .filter(Lecture.subject_id == subject_id)
-    )
+    query = db.query(Lecture).filter(Lecture.subject_id == subject_id)
     if quaderno_only:
         query = query.filter(Lecture.in_quaderno == True)
     return query.order_by(Lecture.date.desc()).all()
@@ -66,12 +62,28 @@ def update_lecture(lecture_id: int, payload: LectureUpdate, db: Session = Depend
     lecture = db.query(Lecture).filter(Lecture.id == lecture_id).first()
     if not lecture:
         raise HTTPException(status_code=404, detail="Lezione non trovata.")
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    updates = payload.model_dump(exclude_unset=True)
+    needs_reindex = any(k in updates for k in ("title", "processed_notes", "raw_transcript"))
+    for field, value in updates.items():
         if value is None and field in _NON_NULLABLE_FIELDS:
             continue
         setattr(lecture, field, value)
     db.commit()
     db.refresh(lecture)
+
+    if needs_reindex:
+        try:
+            from rag import index_lecture
+            index_lecture(
+                subject_id=lecture.subject_id,
+                lecture_id=lecture.id,
+                title=lecture.title,
+                transcript=lecture.raw_transcript or "",
+                notes=lecture.processed_notes,
+            )
+        except Exception as reindex_err:
+            logger.debug(f"[Lectures] Reindex LanceDB post-update: {reindex_err}")
+
     return lecture
 
 
@@ -81,20 +93,34 @@ def get_lecture_audio(lecture_id: int, db: Session = Depends(get_db)):
     lecture = db.query(Lecture).filter(Lecture.id == lecture_id).first()
     if not lecture or not lecture.audio_path:
         raise HTTPException(status_code=404, detail="File audio non registrato per questa lezione.")
-    if not os.path.exists(lecture.audio_path):
-        raise HTTPException(status_code=404, detail="File audio non trovato sul disco.")
+
+    audio_path = lecture.audio_path
+    if not os.path.exists(audio_path):
+        # Fallback difensivo nel caso in cui la compressione M4A in background abbia sostituito il file
+        base, _ = os.path.splitext(audio_path)
+        if os.path.exists(base + ".m4a"):
+            audio_path = base + ".m4a"
+        elif os.path.exists(base + ".wav"):
+            audio_path = base + ".wav"
+        else:
+            raise HTTPException(status_code=404, detail="File audio non trovato sul disco.")
 
     media_type = "audio/wav"
-    if lecture.audio_path.endswith(".mp3"):
+    if audio_path.endswith(".mp3"):
         media_type = "audio/mpeg"
-    elif lecture.audio_path.endswith(".m4a"):
+    elif audio_path.endswith(".m4a"):
         media_type = "audio/mp4"
-    elif lecture.audio_path.endswith(".aac"):
+    elif audio_path.endswith(".aac"):
         media_type = "audio/aac"
-    elif lecture.audio_path.endswith(".ogg"):
+    elif audio_path.endswith(".ogg"):
         media_type = "audio/ogg"
 
-    return FileResponse(lecture.audio_path, media_type=media_type, filename=os.path.basename(lecture.audio_path))
+    return FileResponse(
+        audio_path,
+        media_type=media_type,
+        filename=os.path.basename(audio_path),
+        headers={"Accept-Ranges": "bytes"},
+    )
 
 
 def _normalize_karaoke_lines(raw_data) -> List[dict]:
@@ -365,6 +391,11 @@ def delete_lecture(lecture_id: int, db: Session = Depends(get_db)):
 
     # 1. Eliminazione a cascata vettori LanceDB
     delete_lecture_vectors(subject_id=subject_id, lecture_id=lecture_id)
+    try:
+        from rag import compact_lancedb
+        compact_lancedb()
+    except Exception:
+        pass
 
     # 2. Eliminazione file audio fisico registrato e relativa cache
     if audio_path:
@@ -404,13 +435,6 @@ def delete_lecture(lecture_id: int, db: Session = Depends(get_db)):
     # 4. Eliminazione da SQLite
     db.delete(lecture)
     db.commit()
-
-    # 5. Compattazione automatica
-    try:
-        from cleaner import vacuum_sqlite
-        vacuum_sqlite()
-    except Exception:
-        pass
 
 
 

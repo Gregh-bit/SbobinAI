@@ -44,6 +44,7 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
   const [lectures, setLectures] = useState<Lecture[]>([]);
   const [loading, setLoading] = useState(true);
   const [startingLive, setStartingLive] = useState(false);
+  const [liveError, setLiveError] = useState<string | null>(null);
   const [activeRecordingLecture, setActiveRecordingLecture] = useState<Lecture | null>(null);
 
   // Guardie contro risposte asincrone obsolete (dismount o richieste superate)
@@ -77,6 +78,12 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
 
   useEffect(() => {
     loadLectures(true);
+    return () => {
+      if (notesPollRef.current) {
+        clearInterval(notesPollRef.current);
+        notesPollRef.current = null;
+      }
+    };
   }, [loadLectures]);
 
   // Notifica al genitore lo stato di registrazione (blocca il cambio corso nella Sidebar)
@@ -97,8 +104,7 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
     const isDone = (data: Lecture[] | null) => {
       const lec = data?.find((l) => l.id === lectureId);
       if (!lec) return false;
-      // Il backend genera gli appunti solo se la trascrizione è sufficientemente lunga
-      return Boolean(lec.processed_notes) || (lec.raw_transcript || '').trim().length <= 30;
+      return Boolean(lec.processed_notes);
     };
     notesPollRef.current = setInterval(async () => {
       const data = await loadLectures(false);
@@ -127,6 +133,7 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
 
   const handleStartLive = async () => {
     setStartingLive(true);
+    setLiveError(null);
     try {
       const today = new Date().toLocaleDateString('it-IT', { day: 'numeric', month: 'long' });
       const newLec = await api.lectures.create({
@@ -134,8 +141,10 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
         title: `Lezione del ${today}`,
       });
       setActiveRecordingLecture(newLec);
+      setLectures((prev) => [newLec, ...prev]);
     } catch (e: unknown) {
       console.error('Errore avvio lezione:', e);
+      setLiveError('Impossibile avviare la lezione. Assicurati che il motore locale sia attivo.');
     } finally {
       setStartingLive(false);
     }
@@ -301,9 +310,27 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
                   {/* Waveform indicator + Timer */}
                   <div className="flex items-center gap-2 font-mono text-[11px] text-white/80 pr-2 border-r border-white/[0.12]">
                     <div className="flex items-center gap-0.5 h-3">
-                      <span className={clsx('w-0.5 bg-red-400 rounded-full', !liveSession.isPaused && 'animate-wave')} style={{ height: '8px', animationDelay: '0ms' }} />
-                      <span className={clsx('w-0.5 bg-red-400 rounded-full', !liveSession.isPaused && 'animate-wave')} style={{ height: '12px', animationDelay: '200ms' }} />
-                      <span className={clsx('w-0.5 bg-red-400 rounded-full', !liveSession.isPaused && 'animate-wave')} style={{ height: '7px', animationDelay: '400ms' }} />
+                      <span
+                        className={clsx(
+                          'w-0.5 bg-red-400 rounded-full transition-opacity',
+                          liveSession.isConnected && !liveSession.isPaused && liveSession.elapsed > 0 ? 'animate-wave' : 'opacity-40'
+                        )}
+                        style={{ height: '8px', animationDelay: '0ms' }}
+                      />
+                      <span
+                        className={clsx(
+                          'w-0.5 bg-red-400 rounded-full transition-opacity',
+                          liveSession.isConnected && !liveSession.isPaused && liveSession.elapsed > 0 ? 'animate-wave' : 'opacity-40'
+                        )}
+                        style={{ height: '12px', animationDelay: '200ms' }}
+                      />
+                      <span
+                        className={clsx(
+                          'w-0.5 bg-red-400 rounded-full transition-opacity',
+                          liveSession.isConnected && !liveSession.isPaused && liveSession.elapsed > 0 ? 'animate-wave' : 'opacity-40'
+                        )}
+                        style={{ height: '7px', animationDelay: '400ms' }}
+                      />
                     </div>
                     <span className="font-semibold tracking-tight tabular-nums">{formatElapsed(liveSession.elapsed)}</span>
                   </div>
@@ -401,6 +428,23 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
           >
             <Download size={11} />
             <span>Scarica Modelli</span>
+          </button>
+        </div>
+      )}
+
+      {/* ── Banner errore avvio registrazione live ── */}
+      {liveError && !activeRecordingLecture && (
+        <div className="px-6 py-2 bg-red-500/10 border-b border-red-500/20 flex items-center justify-between text-xs text-red-200/90 flex-shrink-0 animate-fade-in">
+          <div className="flex items-center gap-2.5">
+            <AlertTriangle size={14} className="text-red-400 flex-shrink-0" />
+            <span>{liveError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setLiveError(null)}
+            className="text-red-300/60 hover:text-red-200 text-xs px-2 py-0.5 rounded cursor-pointer"
+          >
+            Chiudi
           </button>
         </div>
       )}

@@ -15,6 +15,7 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import sys
 import threading
 from typing import Any, Dict, List, Optional
 
@@ -35,7 +36,15 @@ from pydantic import BaseModel
 from tqdm.auto import tqdm
 
 import ai_models
-from platform_utils import AI_BACKEND, backend_label, dir_size_mb, hf_cache_dir, hf_repo_folder, safe_rmtree
+from platform_utils import (
+    AI_BACKEND,
+    backend_label,
+    dir_size_mb,
+    hf_cache_dir,
+    hf_repo_folder,
+    invalidate_dir_size_cache,
+    safe_rmtree,
+)
 
 logger = logging.getLogger("sbobinai.models")
 
@@ -152,9 +161,13 @@ def _download_hf_worker(model_id: str, spec: ai_models.ModelSpec, cancel_event: 
                     tracker["downloaded_bytes"] = tracker.get("downloaded_bytes", 0) + n
                     tracker["downloaded_mb"] = round(tracker["downloaded_bytes"] / (1024 * 1024), 1)
                     t_bytes = tracker.get("total_bytes") or total_bytes
+                    if tracker["downloaded_bytes"] > t_bytes:
+                        tracker["total_bytes"] = tracker["downloaded_bytes"]
+                        tracker["total_mb"] = tracker["downloaded_mb"]
+                        t_bytes = tracker["downloaded_bytes"]
                     if t_bytes > 0:
-                        pct = min(99, int((tracker["downloaded_bytes"] / t_bytes) * 100))
-                        tracker["progress"] = max(tracker["progress"], pct)
+                        pct = min(99, max(1, int((tracker["downloaded_bytes"] / t_bytes) * 100)))
+                        tracker["progress"] = max(tracker.get("progress", 1), pct)
 
     try:
         from huggingface_hub import snapshot_download
@@ -170,14 +183,17 @@ def _download_hf_worker(model_id: str, spec: ai_models.ModelSpec, cancel_event: 
         if ai_models.local_snapshot(spec) is None:
             raise RuntimeError("Download terminato ma alcuni file del modello risultano mancanti.")
 
+        invalidate_dir_size_cache(hf_repo_folder(repo_id))
         with _lock:
+            actual_bytes = max(total_bytes, _download_tracker.get(model_id, {}).get("downloaded_bytes", total_bytes))
+            actual_mb = round(actual_bytes / (1024 * 1024), 1)
             _download_tracker[model_id] = {
                 "status": "completed",
                 "progress": 100,
-                "downloaded_bytes": total_bytes,
-                "downloaded_mb": total_mb,
-                "total_bytes": total_bytes,
-                "total_mb": total_mb,
+                "downloaded_bytes": actual_bytes,
+                "downloaded_mb": actual_mb,
+                "total_bytes": actual_bytes,
+                "total_mb": actual_mb,
                 "stage": "Completato con successo!",
                 "error": None,
             }
@@ -217,6 +233,13 @@ def _download_hf_worker(model_id: str, spec: ai_models.ModelSpec, cancel_event: 
         except Exception:
             pass
 
+        # Pulisce eventuali file parziali per non lasciare sporcizia sul disco
+        try:
+            if ai_models.local_snapshot(spec) is None:
+                _delete_repos(spec.all_repo_ids())
+        except Exception:
+            pass
+
         with _lock:
             _download_tracker[model_id] = {
                 "status": "error",
@@ -239,7 +262,7 @@ def _finish_cancelled(model_id: str, spec: ai_models.ModelSpec, total_mb: float)
     logger.info(f"[Models] Download di {model_id} interrotto: rimozione file parziali.")
     ai_models.set_downloading(model_id, False)
     try:
-        _delete_repos([spec.repo_id])
+        _delete_repos(spec.all_repo_ids())
     except Exception as exc:
         logger.warning(f"[Models] Pulizia file parziali {model_id}: {exc}")
     with _lock:
@@ -516,6 +539,7 @@ def _delete_repos(repo_ids: List[str]) -> float:
     locks_root = os.path.join(hf_cache_dir(), ".locks")
     for repo_id in repo_ids:
         safe_rmtree(os.path.join(locks_root, "models--" + repo_id.replace("/", "--")), retries=1)
+    invalidate_dir_size_cache()
     return round(freed_mb, 1)
 
 
@@ -584,6 +608,17 @@ def delete_single_model(model_name: str):
     with _lock:
         _download_tracker.pop(spec.id, None)
         _download_tracker.pop(clean_name, None)
+
+    try:
+        from config import update_settings
+        if spec.type == "whisper":
+            update_settings({"models_downloaded": False, "whisper_model": ai_models.MOCK_WHISPER_ID})
+        elif spec.type == "llm":
+            update_settings({"llm_model": ai_models.LLM_DEFAULT_ID})
+        elif spec.type == "embedding":
+            update_settings({"embedding_model": ai_models.EMBEDDING_DEFAULT_ID})
+    except Exception:
+        pass
 
     return {
         "status": "deleted",

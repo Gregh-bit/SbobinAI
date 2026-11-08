@@ -359,15 +359,18 @@ class Transcriber:
             self.local_model_path = _resolve_model_path(self.repo_id)
         target = self.local_model_path
         if not target:
-            if USE_MLX:
-                target = self.repo_id  # comportamento storico: mlx-whisper risolve il repo
-            else:
-                logger.error(f"[Transcriber] {MODEL_NOT_DOWNLOADED_MSG}")
-                return ""
+            logger.error(f"[Transcriber] {MODEL_NOT_DOWNLOADED_MSG}")
+            return ""
 
         try:
+            rem = len(audio_data) % 2
+            if rem:
+                audio_data = audio_data[:-rem]
+            if not audio_data:
+                return ""
             # int16 → float32 normalizzato: una sola allocazione, scala in-place
             audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
+            audio_np = np.nan_to_num(audio_np)
             audio_np *= (1.0 / 32768.0)
 
             # Pre-filtro spettrale rapido: scarta rumori prima di impegnare la GPU
@@ -463,8 +466,22 @@ def is_speech_spectral(audio_np: np.ndarray, sample_rate: int = 16000) -> bool:
     if zero_crossings < 0.005 or zero_crossings > 0.60:
         return False
 
-    # Analisi spettrale rapida FFT sui primi 4096 campioni (~256ms)
-    fft_samples = audio_np[:4096]
+    # Analisi spettrale rapida FFT sulla finestra a massima energia (evita falsi negativi su pause/respiro iniziale)
+    if total_samples > 4096:
+        mid_idx = total_samples // 2
+        cand_starts = [0, max(0, mid_idx - 2048), max(0, total_samples - 4096)]
+        best_start = 0
+        best_eng = -1.0
+        for s in cand_starts:
+            seg = audio_np[s : s + 4096]
+            eng = float(np.dot(seg, seg))
+            if eng > best_eng:
+                best_eng = eng
+                best_start = s
+        fft_samples = audio_np[best_start : best_start + 4096]
+    else:
+        fft_samples = audio_np
+
     fft_vals = np.abs(np.fft.rfft(fft_samples))
     freqs = np.fft.rfftfreq(len(fft_samples), d=1.0 / sample_rate)
     speech_band = (freqs >= 200) & (freqs <= 3800)
@@ -487,10 +504,16 @@ def release_metal_cache() -> None:
             import mlx.core as mx
             if hasattr(mx, "clear_cache"):
                 mx.clear_cache()
-            if hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
+            if hasattr(mx.metal, "clear_cache"):
                 mx.metal.clear_cache()
         except Exception:
             pass
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
     gc.collect()
 
 

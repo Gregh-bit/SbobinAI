@@ -117,11 +117,17 @@ class AudioEngine:
         self.is_paused: bool = False
         self.is_voice_active: bool = False
 
-        # Registrazione integrale: RAM fino a 64 MB, poi spool automatico su file temporaneo
-        self._recording = tempfile.SpooledTemporaryFile(max_size=_SPOOL_MAX_RAM_BYTES, mode="w+b",
-                                                        prefix="sbobinai_rec_", suffix=".pcm")
+        # Registrazione integrale su file temporaneo PCM (scrittura sequenziale continua, zero latenza di rollover)
+        self._temp_pcm_file = tempfile.NamedTemporaryFile(
+            mode="w+b", prefix="sbobinai_rec_", suffix=".pcm", delete=False
+        )
+        self._temp_pcm_path: Optional[str] = self._temp_pcm_file.name
         self._recorded_bytes = 0
         self._lock = threading.Lock()
+
+        # Dispositivo e canali negoziati
+        self.device_channels: int = 1
+        self.device_samplerate: float = float(self.SAMPLE_RATE)
 
         # Coda vocale per Whisper Large-v3-Turbo
         self.speech_queue: queue.Queue[bytes] = queue.Queue()
@@ -161,7 +167,7 @@ class AudioEngine:
         except Exception as e:
             logger.warning(f"[AudioEngine] Inizializzazione filtro High-Pass fallita ({e}). Uso segnale diretto.")
 
-        # Ricampionamento (solo se il dispositivo non supporta 16 kHz)
+        # Ricampionamento (attivo se il dispositivo hardware non supporta 16 kHz nativi)
         self._resampler: Optional[_StreamResampler] = None
         self._pending = np.zeros(0, dtype=np.float32)
 
@@ -179,33 +185,66 @@ class AudioEngine:
                 pass
 
     def _open_stream(self):
-        """Apre lo stream di input: prima a 16 kHz nativi, poi alla frequenza del dispositivo con ricampionamento."""
+        """
+        Apre lo stream di input con negoziazione progressiva:
+        1. 16 kHz Mono (standard ideale Whisper/VAD)
+        2. 16 kHz Stereo (richiesto da molti driver WASAPI / USB su Windows)
+        3. Frequenza nativa (es. 48/44.1 kHz) Mono / Stereo con ricampionamento in streaming
+        """
         device = _resolve_input_device()
+        max_ch = 1
+        native_sr = 48000.0
         try:
-            stream = sd.InputStream(
-                device=device,
-                samplerate=self.SAMPLE_RATE,
-                channels=self.CHANNELS,
-                dtype="int16",
-                blocksize=self.SAMPLES_PER_FRAME,
-                callback=self._audio_callback,
-            )
-            self._resampler = None
-            return stream
-        except Exception as e16:
             info = sd.query_devices(device, kind="input") if device is not None else sd.query_devices(kind="input")
-            native = float(info.get("default_samplerate") or 48000.0)
-            logger.warning(f"[AudioEngine] 16 kHz non supportato ({e16}). Cattura a {native:.0f} Hz con ricampionamento.")
-            self._resampler = _StreamResampler(native, self.SAMPLE_RATE)
-            self._pending = np.zeros(0, dtype=np.float32)
-            return sd.InputStream(
-                device=device,
-                samplerate=native,
-                channels=self.CHANNELS,
-                dtype="int16",
-                blocksize=int(round(native * self.FRAME_MS / 1000.0)),
-                callback=self._native_rate_callback,
-            )
+            max_ch = max(1, int(info.get("max_input_channels", 1) or 1))
+            native_sr = float(info.get("default_samplerate", 48000.0) or 48000.0)
+        except Exception as q_err:
+            logger.warning(f"[AudioEngine] Query dispositivo input fallita ({q_err}), uso valori standard.")
+
+        candidates = [
+            (self.SAMPLE_RATE, 1),
+            (self.SAMPLE_RATE, min(2, max_ch)),
+            (int(native_sr), 1),
+            (int(native_sr), min(2, max_ch)),
+            (48000, 1),
+            (48000, min(2, max_ch)),
+            (44100, 1),
+            (44100, min(2, max_ch)),
+        ]
+        # Rimuovi duplicati mantenendo l'ordine di priorità
+        unique_candidates = []
+        seen = set()
+        for sr, ch in candidates:
+            if (sr, ch) not in seen:
+                seen.add((sr, ch))
+                unique_candidates.append((sr, ch))
+
+        last_err = None
+        for sr, ch in unique_candidates:
+            try:
+                block_size = int(round(sr * (self.FRAME_MS / 1000.0)))
+                stream = sd.InputStream(
+                    device=device,
+                    samplerate=sr,
+                    channels=ch,
+                    dtype="int16",
+                    blocksize=block_size,
+                    callback=self._raw_stream_callback,
+                )
+                self.device_samplerate = float(sr)
+                self.device_channels = ch
+                if sr != self.SAMPLE_RATE:
+                    logger.info(f"[AudioEngine] Dispositivo aperto a {sr:.0f} Hz ({ch} canali) con ricampionamento a 16 kHz.")
+                    self._resampler = _StreamResampler(sr, self.SAMPLE_RATE)
+                else:
+                    logger.info(f"[AudioEngine] Dispositivo aperto a 16 kHz nativi ({ch} canali).")
+                    self._resampler = None
+                self._pending = np.zeros(0, dtype=np.float32)
+                return stream
+            except Exception as e:
+                last_err = e
+
+        raise RuntimeError(f"Nessuna configurazione audio hardware supportata dal dispositivo ({last_err})")
 
     def start(self) -> bool:
         """Avvia la registrazione audio."""
@@ -221,7 +260,7 @@ class AudioEngine:
             try:
                 self._stream = self._open_stream()
                 self._stream.start()
-                logger.info(f"[AudioEngine] Microfono hardware avviato (16kHz mono) per lezione {self.lecture_id}")
+                logger.info(f"[AudioEngine] Microfono hardware avviato ({self.device_samplerate:.0f}Hz, {self.device_channels}ch) per lezione {self.lecture_id}")
                 return True
             except Exception as e:
                 self._stream = None
@@ -234,31 +273,64 @@ class AudioEngine:
         return True
 
     def _write_recording(self, raw_bytes: bytes) -> None:
-        with self._lock:
-            if not self._recording.closed:
-                self._recording.write(raw_bytes)
-                self._recorded_bytes += len(raw_bytes)
+        try:
+            with self._lock:
+                if self._temp_pcm_file and not self._temp_pcm_file.closed:
+                    self._temp_pcm_file.write(raw_bytes)
+                    self._recorded_bytes += len(raw_bytes)
+        except Exception as e:
+            logger.error(f"[AudioEngine] Errore scrittura PCM: {e}")
+
+    def _raw_stream_callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
+        """Callback universale per cattura audio: gestisce multicanale, frequenze native e ricampionamento."""
+        if status:
+            logger.debug(f"[AudioEngine] Status sounddevice: {status}")
+        if not self.is_running or self.is_paused:
+            return
+
+        # 1. Downmix a mono se il flusso hardware è multicanale (stereo)
+        if indata.ndim == 2 and indata.shape[1] > 1:
+            # Media a 32-bit per evitare overflow
+            mono_int16 = ((indata[:, 0].astype(np.int32) + indata[:, 1].astype(np.int32)) // 2).astype(np.int16)
+        else:
+            mono_int16 = indata.reshape(-1).astype(np.int16, copy=False)
+
+        # 2. Se la frequenza nativa è diversa da 16 kHz, ricampiona
+        if self._resampler is not None:
+            out = self._resampler.process(mono_int16)
+            buf = np.concatenate([self._pending, out]) if len(self._pending) else out
+            n_frames = len(buf) // self.SAMPLES_PER_FRAME
+            for i in range(n_frames):
+                seg = buf[i * self.SAMPLES_PER_FRAME:(i + 1) * self.SAMPLES_PER_FRAME]
+                frame = np.clip(np.round(seg), -32768, 32767).astype(np.int16)
+                self._process_16k_mono_frame(frame)
+            self._pending = buf[n_frames * self.SAMPLES_PER_FRAME:].copy()
+        else:
+            if len(mono_int16) == self.SAMPLES_PER_FRAME:
+                self._process_16k_mono_frame(mono_int16)
+            else:
+                buf = np.concatenate([self._pending, mono_int16.astype(np.float32, copy=False)]) if len(self._pending) else mono_int16.astype(np.float32, copy=False)
+                n_frames = len(buf) // self.SAMPLES_PER_FRAME
+                for i in range(n_frames):
+                    seg = buf[i * self.SAMPLES_PER_FRAME:(i + 1) * self.SAMPLES_PER_FRAME]
+                    frame = np.clip(np.round(seg), -32768, 32767).astype(np.int16)
+                    self._process_16k_mono_frame(frame)
+                self._pending = buf[n_frames * self.SAMPLES_PER_FRAME:].copy()
+
+    # Alias per compatibilità con test unitari e chiamate dirette
+    def _audio_callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
+        self._raw_stream_callback(indata, frames, time_info, status)
 
     def _native_rate_callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
-        """Callback a frequenza nativa: ricampiona a 16 kHz e inoltra frame da 480 campioni."""
-        if not self.is_running or self.is_paused or self._resampler is None:
-            return
-        out = self._resampler.process(indata.reshape(-1))
-        buf = np.concatenate([self._pending, out]) if len(self._pending) else out
-        n_frames = len(buf) // self.SAMPLES_PER_FRAME
-        for i in range(n_frames):
-            seg = buf[i * self.SAMPLES_PER_FRAME:(i + 1) * self.SAMPLES_PER_FRAME]
-            frame = np.clip(np.round(seg), -32768, 32767).astype(np.int16)
-            self._audio_callback(frame.reshape(-1, 1), self.SAMPLES_PER_FRAME, time_info, status)
-        self._pending = buf[n_frames * self.SAMPLES_PER_FRAME:].copy()
+        self._raw_stream_callback(indata, frames, time_info, status)
 
-    def _audio_callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
-        """Callback chiamata ogni 30ms con 480 campioni int16 a 16 kHz."""
+    def _process_16k_mono_frame(self, frame: np.ndarray) -> None:
+        """Elabora un singolo frame mono da 480 campioni int16 a 16 kHz (filtro HP, VAD, accumulo)."""
         if not self.is_running or self.is_paused:
             return
 
         # 1. Filtro High-Pass anti-rumble (80 Hz): rimuove ronzii, ventole e colpi sulla scrivania
-        samples_raw = indata.reshape(-1)
+        samples_raw = frame.reshape(-1)
         if self._hp_enabled and self._hp_zi is not None:
             try:
                 import scipy.signal as signal
@@ -269,12 +341,12 @@ class AudioEngine:
                 energy = float(np.dot(filtered_f, filtered_f))
                 rms = float(np.sqrt(energy / len(filtered_f)))
             except Exception:
-                raw_bytes = indata.tobytes()
+                raw_bytes = frame.tobytes()
                 samples_f = samples_raw.astype(np.float32, copy=False)
                 energy = float(np.dot(samples_f, samples_f))
                 rms = float(np.sqrt(energy / len(samples_f)))
         else:
-            raw_bytes = indata.tobytes()
+            raw_bytes = frame.tobytes()
             samples_f = samples_raw.astype(np.float32, copy=False)
             energy = float(np.dot(samples_f, samples_f))
             rms = float(np.sqrt(energy / len(samples_f)))
@@ -291,63 +363,65 @@ class AudioEngine:
                 vad_active = False
             is_speech = vad_active and (rms > self.rms_threshold)
         else:
-            is_speech = (rms > max(260.0, self.rms_threshold))
+            # Fallback energetico permissivo: cattura bene anche microfoni laptop Windows con basso guadagno
+            is_speech = (rms > max(110.0, self.rms_threshold))
 
         now = time.time()
 
-        if is_speech:
-            self.is_voice_active = True
-            if self._speech_frames_count == 0:
-                # Prependi i frame di pre-roll per non perdere l'attacco della prima parola
-                self._speech_buffer.extend(self._preroll_buffer)
-                self._preroll_buffer.clear()
+        with self._lock:
+            if is_speech:
+                self.is_voice_active = True
+                if self._speech_frames_count == 0:
+                    # Prependi i frame di pre-roll per non perdere l'attacco della prima parola
+                    self._speech_buffer.extend(self._preroll_buffer)
+                    self._preroll_buffer.clear()
 
-            self._speech_buffer.append(raw_bytes)
-            self._speech_frames_count += 1
-            self._silence_frames_count = 0
-            self._last_speech_time = now
-
-            # Condizione 1: Finestra temporale continua di 20 secondi (~666 frame x 30ms = 20.0s)
-            if self._speech_frames_count >= 666:
-                logger.info(f"[AudioEngine] Finestra 20s completata ({self._speech_frames_count * 30 / 1000:.1f}s) -> Invio a Whisper Large Turbo")
-                overlap = list(self._speech_buffer[-6:]) if len(self._speech_buffer) >= 6 else []
-                self._flush_speech_buffer()
-                self._preroll_buffer.extend(overlap)
-
-        else:
-            self._preroll_buffer.append(raw_bytes)
-
-            if self._speech_frames_count > 0:
-                # Il docente ha appena smesso di parlare o sta facendo una pausa
                 self._speech_buffer.append(raw_bytes)
-                self._silence_frames_count += 1
+                self._speech_frames_count += 1
+                self._silence_frames_count = 0
+                self._last_speech_time = now
 
-                # Condizione 2: Soglia di Silenzio Adattiva
-                # - parlato lungo (>= 250 frame ~= 7.5s): basta una pausa di 360ms (12 frame)
-                # - parlato breve (50..249 frame): attendiamo 510ms (17 frame)
-                silence_limit = 12 if self._speech_frames_count >= 250 else 17
+                # Condizione 1: Finestra temporale continua di 20 secondi (~666 frame x 30ms = 20.0s)
+                if self._speech_frames_count >= 666:
+                    logger.info(f"[AudioEngine] Finestra 20s completata ({self._speech_frames_count * 30 / 1000:.1f}s) -> Invio a Whisper Large Turbo")
+                    overlap = list(self._speech_buffer[-6:]) if len(self._speech_buffer) >= 6 else []
+                    self._flush_speech_buffer()
+                    self._preroll_buffer.extend(overlap)
 
-                if self._silence_frames_count >= silence_limit:
-                    self.is_voice_active = False
-                    if self._speech_frames_count >= 50:
-                        dur_s = (len(self._speech_buffer) * 30) / 1000.0
-                        logger.info(
-                            f"[AudioEngine] Innesco Pausa Docente ({self._silence_frames_count * 30}ms silenzio "
-                            f"dopo ~{dur_s:.1f}s di spiegazione, soglia={silence_limit * 30}ms) -> Invio a Whisper Large Turbo"
-                        )
-                        self._flush_speech_buffer()
-                    elif self._silence_frames_count >= 40:
-                        # Se il silenzio è superiore a 1.2s e la voce era brevissima (<1.5s)
-                        if self._speech_frames_count >= 30:  # ~1.0s di voce
-                            self._flush_speech_buffer()
-                        else:
-                            # Rumore isolato o colpo sul tavolo: scarta senza affaticare Whisper
-                            self._speech_buffer.clear()
-                            self._speech_frames_count = 0
-                            self._silence_frames_count = 0
             else:
-                self.is_voice_active = False
-                self._silence_frames_count += 1
+                self._preroll_buffer.append(raw_bytes)
+
+                if self._speech_frames_count > 0:
+                    # Il docente ha appena smesso di parlare o sta facendo una pausa
+                    self._speech_buffer.append(raw_bytes)
+                    self._silence_frames_count += 1
+
+                    # Condizione 2: Soglia di Silenzio Adattiva
+                    # - parlato lungo (>= 250 frame ~= 7.5s): basta una pausa di 360ms (12 frame)
+                    # - parlato breve (50..249 frame): attendiamo 510ms (17 frame)
+                    silence_limit = 12 if self._speech_frames_count >= 250 else 17
+
+                    if self._silence_frames_count >= silence_limit:
+                        self.is_voice_active = False
+                        if self._speech_frames_count >= 50:
+                            dur_s = (len(self._speech_buffer) * 30) / 1000.0
+                            logger.info(
+                                f"[AudioEngine] Innesco Pausa Docente ({self._silence_frames_count * 30}ms silenzio "
+                                f"dopo ~{dur_s:.1f}s di spiegazione, soglia={silence_limit * 30}ms) -> Invio a Whisper Large Turbo"
+                            )
+                            self._flush_speech_buffer()
+                        elif self._silence_frames_count >= 40:
+                            # Se il silenzio è superiore a 1.2s e la voce era brevissima (<1.5s)
+                            if self._speech_frames_count >= 30:  # ~1.0s di voce
+                                self._flush_speech_buffer()
+                            else:
+                                # Rumore isolato o colpo sul tavolo: scarta senza affaticare Whisper
+                                self._speech_buffer.clear()
+                                self._speech_frames_count = 0
+                                self._silence_frames_count = 0
+                else:
+                    self.is_voice_active = False
+                    self._silence_frames_count += 1
 
     def _flush_speech_buffer(self) -> None:
         """Chiude il blocco vocale accumulato e lo accoda per Whisper."""
@@ -403,14 +477,14 @@ class AudioEngine:
             except Exception as e:
                 logger.warning(f"[AudioEngine] Errore arresto stream per pausa: {e}")
 
-        # Estrai l'eventuale parlato residuo rimasto nel buffer
+        # Estrai l'eventuale parlato residuo rimasto nel buffer in modo thread-safe
         last_audio = None
-        if self._speech_buffer and self._speech_frames_count >= 15:  # Almeno ~450ms di voce
-            last_audio = b"".join(self._speech_buffer)
-
-        self._speech_buffer.clear()
-        self._speech_frames_count = 0
-        self._silence_frames_count = 0
+        with self._lock:
+            if self._speech_buffer and self._speech_frames_count >= 15:  # Almeno ~450ms di voce
+                last_audio = b"".join(self._speech_buffer)
+            self._speech_buffer.clear()
+            self._speech_frames_count = 0
+            self._silence_frames_count = 0
 
         logger.info(f"[AudioEngine] Motori in PAUSA. Ultimo chunk estratto: {len(last_audio) if last_audio else 0} bytes")
         return last_audio
@@ -420,23 +494,29 @@ class AudioEngine:
         if not self.is_running or not self.is_paused:
             return False
 
-        self.is_paused = False
-        self.is_voice_active = False
-        self._reset_filter_state()
-        self._preroll_buffer.clear()
-        self._speech_buffer.clear()
-        self._speech_frames_count = 0
-        self._silence_frames_count = 0
-        self._pending = np.zeros(0, dtype=np.float32)
-
         if self._stream:
             try:
                 self._stream.start()
                 logger.info(f"[AudioEngine] Stream audio hardware RIPRESO per lezione {self.lecture_id}")
-                return True
             except Exception as e:
-                logger.warning(f"[AudioEngine] Errore ripresa stream: {e}")
-                return False
+                logger.warning(f"[AudioEngine] Errore ripresa stream con start(): {e}, provo riapertura...")
+                try:
+                    self._open_stream()
+                    if self._stream:
+                        self._stream.start()
+                except Exception as e2:
+                    logger.error(f"[AudioEngine] Impossibile riaprire lo stream: {e2}")
+                    return False
+
+        self.is_paused = False
+        self.is_voice_active = False
+        self._reset_filter_state()
+        with self._lock:
+            self._preroll_buffer.clear()
+            self._speech_buffer.clear()
+            self._speech_frames_count = 0
+            self._silence_frames_count = 0
+            self._pending = np.zeros(0, dtype=np.float32)
         return True
 
     def _run_simulated_mic(self) -> None:
@@ -459,7 +539,10 @@ class AudioEngine:
 
         if self._stream:
             try:
-                self._stream.stop()
+                self._stream.abort()
+            except Exception as e:
+                logger.warning(f"[AudioEngine] Errore abort stream: {e}")
+            try:
                 self._stream.close()
             except Exception as e:
                 logger.warning(f"[AudioEngine] Errore chiusura stream: {e}")
@@ -486,25 +569,31 @@ class AudioEngine:
             total = self._recorded_bytes
             logger.info(f"[AudioEngine] Esportazione {total} bytes di audio PCM in {output_path}")
             try:
-                if not self._recording.closed:
-                    self._recording.flush()
-                    self._recording.seek(0)
+                if self._temp_pcm_file and not self._temp_pcm_file.closed:
+                    self._temp_pcm_file.flush()
+                    self._temp_pcm_file.seek(0)
                 with wave.open(part_path, "wb") as wf:
                     wf.setnchannels(self.CHANNELS)
                     wf.setsampwidth(2)  # 16-bit = 2 bytes
                     wf.setframerate(self.SAMPLE_RATE)
-                    if not self._recording.closed:
+                    if self._temp_pcm_file and not self._temp_pcm_file.closed:
                         while True:
-                            block = self._recording.read(1024 * 1024)
+                            block = self._temp_pcm_file.read(1024 * 1024)
                             if not block:
                                 break
                             wf.writeframesraw(block)
                 os.replace(part_path, output_path)
             finally:
-                try:
-                    self._recording.close()  # elimina anche l'eventuale file temporaneo
-                except Exception:
-                    pass
+                if self._temp_pcm_file:
+                    try:
+                        self._temp_pcm_file.close()
+                    except Exception:
+                        pass
+                if self._temp_pcm_path and os.path.exists(self._temp_pcm_path):
+                    try:
+                        os.remove(self._temp_pcm_path)
+                    except OSError:
+                        pass
                 if os.path.exists(part_path):
                     try:
                         os.remove(part_path)
@@ -566,8 +655,13 @@ def compress_wav_to_m4a(wav_path: str, bitrate: int = 48000, remove_original: bo
 
             with av.open(part_path, mode="w", format="mp4") as out_container:
                 out_stream = out_container.add_stream("aac", rate=16000)
+                out_stream.format = "fltp"
                 out_stream.bit_rate = int(bitrate)
                 out_stream.layout = "mono"
+                try:
+                    out_stream.codec_context.thread_count = 1
+                except Exception:
+                    pass
 
                 resampler = av.AudioResampler(
                     format=out_stream.format,
@@ -575,17 +669,20 @@ def compress_wav_to_m4a(wav_path: str, bitrate: int = 48000, remove_original: bo
                     rate=out_stream.rate,
                 )
 
+                frames_encoded = 0
                 for frame in in_container.decode(in_stream):
+                    frames_encoded += 1
                     for resampled in resampler.resample(frame):
                         for packet in out_stream.encode(resampled):
                             out_container.mux(packet)
 
-                for resampled in resampler.resample(None):
-                    for packet in out_stream.encode(resampled):
-                        out_container.mux(packet)
+                if frames_encoded > 0:
+                    for resampled in resampler.resample(None):
+                        for packet in out_stream.encode(resampled):
+                            out_container.mux(packet)
 
-                for packet in out_stream.encode(None):
-                    out_container.mux(packet)
+                    for packet in out_stream.encode(None):
+                        out_container.mux(packet)
 
         if not os.path.exists(part_path) or os.path.getsize(part_path) == 0:
             logger.warning(f"[AudioEngine] File compresso vuoto o non generato per {wav_path}")

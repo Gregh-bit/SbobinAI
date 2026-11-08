@@ -396,19 +396,41 @@ def _load_llama(model_path: str) -> Tuple[Any, Any]:
         f"[LLM Engine] Caricamento GGUF con llama.cpp ({'GPU offload completo' if gpu else 'CPU'}, "
         f"n_ctx={LLM_CONTEXT_TOKENS}): {model_path}"
     )
-    model = Llama(
-        model_path=model_path,
-        n_ctx=LLM_CONTEXT_TOKENS,
-        n_batch=512,
-        n_ubatch=512,
-        n_gpu_layers=-1 if gpu else 0,
-        n_threads=cpu_threads(),
-        n_threads_batch=os.cpu_count() or cpu_threads(),
-        flash_attn=gpu,
-        use_mmap=True,
-        verbose=False,
-    )
-    return model, _GGUFChatTokenizer(model)
+    for try_flash in ([gpu, False] if gpu else [False]):
+        try:
+            model = Llama(
+                model_path=model_path,
+                n_ctx=LLM_CONTEXT_TOKENS,
+                n_batch=512,
+                n_ubatch=512,
+                n_gpu_layers=-1 if gpu else 0,
+                n_threads=cpu_threads(),
+                n_threads_batch=os.cpu_count() or cpu_threads(),
+                flash_attn=try_flash,
+                use_mmap=True,
+                verbose=False,
+            )
+            return model, _GGUFChatTokenizer(model)
+        except Exception as e:
+            if try_flash:
+                logger.warning(f"[LLM Engine] Caricamento con flash_attn=True fallito ({e}), riprovo senza flash attention...")
+                continue
+            if gpu:
+                logger.warning(f"[LLM Engine] Caricamento su GPU fallito ({e}), fallback su CPU...")
+                model = Llama(
+                    model_path=model_path,
+                    n_ctx=LLM_CONTEXT_TOKENS,
+                    n_batch=512,
+                    n_ubatch=512,
+                    n_gpu_layers=0,
+                    n_threads=cpu_threads(),
+                    n_threads_batch=os.cpu_count() or cpu_threads(),
+                    flash_attn=False,
+                    use_mmap=True,
+                    verbose=False,
+                )
+                return model, _GGUFChatTokenizer(model)
+            raise
 
 
 def get_or_load_model(model_id: Optional[str] = None) -> Tuple[Any, Any]:
@@ -867,7 +889,7 @@ STRUTTURA OBBLIGATORIA DEL CAPITOLO (in Markdown):
             full_chapter = _generate_blocking(
                 messages,
                 model_id=target,
-                max_tokens=1200,
+                max_tokens=2500,
                 fallback_str=f"{system_prompt}\n\n{user_prompt}\n\n# {title} — Capitolo di Studio\n",
                 epoch=epoch,
                 kv_bits=4,

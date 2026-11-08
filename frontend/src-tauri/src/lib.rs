@@ -1,6 +1,8 @@
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,14 +27,205 @@ pub struct BackendState(pub Arc<Mutex<BackendStatus>>);
 /// Python backend process spawned by us (None if already running or spawn failed).
 pub struct BackendProcess(pub Arc<Mutex<Option<Child>>>);
 
+/// Token di cancellazione atomico per arrestare immediatamente il bootstrap del backend alla chiusura dell'app.
+#[derive(Clone)]
+pub struct AppShutdown(pub Arc<AtomicBool>);
+
+// ── Native OS Wake Lock (Anti-sleep / Sleep Prevention) ─────────────────────────
+
+#[cfg(target_os = "macos")]
+mod macos_power {
+    use std::ffi::c_void;
+
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IOPMAssertionCreateWithName(
+            assertion_type: *const c_void,
+            assertion_level: u32,
+            assertion_name: *const c_void,
+            assertion_id: *mut u32,
+        ) -> i32;
+
+        fn IOPMAssertionRelease(assertion_id: u32) -> i32;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringCreateWithCString(
+            alloc: *const c_void,
+            c_str: *const std::ffi::c_char,
+            encoding: u32,
+        ) -> *const c_void;
+        fn CFRelease(cf: *const c_void);
+    }
+
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x08000100;
+    const K_IOPM_ASSERTION_LEVEL_ON: u32 = 255;
+
+    pub fn create_wake_lock(reason: &str) -> Option<u32> {
+        unsafe {
+            let type_str = std::ffi::CString::new("PreventUserIdleSystemSleep").ok()?;
+            let reason_str = std::ffi::CString::new(reason).ok()?;
+
+            let cf_type = CFStringCreateWithCString(std::ptr::null(), type_str.as_ptr(), K_CF_STRING_ENCODING_UTF8);
+            let cf_reason = CFStringCreateWithCString(std::ptr::null(), reason_str.as_ptr(), K_CF_STRING_ENCODING_UTF8);
+
+            if cf_type.is_null() || cf_reason.is_null() {
+                if !cf_type.is_null() {
+                    CFRelease(cf_type);
+                }
+                if !cf_reason.is_null() {
+                    CFRelease(cf_reason);
+                }
+                return None;
+            }
+
+            let mut assertion_id: u32 = 0;
+            let ret = IOPMAssertionCreateWithName(
+                cf_type,
+                K_IOPM_ASSERTION_LEVEL_ON,
+                cf_reason,
+                &mut assertion_id,
+            );
+
+            CFRelease(cf_type);
+            CFRelease(cf_reason);
+
+            if ret == 0 {
+                log::info!("[WakeLock] Asserzione macOS IOKit creata con successo (ID: {})", assertion_id);
+                Some(assertion_id)
+            } else {
+                log::warn!("[WakeLock] Errore creazione asserzione IOKit: {}", ret);
+                None
+            }
+        }
+    }
+
+    pub fn release_wake_lock(assertion_id: u32) {
+        unsafe {
+            let ret = IOPMAssertionRelease(assertion_id);
+            if ret == 0 {
+                log::info!("[WakeLock] Asserzione macOS IOKit rilasciata (ID: {})", assertion_id);
+            } else {
+                log::warn!("[WakeLock] Errore rilascio asserzione IOKit {}: {}", assertion_id, ret);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod windows_power {
+    type ExecutionState = u32;
+    const ES_CONTINUOUS: ExecutionState = 0x80000000;
+    const ES_SYSTEM_REQUIRED: ExecutionState = 0x00000001;
+    const ES_AWAYMODE_REQUIRED: ExecutionState = 0x00000040;
+
+    unsafe extern "system" {
+        fn SetThreadExecutionState(es_flags: ExecutionState) -> ExecutionState;
+    }
+
+    pub fn create_wake_lock() -> bool {
+        unsafe {
+            // Tentativo 1: Continuous + System Required + Away Mode (supportato da Windows Vista/7/8/10/11)
+            let prev = SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED);
+            if prev == 0 {
+                // Tentativo 2: Fallback se Away Mode non è supportato dall'hardware/versione di Windows
+                let prev_fallback = SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+                if prev_fallback == 0 {
+                    log::warn!("[WakeLock] SetThreadExecutionState fallito su Windows");
+                    return false;
+                }
+            }
+            log::info!("[WakeLock] Anti-sleep attivato con successo su Windows (SetThreadExecutionState)");
+            true
+        }
+    }
+
+    pub fn release_wake_lock() {
+        unsafe {
+            SetThreadExecutionState(ES_CONTINUOUS);
+            log::info!("[WakeLock] Anti-sleep disattivato su Windows (ripristinato ES_CONTINUOUS)");
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct WakeLockState {
+    #[cfg(target_os = "macos")]
+    pub assertion_id: Mutex<Option<u32>>,
+    #[cfg(target_os = "windows")]
+    pub active: AtomicBool,
+}
+
+#[tauri::command]
+fn acquire_wake_lock(state: tauri::State<WakeLockState>, reason: Option<String>) -> Result<(), String> {
+    let r = reason.unwrap_or_else(|| "SbobinAI - Registrazione audio lezione in corso".to_string());
+    #[cfg(target_os = "macos")]
+    {
+        let mut guard = state.assertion_id.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.is_none() {
+            if let Some(id) = macos_power::create_wake_lock(&r) {
+                *guard = Some(id);
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if !state.active.swap(true, Ordering::SeqCst) {
+            windows_power::create_wake_lock();
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = r;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn release_wake_lock(state: tauri::State<WakeLockState>) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut guard = state.assertion_id.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(id) = guard.take() {
+            macos_power::release_wake_lock(id);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if state.active.swap(false, Ordering::SeqCst) {
+            windows_power::release_wake_lock();
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn get_backend_status(state: tauri::State<BackendState>) -> BackendStatus {
-    state.0.lock().unwrap().clone()
+    state.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
 fn backend_is_up() -> bool {
     let addr: SocketAddr = ([127, 0, 0, 1], 8000).into();
-    TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(400)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(600)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(400)));
+
+    let req = b"GET /health HTTP/1.1\r\nHost: 127.0.0.1:8000\r\nConnection: close\r\n\r\n";
+    if stream.write_all(req).is_err() {
+        return false;
+    }
+
+    let mut buf = [0u8; 512];
+    match stream.read(&mut buf) {
+        Ok(n) if n > 0 => {
+            let resp = String::from_utf8_lossy(&buf[..n]);
+            resp.starts_with("HTTP/1.1 200") && (resp.contains("SbobinAI") || (resp.contains("status") && resp.contains("ok")))
+        }
+        _ => false,
+    }
 }
 
 fn has_main(dir: &Path) -> bool {
@@ -149,17 +342,50 @@ fn find_base_python() -> Option<PathBuf> {
 
     #[cfg(target_os = "macos")]
     {
-        candidates.push(PathBuf::from("/opt/homebrew/bin/python3.12"));
-        candidates.push(PathBuf::from("/opt/homebrew/bin/python3.11"));
-        candidates.push(PathBuf::from("/opt/homebrew/bin/python3"));
-        candidates.push(PathBuf::from("/Library/Frameworks/Python.framework/Versions/3.12/bin/python3"));
-        candidates.push(PathBuf::from("/Library/Frameworks/Python.framework/Versions/3.11/bin/python3"));
-        candidates.push(PathBuf::from("/Library/Frameworks/Python.framework/Versions/3.10/bin/python3"));
-        candidates.push(PathBuf::from("/usr/local/bin/python3"));
+        for prefix in &["/opt/homebrew/bin", "/usr/local/bin"] {
+            for ver in &["python3.12", "python3.11", "python3.10", "python3"] {
+                let p = PathBuf::from(format!("{prefix}/{ver}"));
+                if p.is_file() && !candidates.contains(&p) {
+                    candidates.push(p);
+                }
+            }
+        }
+        for ver in &["3.12", "3.11", "3.10"] {
+            let p = PathBuf::from(format!("/Library/Frameworks/Python.framework/Versions/{ver}/bin/python3"));
+            if p.is_file() && !candidates.contains(&p) {
+                candidates.push(p);
+            }
+        }
         if let Some(home) = get_home_dir() {
             candidates.push(home.join(".pyenv/shims/python3"));
+            candidates.push(home.join(".local/bin/python3"));
         }
-        candidates.push(PathBuf::from("/usr/bin/python3"));
+        // Scansione dinamica del PATH utente
+        if let Ok(output) = Command::new("/usr/bin/which").arg("python3").output() {
+            if output.status.success() {
+                let trimmed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !trimmed.is_empty() {
+                    let p = PathBuf::from(trimmed);
+                    if p.is_file() && !candidates.contains(&p) && !p.starts_with("/usr/bin") {
+                        candidates.push(p);
+                    }
+                }
+            }
+        }
+        // /usr/bin/python3 solo se Command Line Tools di Xcode sono installati (evita popup di sistema)
+        let has_clt = Command::new("/usr/bin/xcode-select")
+            .arg("-p")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if has_clt {
+            let p = PathBuf::from("/usr/bin/python3");
+            if p.is_file() && !candidates.contains(&p) {
+                candidates.push(p);
+            }
+        }
     }
     #[cfg(windows)]
     {
@@ -260,7 +486,7 @@ fn find_base_python() -> Option<PathBuf> {
     for c in candidates {
         if c.is_file() {
             let ok = silent_command(&c)
-                .args(["-c", "import sys; exit(0 if sys.version_info >= (3, 8) else 1)"])
+                .args(["-c", "import sys; exit(0 if (3, 10) <= sys.version_info < (3, 13) else 1)"])
                 .env("PATH", &path_env)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -268,7 +494,7 @@ fn find_base_python() -> Option<PathBuf> {
                 .map(|s| s.success())
                 .unwrap_or(false);
             if ok {
-                log::info!("Rilevato interprete Python valido: {:?}", c);
+                log::info!("Rilevato interprete Python valido (3.10-3.12): {:?}", c);
                 return Some(c);
             }
         }
@@ -471,7 +697,7 @@ fn ensure_virtualenv(
     if let Some(base_py) = find_base_python() {
         log::info!("Trovato interprete Python utente già presente sul sistema: {:?}", base_py);
         {
-            let mut s = state.0.lock().unwrap();
+            let mut s = state.0.lock().unwrap_or_else(|p| p.into_inner());
             s.status = "initializing_venv".into();
             s.message = "Configurazione dell'ambiente locale in corso...".into();
         }
@@ -489,7 +715,7 @@ fn ensure_virtualenv(
 
         if venv_status.success() {
             {
-                let mut s = state.0.lock().unwrap();
+                let mut s = state.0.lock().unwrap_or_else(|p| p.into_inner());
                 s.status = "installing_deps".into();
                 s.message = "Installazione delle librerie del motore in corso (richiede qualche minuto al primo avvio)...".into();
             }
@@ -572,7 +798,7 @@ fn ensure_virtualenv(
         #[cfg(not(windows))]
         {
             {
-                let mut s = state.0.lock().unwrap();
+                let mut s = state.0.lock().unwrap_or_else(|p| p.into_inner());
                 s.status = "initializing_venv".into();
                 s.message = "Sto preparando l'ambiente per l'uso, aspetta ancora un po'...".into();
             }
@@ -584,17 +810,19 @@ fn ensure_virtualenv(
                 .status();
 
             if let Some(home) = get_home_dir() {
-                let local_uv = home.join(".local/bin/uv");
-                if local_uv.is_file() {
-                    uv_bin = local_uv;
-                    has_uv = true;
+                for cand in &[home.join(".local/bin/uv"), home.join(".cargo/bin/uv")] {
+                    if cand.is_file() {
+                        uv_bin = cand.clone();
+                        has_uv = true;
+                        break;
+                    }
                 }
             }
         }
         #[cfg(windows)]
         {
             {
-                let mut s = state.0.lock().unwrap();
+                let mut s = state.0.lock().unwrap_or_else(|p| p.into_inner());
                 s.status = "initializing_venv".into();
                 s.message = "Configurazione componenti in corso...".into();
             }
@@ -625,7 +853,7 @@ fn ensure_virtualenv(
 
     if has_uv {
         {
-            let mut s = state.0.lock().unwrap();
+            let mut s = state.0.lock().unwrap_or_else(|p| p.into_inner());
             s.status = "initializing_venv".into();
             s.message = "Configurazione runtime locale autonomo in corso...".into();
         }
@@ -642,7 +870,7 @@ fn ensure_virtualenv(
         }
 
         {
-            let mut s = state.0.lock().unwrap();
+            let mut s = state.0.lock().unwrap_or_else(|p| p.into_inner());
             s.status = "installing_deps".into();
             s.message = "Installazione delle librerie del motore in corso (richiede qualche minuto al primo avvio)...".into();
         }
@@ -683,10 +911,15 @@ fn run_backend_bootstrap(
     app: tauri::AppHandle,
     state: BackendState,
     process: BackendProcess,
+    shutdown: Arc<AtomicBool>,
 ) {
+    if shutdown.load(Ordering::SeqCst) {
+        return;
+    }
+
     if backend_is_up() {
         log::info!("Backend already listening on 127.0.0.1:8000");
-        let mut s = state.0.lock().unwrap();
+        let mut s = state.0.lock().unwrap_or_else(|p| p.into_inner());
         s.status = "ready".into();
         s.message = "Motore locale SbobinAI pronto".into();
         s.port_ready = true;
@@ -697,13 +930,17 @@ fn run_backend_bootstrap(
         Some(d) => d,
         None => {
             log::error!("Cartella backend non trovata");
-            let mut s = state.0.lock().unwrap();
+            let mut s = state.0.lock().unwrap_or_else(|p| p.into_inner());
             s.status = "error".into();
             s.message = "Cartella backend non trovata nel pacchetto applicativo.".into();
             s.error = Some("Directory backend mancante".into());
             return;
         }
     };
+
+    if shutdown.load(Ordering::SeqCst) {
+        return;
+    }
 
     // 1. Cerca prima se esiste già un venv di sviluppo con dipendenze attive
     let dev_py = if cfg!(windows) {
@@ -720,7 +957,7 @@ fn run_backend_bootstrap(
         let home = match get_home_dir() {
             Some(h) => h,
             None => {
-                let mut s = state.0.lock().unwrap();
+                let mut s = state.0.lock().unwrap_or_else(|p| p.into_inner());
                 s.status = "error".into();
                 s.message = "Impossibile determinare la cartella home dell'utente.".into();
                 return;
@@ -735,11 +972,15 @@ fn run_backend_bootstrap(
             home.join(".sbobinai/venv")
         };
 
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+
         match ensure_virtualenv(&backend_dir, &target_venv, &state) {
             Ok(py) => py,
             Err(e) => {
                 log::error!("Errore bootstrap venv: {}", e);
-                let mut s = state.0.lock().unwrap();
+                let mut s = state.0.lock().unwrap_or_else(|p| p.into_inner());
                 s.status = "error".into();
                 s.message = "Errore durante la preparazione dell'ambiente AI locale.".into();
                 s.error = Some(e);
@@ -748,8 +989,13 @@ fn run_backend_bootstrap(
         }
     };
 
+    if shutdown.load(Ordering::SeqCst) {
+        log::info!("Bootstrap backend interrotto per shutdown applicazione.");
+        return;
+    }
+
     {
-        let mut s = state.0.lock().unwrap();
+        let mut s = state.0.lock().unwrap_or_else(|p| p.into_inner());
         s.status = "starting".into();
         s.message = "Avvio del motore AI locale in corso...".into();
     }
@@ -768,7 +1014,13 @@ fn run_backend_bootstrap(
     let log_file = get_home_dir().and_then(|home| {
         #[cfg(target_os = "macos")]
         let log_dir = home.join("Library/Logs/SbobinAI");
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        let log_dir = std::env::var("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home.join(r"AppData\Local"))
+            .join("SbobinAI")
+            .join("logs");
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let log_dir = home.join(".sbobinai/logs");
         let _ = std::fs::create_dir_all(&log_dir);
         let path = log_dir.join("backend.log");
@@ -809,20 +1061,43 @@ fn run_backend_bootstrap(
 
     match cmd.spawn() {
         Ok(child) => {
+            if shutdown.load(Ordering::SeqCst) {
+                let mut child = child;
+                let _ = child.kill();
+                return;
+            }
             log::info!("Backend avviato con successo (pid {})", child.id());
             if let Ok(mut g) = process.0.lock() {
                 *g = Some(child);
             }
 
             for i in 0..60 {
+                if shutdown.load(Ordering::SeqCst) {
+                    return;
+                }
                 if backend_is_up() {
                     log::info!("Porta 8000 attiva e verificata dopo {} cicli", i + 1);
-                    let mut s = state.0.lock().unwrap();
+                    let mut s = state.0.lock().unwrap_or_else(|p| p.into_inner());
                     s.status = "ready".into();
                     s.message = "Motore locale SbobinAI pronto".into();
                     s.port_ready = true;
                     return;
                 }
+
+                // Controlla se il child process è terminato prematuramente (es. crash all'import o porta occupata)
+                if let Ok(mut g) = process.0.lock() {
+                    if let Some(ref mut child_proc) = *g {
+                        if let Ok(Some(exit_status)) = child_proc.try_wait() {
+                            log::error!("Il backend Python è terminato inaspettatamente con stato: {exit_status}");
+                            let mut s = state.0.lock().unwrap_or_else(|p| p.into_inner());
+                            s.status = "error".into();
+                            s.message = format!("Il motore locale si è arrestato all'avvio ({exit_status}).");
+                            s.error = Some(format!("Crash processo backend: {exit_status}"));
+                            return;
+                        }
+                    }
+                }
+
                 std::thread::sleep(Duration::from_millis(500));
             }
 
@@ -831,14 +1106,14 @@ fn run_backend_bootstrap(
             } else {
                 "~/Library/Logs/SbobinAI/backend.log"
             };
-            let mut s = state.0.lock().unwrap();
+            let mut s = state.0.lock().unwrap_or_else(|p| p.into_inner());
             s.status = "error".into();
             s.message = format!("Il motore locale non ha risposto entro 30s. Controlla {log_hint}.");
             s.error = Some("Timeout avvio server locale".into());
         }
         Err(e) => {
             log::error!("Errore avvio comando uvicorn: {}", e);
-            let mut s = state.0.lock().unwrap();
+            let mut s = state.0.lock().unwrap_or_else(|p| p.into_inner());
             s.status = "error".into();
             s.message = format!("Impossibile avviare il backend: {e}");
             s.error = Some(e.to_string());
@@ -847,19 +1122,23 @@ fn run_backend_bootstrap(
 }
 
 fn kill_backend(app: &tauri::AppHandle) {
+    if let Some(shutdown) = app.try_state::<AppShutdown>() {
+        shutdown.0.store(true, Ordering::SeqCst);
+    }
     let Some(state) = app.try_state::<BackendProcess>() else {
         return;
     };
     let child = match state.0.lock() {
         Ok(mut g) => g.take(),
-        Err(_) => None,
+        Err(poisoned) => poisoned.into_inner().take(),
     };
     if let Some(mut child) = child {
+        let pid = child.id();
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
             let _ = Command::new("taskkill")
-                .args(["/T", "/F", "/PID", &child.id().to_string()])
+                .args(["/T", "/F", "/PID", &pid.to_string()])
                 .creation_flags(0x0800_0000)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -868,15 +1147,512 @@ fn kill_backend(app: &tauri::AppHandle) {
         #[cfg(unix)]
         {
             let _ = Command::new("kill")
-                .args(["-TERM", &child.id().to_string()])
+                .args(["-TERM", &format!("-{}", pid)])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
-            std::thread::sleep(Duration::from_millis(300));
+            let _ = Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            std::thread::sleep(Duration::from_millis(800));
         }
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+#[tauri::command]
+async fn uninstall_sbobinai(
+    app: tauri::AppHandle,
+    keep_storage_path: Option<String>,
+    delete_storage_folder: Option<bool>,
+) -> Result<(), String> {
+    let should_delete_storage = delete_storage_folder.unwrap_or(false);
+    log::info!("Richiesta disinstallazione SbobinAI avviata (elimina_cartella_lezioni: {})...", should_delete_storage);
+
+    // 1. Rilascia eventuale wake lock e termina immediatamente il backend Python se attivo
+    if let Some(wls) = app.try_state::<WakeLockState>() {
+        let _ = release_wake_lock(wls);
+    }
+    kill_backend(&app);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // 2. Rileva e normalizza la cartella di archiviazione utente
+    let home = get_home_dir();
+    let mut effective_storage = keep_storage_path.filter(|s| !s.trim().is_empty());
+    if effective_storage.is_none() {
+        if let Some(ref h) = home {
+            for cand in &[
+                h.join("Library/Application Support/com.sbobinai.app/settings.json"),
+                h.join(r"AppData\Local\SbobinAI\settings.json"),
+                h.join(".sbobinai/settings.json"),
+            ] {
+                if cand.is_file() {
+                    if let Ok(content) = std::fs::read_to_string(cand) {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                            if let Some(sp) = json.get("storage_path").and_then(|v| v.as_str()) {
+                                effective_storage = Some(sp.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Se l'utente ha scelto l'eliminazione totale, NON preservare nulla
+    let preserved_path: Option<PathBuf> = if should_delete_storage {
+        None
+    } else {
+        effective_storage
+            .as_deref()
+            .map(|s| {
+                if s.starts_with("~/") || s.starts_with("~\\") {
+                    if let Some(ref h) = home {
+                        return h.join(&s[2..]);
+                    }
+                }
+                PathBuf::from(s)
+            })
+            .or_else(|| home.as_ref().map(|h| h.join("Documents").join("SbobinAI")))
+    };
+
+    if should_delete_storage {
+        log::warn!("PULIZIA TOTALE: Nessun percorso preservato. La cartella lezioni e ogni traccia verranno rimosse.");
+    } else {
+        log::info!("Cartella dati utente PRESERVATA (whitelist protetta): {:?}", preserved_path);
+    }
+
+    let is_preserved = |p: &Path| -> bool {
+        if let Some(ref pres) = preserved_path {
+            if let (Ok(p_canon), Ok(pres_canon)) = (p.canonicalize(), pres.canonicalize()) {
+                return p_canon == pres_canon 
+                    || p_canon.starts_with(&pres_canon) 
+                    || pres_canon.starts_with(&p_canon);
+            }
+            if p == pres.as_path() || p.starts_with(pres.as_path()) || pres.as_path().starts_with(p) {
+                return true;
+            }
+        }
+        false
+    };
+
+    let safe_remove_dir = |p: &Path| {
+        if p.exists() && !is_preserved(p) {
+            log::info!("Rimozione directory: {:?}", p);
+            for attempt in 0..5 {
+                match std::fs::remove_dir_all(p) {
+                    Ok(_) => break,
+                    Err(e) if attempt < 4 => {
+                        log::warn!("Tentativo {} cancellazione {:?} fallito ({}), attendo rilascio lock...", attempt + 1, p, e);
+                        std::thread::sleep(Duration::from_millis(300 * (attempt + 1) as u64));
+                    }
+                    Err(e) => {
+                        log::error!("Impossibile rimuovere {:?} dopo ripetuti tentativi: {}", p, e);
+                    }
+                }
+            }
+        }
+    };
+
+    let safe_remove_file = |p: &Path| {
+        if p.exists() && !is_preserved(p) {
+            log::info!("Rimozione file: {:?}", p);
+            let _ = std::fs::remove_file(p);
+        }
+    };
+
+    let safe_delete_storage_directory = |target_path: &Path| {
+        if !target_path.exists() {
+            return;
+        }
+
+        // Controllo di sicurezza: non eliminare mai cartelle di sistema vitali
+        if let Some(ref h) = home {
+            let p_canon = target_path.canonicalize().unwrap_or_else(|_| target_path.to_path_buf());
+            let h_canon = h.canonicalize().unwrap_or_else(|_| h.to_path_buf());
+            let docs_canon = h.join("Documents").canonicalize().unwrap_or_else(|_| h.join("Documents"));
+            let desk_canon = h.join("Desktop").canonicalize().unwrap_or_else(|_| h.join("Desktop"));
+            let down_canon = h.join("Downloads").canonicalize().unwrap_or_else(|_| h.join("Downloads"));
+
+            if p_canon == h_canon || p_canon == docs_canon || p_canon == desk_canon || p_canon == down_canon || p_canon.parent().is_none() {
+                log::warn!("Il percorso storage coincide con una cartella radice o di sistema ({:?}). Elimino solo i dati interni di SbobinAI.", p_canon);
+                safe_remove_dir(&target_path.join("audio"));
+                safe_remove_dir(&target_path.join("sqlite"));
+                safe_remove_dir(&target_path.join("lancedb"));
+                safe_remove_dir(&target_path.join("uploads"));
+                safe_remove_dir(&target_path.join("quaderno"));
+                safe_remove_file(&target_path.join("settings.json"));
+                safe_remove_file(&target_path.join("sbobinai.db"));
+                safe_remove_file(&target_path.join("unicopilot.db"));
+                return;
+            }
+        }
+
+        log::info!("Eliminazione definitiva cartella storage SbobinAI: {:?}", target_path);
+        safe_remove_dir(target_path);
+    };
+
+    // 3. Rimozione profonda dei modelli Hugging Face e delle cache AI di SbobinAI
+    let mut hf_roots: Vec<PathBuf> = Vec::new();
+    if let Ok(val) = std::env::var("HF_HUB_CACHE") {
+        hf_roots.push(PathBuf::from(val));
+    }
+    if let Ok(val) = std::env::var("HF_HOME") {
+        let p = PathBuf::from(val);
+        hf_roots.push(p.join("hub"));
+        hf_roots.push(p);
+    }
+    if let Some(ref h) = home {
+        hf_roots.push(h.join(".cache").join("huggingface").join("hub"));
+        hf_roots.push(h.join(".cache").join("huggingface"));
+        hf_roots.push(h.join(".huggingface"));
+        #[cfg(target_os = "macos")]
+        {
+            hf_roots.push(h.join("Library/Caches/huggingface"));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if let Ok(local_app) = std::env::var("LOCALAPPDATA") {
+                let p = PathBuf::from(local_app);
+                hf_roots.push(p.join(r"huggingface\hub"));
+                hf_roots.push(p.join("huggingface"));
+            }
+            if let Ok(app_data) = std::env::var("APPDATA") {
+                let p = PathBuf::from(app_data);
+                hf_roots.push(p.join(r"huggingface\hub"));
+                hf_roots.push(p.join("huggingface"));
+            }
+            hf_roots.push(h.join(r"AppData\Local\huggingface\hub"));
+            hf_roots.push(h.join(r"AppData\Local\huggingface"));
+            hf_roots.push(h.join(r"AppData\Roaming\huggingface"));
+        }
+    }
+
+    if should_delete_storage {
+        // Pulizia totale: elimina ogni singola directory di cache HuggingFace
+        for hf_dir in &hf_roots {
+            safe_remove_dir(hf_dir);
+        }
+
+        // Cache PyTorch, Whisper, MLX, uv e pip
+        if let Some(ref h) = home {
+            safe_remove_dir(&h.join(".cache/mlx"));
+            safe_remove_dir(&h.join(".cache/torch"));
+            safe_remove_dir(&h.join(".cache/whisper"));
+            safe_remove_dir(&h.join(".cache/uv"));
+            safe_remove_dir(&h.join(".local/share/uv"));
+            #[cfg(target_os = "macos")]
+            {
+                safe_remove_dir(&h.join("Library/Caches/pip"));
+                safe_remove_dir(&h.join("Library/Caches/uv"));
+            }
+            #[cfg(target_os = "windows")]
+            {
+                safe_remove_dir(&h.join(r"AppData\Local\torch"));
+                safe_remove_dir(&h.join(r"AppData\Local\whisper"));
+                safe_remove_dir(&h.join(r"AppData\Local\pip"));
+                safe_remove_dir(&h.join(r"AppData\Local\uv"));
+                safe_remove_dir(&h.join(r"AppData\Roaming\uv"));
+            }
+        }
+    } else {
+        // Se preserva la cartella lezioni, rimuove comunque tutti i modelli AI scaricati da SbobinAI
+        let sbobinai_prefixes = [
+            "models--mlx-community--whisper",
+            "models--dropbox-dash--faster-whisper",
+            "models--Systran--faster-whisper",
+            "models--mlx-community--Qwen",
+            "models--unsloth--Qwen",
+            "models--unsloth--gemma",
+            "models--mlx-community--bge",
+            "models--mlx-community--multilingual",
+            "models--CompendiumLabs--bge",
+            "models--Qwen--Qwen3-Embedding",
+            "models--Qwen--Qwen",
+        ];
+
+        for hf_cache in &hf_roots {
+            if hf_cache.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(hf_cache) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if sbobinai_prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+                            safe_remove_dir(&entry.path());
+                        }
+                    }
+                }
+
+                let locks_dir = hf_cache.join(".locks");
+                if locks_dir.is_dir() {
+                    if let Ok(entries) = std::fs::read_dir(&locks_dir) {
+                        for entry in entries.flatten() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            if sbobinai_prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+                                safe_remove_dir(&entry.path());
+                                safe_remove_file(&entry.path());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Rimozione dei dati applicazione, venv, backend e settings
+    if let Some(ref h) = home {
+        #[cfg(target_os = "macos")]
+        {
+            safe_remove_dir(&h.join("Library/Application Support/com.sbobinai.app"));
+            safe_remove_dir(&h.join("Library/Application Support/SbobinAI"));
+            safe_remove_dir(&h.join("Library/Application Support/unicopilot"));
+            safe_remove_dir(&h.join("Library/Caches/com.sbobinai.app"));
+            safe_remove_dir(&h.join("Library/Caches/SbobinAI"));
+            safe_remove_dir(&h.join("Library/Caches/unicopilot"));
+            safe_remove_dir(&h.join("Library/WebKit/com.sbobinai.app"));
+            safe_remove_dir(&h.join("Library/WebKit/SbobinAI"));
+            safe_remove_dir(&h.join("Library/Logs/SbobinAI"));
+            safe_remove_dir(&h.join("Library/Logs/com.sbobinai.app"));
+            safe_remove_dir(&h.join("Library/Saved Application State/com.sbobinai.app.savedState"));
+            safe_remove_dir(&h.join("Library/HTTPStorages/com.sbobinai.app"));
+            safe_remove_file(&h.join("Library/Preferences/com.sbobinai.app.plist"));
+            safe_remove_dir(&h.join(".sbobinai"));
+            safe_remove_dir(&h.join(".unicopilot"));
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            safe_remove_dir(&h.join(r"AppData\Local\SbobinAI"));
+            safe_remove_dir(&h.join(r"AppData\Local\com.sbobinai.app"));
+            safe_remove_dir(&h.join(r"AppData\Local\unicopilot"));
+            safe_remove_dir(&h.join(r"AppData\Local\EBWebView"));
+            safe_remove_dir(&h.join(r"AppData\Roaming\com.sbobinai.app"));
+            safe_remove_dir(&h.join(r"AppData\Roaming\SbobinAI"));
+            safe_remove_dir(&h.join(r"AppData\Roaming\unicopilot"));
+            safe_remove_dir(&h.join(r"AppData\Local\Programs\SbobinAI"));
+            safe_remove_file(&h.join(r"Desktop\SbobinAI.lnk"));
+            safe_remove_file(&h.join(r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs\SbobinAI.lnk"));
+            safe_remove_dir(&h.join(".sbobinai"));
+            safe_remove_dir(&h.join(".unicopilot"));
+        }
+
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            safe_remove_dir(&h.join(".sbobinai"));
+            safe_remove_dir(&h.join(".unicopilot"));
+            safe_remove_dir(&h.join(".config/com.sbobinai.app"));
+            safe_remove_dir(&h.join(".config/SbobinAI"));
+            safe_remove_dir(&h.join(".local/share/com.sbobinai.app"));
+            safe_remove_dir(&h.join(".local/share/SbobinAI"));
+            safe_remove_dir(&h.join(".cache/com.sbobinai.app"));
+            safe_remove_dir(&h.join(".cache/SbobinAI"));
+        }
+    }
+
+    // 5. Pulizia file temporanei
+    let temp_dir = std::env::temp_dir();
+    if let Ok(entries) = std::fs::read_dir(&temp_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("sbobinai_")
+                || name.starts_with("oral_answer_")
+                || name.starts_with("unicopilot_")
+                || name.starts_with("huggingface")
+                || name.starts_with("torch_")
+                || name == "com.sbobinai.app"
+            {
+                let _ = std::fs::remove_file(entry.path());
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+
+    // 5b. Se l'utente ha scelto l'eliminazione totale, elimina la cartella delle lezioni e dei dati personali
+    if should_delete_storage {
+        if let Some(ref raw_str) = effective_storage {
+            let resolved = if raw_str.starts_with("~/") || raw_str.starts_with("~\\") {
+                home.as_ref().map(|h| h.join(&raw_str[2..]))
+            } else {
+                Some(PathBuf::from(raw_str))
+            };
+            if let Some(p) = resolved {
+                safe_delete_storage_directory(&p);
+            }
+        }
+
+        if let Some(ref h) = home {
+            safe_delete_storage_directory(&h.join("Documents").join("SbobinAI"));
+            safe_delete_storage_directory(&h.join("Documents").join("UniCoPilot"));
+            #[cfg(target_os = "windows")]
+            {
+                safe_delete_storage_directory(&h.join(r"OneDrive\Documents\SbobinAI"));
+                safe_delete_storage_directory(&h.join(r"OneDrive\Documents\UniCoPilot"));
+                safe_delete_storage_directory(&h.join(r"OneDrive\Documenti\SbobinAI"));
+                safe_delete_storage_directory(&h.join(r"Documenti\SbobinAI"));
+            }
+            safe_delete_storage_directory(&h.join(".sbobinai"));
+            safe_delete_storage_directory(&h.join(".unicopilot"));
+        }
+    }
+
+    // 6. Autodistruzione del pacchetto applicativo se in produzione
+    if let Ok(exe_path) = std::env::current_exe() {
+        let is_dev_build = exe_path
+            .ancestors()
+            .any(|a| a.join(".git").exists() || a.ends_with("target/debug") || a.ends_with("target/release"));
+
+        if !is_dev_build {
+            #[cfg(target_os = "macos")]
+            {
+                let app_bundle = exe_path
+                    .ancestors()
+                    .find(|a| a.extension().map_or(false, |ext| ext == "app"));
+
+                if let Some(bundle) = app_bundle {
+                    let bundle_str = bundle.to_string_lossy().to_string().replace('\'', "'\\''");
+                    let home_str = home.as_ref().map(|h| h.to_string_lossy().to_string()).unwrap_or_default().replace('\'', "'\\''");
+                    
+                    let mut storage_clean_cmd = String::new();
+                    if should_delete_storage {
+                        if let Some(ref raw_str) = effective_storage {
+                            let resolved = if raw_str.starts_with("~/") || raw_str.starts_with("~\\") {
+                                format!("{}/{}", home_str, &raw_str[2..])
+                            } else {
+                                raw_str.clone()
+                            };
+                            if !resolved.is_empty() && resolved != home_str && resolved != format!("{}/Documents", home_str) && resolved != format!("{}/Desktop", home_str) {
+                                storage_clean_cmd.push_str(&format!("rm -rf '{}' 2>/dev/null; ", resolved.replace('\'', "'\\''")));
+                            }
+                        }
+                        storage_clean_cmd.push_str(&format!("rm -rf '{}/Documents/SbobinAI' '{}/Documents/UniCoPilot' 2>/dev/null; ", home_str, home_str));
+                        storage_clean_cmd.push_str(&format!("rm -rf '{0}/.cache/huggingface' '{0}/.huggingface' '{0}/Library/Caches/huggingface' '{0}/.cache/torch' '{0}/.cache/mlx' '{0}/.cache/whisper' '{0}/.cache/uv' '{0}/.local/share/uv' '{0}/Library/Caches/pip' '{0}/Library/Caches/uv' 2>/dev/null; ", home_str));
+                    }
+
+                    log::info!("Avvio script detached di rimozione per bundle: {}", bundle_str);
+                    let _ = Command::new("/bin/sh")
+                        .args([
+                            "-c",
+                            &format!(
+                                "sleep 1.2 && rm -rf '{bundle}' '{home}/Library/Application Support/com.sbobinai.app' '{home}/Library/Application Support/SbobinAI' '{home}/Library/Application Support/unicopilot' '{home}/Library/Caches/com.sbobinai.app' '{home}/Library/Caches/SbobinAI' '{home}/Library/Caches/unicopilot' '{home}/Library/WebKit/com.sbobinai.app' '{home}/Library/WebKit/SbobinAI' '{home}/Library/Logs/SbobinAI' '{home}/Library/Logs/com.sbobinai.app' '{home}/Library/Saved Application State/com.sbobinai.app.savedState' '{home}/Library/HTTPStorages/com.sbobinai.app' '{home}/Library/Preferences/com.sbobinai.app.plist' '{home}/.sbobinai' '{home}/.unicopilot' 2>/dev/null; {storage_clean_cmd}defaults delete com.sbobinai.app 2>/dev/null || true; killall Dock 2>/dev/null || true",
+                                bundle = bundle_str,
+                                home = home_str,
+                                storage_clean_cmd = storage_clean_cmd
+                            ),
+                        ])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn();
+                }
+            }
+
+            #[cfg(target_os = "windows")]
+            {
+                let exe_dir = exe_path.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default().replace('\'', "''");
+                let uninstaller = exe_path.parent().map(|p| p.join("Uninstall SbobinAI.exe"));
+                let has_uninstaller = uninstaller.as_ref().map(|u| u.is_file()).unwrap_or(false);
+                
+                if let Some(uninst) = uninstaller {
+                    if has_uninstaller {
+                        let _ = silent_command(&uninst)
+                            .arg("/S")
+                            .spawn();
+                    }
+                }
+
+                let mut storage_ps_cmd = String::new();
+                if should_delete_storage {
+                    if let Some(ref raw_str) = effective_storage {
+                        let resolved = if raw_str.starts_with("~/") || raw_str.starts_with("~\\") {
+                            home.as_ref().map(|h| h.join(&raw_str[2..]).to_string_lossy().to_string()).unwrap_or_default()
+                        } else {
+                            raw_str.clone()
+                        };
+                        if !resolved.is_empty() {
+                            storage_ps_cmd.push_str(&format!("Remove-Item -Recurse -Force '{}' -ErrorAction SilentlyContinue; ", resolved.replace('\'', "''")));
+                        }
+                    }
+                    if let Some(ref h) = home {
+                        let default_doc = h.join("Documents").join("SbobinAI").to_string_lossy().to_string().replace('\'', "''");
+                        storage_ps_cmd.push_str(&format!("Remove-Item -Recurse -Force '{}' -ErrorAction SilentlyContinue; ", default_doc));
+                        let unist_doc = h.join("Documents").join("UniCoPilot").to_string_lossy().to_string().replace('\'', "''");
+                        storage_ps_cmd.push_str(&format!("Remove-Item -Recurse -Force '{}' -ErrorAction SilentlyContinue; ", unist_doc));
+                    }
+                    storage_ps_cmd.push_str(
+                        "Remove-Item -Recurse -Force \"$HOME\\.cache\\huggingface\" -ErrorAction SilentlyContinue; \
+                         Remove-Item -Recurse -Force \"$HOME\\.huggingface\" -ErrorAction SilentlyContinue; \
+                         Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\huggingface\" -ErrorAction SilentlyContinue; \
+                         Remove-Item -Recurse -Force \"$env:APPDATA\\huggingface\" -ErrorAction SilentlyContinue; \
+                         Remove-Item -Recurse -Force \"$HOME\\.cache\\torch\" -ErrorAction SilentlyContinue; \
+                         Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\torch\" -ErrorAction SilentlyContinue; \
+                         Remove-Item -Recurse -Force \"$HOME\\.cache\\whisper\" -ErrorAction SilentlyContinue; \
+                         Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\whisper\" -ErrorAction SilentlyContinue; \
+                         Remove-Item -Recurse -Force \"$HOME\\.cache\\uv\" -ErrorAction SilentlyContinue; \
+                         Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\uv\" -ErrorAction SilentlyContinue; \
+                         Remove-Item -Recurse -Force \"$env:APPDATA\\uv\" -ErrorAction SilentlyContinue; \
+                         Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\pip\" -ErrorAction SilentlyContinue; \
+                         $docs = [Environment]::GetFolderPath('MyDocuments'); if ($docs) { Remove-Item -Recurse -Force \"$docs\\SbobinAI\" -ErrorAction SilentlyContinue; Remove-Item -Recurse -Force \"$docs\\UniCoPilot\" -ErrorAction SilentlyContinue; }; "
+                    );
+                }
+
+                let exe_cleanup = if has_uninstaller {
+                    String::new()
+                } else {
+                    format!("Remove-Item -Recurse -Force '{}' -ErrorAction SilentlyContinue; ", exe_dir)
+                };
+
+                let _ = silent_command("powershell")
+                    .args([
+                        "-NoProfile",
+                        "-WindowStyle",
+                        "Hidden",
+                        "-Command",
+                        &format!(
+                            "Start-Sleep -Seconds 2; \
+                             Get-Process SbobinAI -ErrorAction SilentlyContinue | Stop-Process -Force; \
+                             Get-Process msedgewebview2 -ErrorAction SilentlyContinue | Where-Object {{ $_.Path -like '*com.sbobinai.app*' }} | Stop-Process -Force; \
+                             {}Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\SbobinAI\" -ErrorAction SilentlyContinue; \
+                             Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\com.sbobinai.app\" -ErrorAction SilentlyContinue; \
+                             Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\unicopilot\" -ErrorAction SilentlyContinue; \
+                             Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\EBWebView\" -ErrorAction SilentlyContinue; \
+                             Remove-Item -Recurse -Force \"$env:APPDATA\\com.sbobinai.app\" -ErrorAction SilentlyContinue; \
+                             Remove-Item -Recurse -Force \"$env:APPDATA\\SbobinAI\" -ErrorAction SilentlyContinue; \
+                             Remove-Item -Recurse -Force \"$env:APPDATA\\unicopilot\" -ErrorAction SilentlyContinue; \
+                             Remove-Item -Recurse -Force \"$HOME\\.sbobinai\" -ErrorAction SilentlyContinue; \
+                             Remove-Item -Recurse -Force \"$HOME\\.unicopilot\" -ErrorAction SilentlyContinue; \
+                             Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\Programs\\SbobinAI\" -ErrorAction SilentlyContinue; \
+                             Remove-Item -Force \"$env:USERPROFILE\\Desktop\\SbobinAI.lnk\" -ErrorAction SilentlyContinue; \
+                             Remove-Item -Force \"$env:APPDATA\\Microsoft\\Windows\\Start Menu\\Programs\\SbobinAI.lnk\" -ErrorAction SilentlyContinue; \
+                             Remove-Item -Recurse -Force 'HKCU:\\Software\\SbobinAI' -ErrorAction SilentlyContinue; \
+                             Remove-Item -Recurse -Force 'HKCU:\\Software\\com.sbobinai.app' -ErrorAction SilentlyContinue; \
+                             Remove-Item -Recurse -Force 'HKCU:\\Software\\unicopilot' -ErrorAction SilentlyContinue; \
+                             Remove-Item -Recurse -Force 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\com.sbobinai.app' -ErrorAction SilentlyContinue; \
+                             Remove-Item -Recurse -Force 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\SbobinAI' -ErrorAction SilentlyContinue; {}",
+                            exe_cleanup,
+                            storage_ps_cmd
+                        ),
+                    ])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+            }
+        } else {
+            log::info!("Ambiente di sviluppo rilevato: saltata cancellazione binario.");
+        }
+    }
+
+    // 7. Chiusura del processo
+    let app_handle_for_exit = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(600));
+        app_handle_for_exit.exit(0);
+    });
+
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -910,19 +1686,28 @@ pub fn run() {
         error: None,
     }));
     let backend_proc_arc = Arc::new(Mutex::new(None));
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
 
     let backend_state = BackendState(backend_status);
     let backend_proc = BackendProcess(backend_proc_arc.clone());
 
     let state_for_setup = backend_state.clone();
     let proc_for_setup = BackendProcess(backend_proc_arc);
+    let shutdown_for_setup = shutdown_flag.clone();
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .manage(backend_state)
         .manage(backend_proc)
-        .invoke_handler(tauri::generate_handler![get_backend_status])
+        .manage(AppShutdown(shutdown_flag))
+        .manage(WakeLockState::default())
+        .invoke_handler(tauri::generate_handler![
+            get_backend_status,
+            uninstall_sbobinai,
+            acquire_wake_lock,
+            release_wake_lock
+        ])
         .setup(move |app| {
             #[cfg(target_os = "macos")]
             apply_macos_dock_icon();
@@ -937,7 +1722,7 @@ pub fn run() {
 
             let app_handle = app.handle().clone();
             std::thread::spawn(move || {
-                run_backend_bootstrap(app_handle, state_for_setup, proc_for_setup);
+                run_backend_bootstrap(app_handle, state_for_setup, proc_for_setup, shutdown_for_setup);
             });
 
             // Window effects
@@ -989,10 +1774,32 @@ pub fn run() {
     app.run(|app, event| match event {
         RunEvent::WindowEvent {
             label,
+            event: WindowEvent::CloseRequested { .. },
+            ..
+        } if label == "main" => {
+            if let Some(wls) = app.try_state::<WakeLockState>() {
+                let _ = release_wake_lock(wls);
+            }
+            kill_backend(app);
+            app.exit(0);
+        }
+        RunEvent::WindowEvent {
+            label,
             event: WindowEvent::Destroyed,
             ..
-        } if label == "main" => kill_backend(app),
-        RunEvent::Exit => kill_backend(app),
+        } if label == "main" => {
+            if let Some(wls) = app.try_state::<WakeLockState>() {
+                let _ = release_wake_lock(wls);
+            }
+            kill_backend(app);
+            app.exit(0);
+        }
+        RunEvent::Exit => {
+            if let Some(wls) = app.try_state::<WakeLockState>() {
+                let _ = release_wake_lock(wls);
+            }
+            kill_backend(app);
+        }
         _ => {}
     });
 }
