@@ -31,6 +31,15 @@ function BackendLoadingGate({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
+  // Pulizia automatica file orfani, vacuum DB e ottimizzazione storage ad ogni avvio dell'app
+  useEffect(() => {
+    if (isReady) {
+      void api.settings.cleanOrphans().catch((err) => {
+        console.warn('[Startup] Ottimizzazione e pulizia automatica saltata:', err);
+      });
+    }
+  }, [isReady]);
+
   useEffect(() => {
     let cancelled = false;
     let attempts = 0;
@@ -304,7 +313,7 @@ function MainApp() {
 
   return (
     <>
-      <UpdateBanner />
+      <UpdateBanner hidden={showSettingsModal} />
       {/* Onboarding Wizard a tutto schermo se setupComplete è false */}
       {!settings.setupComplete ? (
         <Suspense fallback={<div className="h-screen w-screen flex items-center justify-center bg-black/40"><div className="w-8 h-8 rounded-full border-2 border-white/20 border-t-white animate-spin" /></div>}>

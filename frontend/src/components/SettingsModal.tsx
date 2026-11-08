@@ -8,7 +8,7 @@ import {
 import { clsx } from 'clsx';
 import { useSettings } from '../lib/SettingsContext';
 import { pickFolder, isTauri } from '../lib/tauri';
-import { osBadge, fileManagerName, normalizeDisplayPath } from '../lib/platform';
+import { isMac, osBadge, fileManagerName, normalizeDisplayPath } from '../lib/platform';
 import { useUpdater } from '../lib/useUpdater';
 import { api } from '../lib/api';
 import type { ModelsStatusResponse, ModelInfo } from '../types';
@@ -25,30 +25,30 @@ type ModelFilterType = 'system_core' | 'llm';
 const defaultLlms: ModelInfo[] = [
   {
     id: 'mlx-community/Qwen3.5-4B-MLX-4bit',
-    name: 'Qwen 3.5 4B (MLX 4-bit)',
+    name: 'Qwen 3.5 4B (Consigliato)',
     type: 'llm',
     approx_size: '~2.8 GB',
-    description: 'Modello linguistico consigliato: compatto, veloce e ottimizzato con MLX 4-bit per Apple Silicon. Basso consumo di memoria RAM (~2.8 GB).',
+    description: 'Consigliato: compatto e veloce. Genera capitoli, sintesi ed evidenzia i concetti chiave.',
     downloaded: false,
     status: 'idle',
     disk_size_mb: null,
   },
   {
     id: 'mlx-community/Qwen3.5-2B-MLX-4bit',
-    name: 'Qwen 3.5 2B (MLX 4-bit ultraleggero)',
+    name: 'Qwen 3.5 2B (Leggero)',
     type: 'llm',
     approx_size: '~1.4 GB',
-    description: 'Versione ultraleggera a bassissimo impatto di memoria RAM (~1.4 GB). Ideale per MacBook con 8 GB di memoria unificata.',
+    description: 'Versione ultraleggera a basso consumo di memoria RAM. Ideale per computer con risorse contenute.',
     downloaded: false,
     status: 'idle',
     disk_size_mb: null,
   },
   {
     id: 'mlx-community/Qwen3.5-8B-MLX-4bit',
-    name: 'Qwen 3.5 8B (MLX 4-bit alta capacità)',
+    name: 'Qwen 3.5 8B (Avanzato)',
     type: 'llm',
     approx_size: '~5.5 GB',
-    description: 'Modello ad altissima capacità di ragionamento e sintesi concettuale (~5.5 GB in RAM). Consigliato per MacBook con 16 GB o più.',
+    description: 'Modello ad alta capacità di ragionamento. Consigliato per computer con 16 GB o più di RAM.',
     downloaded: false,
     status: 'idle',
     disk_size_mb: null,
@@ -133,17 +133,22 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
     }
   }, []);
 
-  const handleCleanOrphans = async () => {
+  const handleRecalculateAndOptimize = async () => {
     try {
       setIsCleaningOrphans(true);
       const res = await api.settings.cleanOrphans();
-      showNotification(
-        `Pulizia completata: liberati ${res.freed_mb} MB (${res.deleted_audio_files.length} audio orfani rimossi)!`,
-        'success'
-      );
       await fetchStorageStats();
+      await fetchModelsStatus(true);
+      if (res && res.freed_mb > 0) {
+        showNotification(
+          `Ottimizzazione completata: liberati ${res.freed_mb} MB e spazio ricalcolato!`,
+          'success'
+        );
+      } else {
+        showNotification('Spazio su disco ricalcolato e memoria ottimizzata.', 'info');
+      }
     } catch (err: any) {
-      showNotification(err?.message || 'Errore durante la pulizia dei file orfani.', 'error');
+      showNotification(err?.message || 'Errore durante l\'ottimizzazione dello spazio.', 'error');
     } finally {
       setIsCleaningOrphans(false);
     }
@@ -475,12 +480,12 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       badgeText: 'text-[#D087FF]',
       icon: Cpu,
       path: '~/.cache/huggingface/hub',
-      desc: 'Pesi neurali quantizzati 4-bit per Whisper, Qwen LLM ed Embedding RAG.',
-      details: `${downloadedModelsCount} ${downloadedModelsCount === 1 ? 'modello installato' : 'modelli installati'}`,
+      desc: 'Pesi neurali locali per trascrizione, riassunti e ricerca.',
+      details: `${downloadedModelsCount} ${downloadedModelsCount === 1 ? 'modello' : 'modelli'}`,
     },
     {
       id: 'audio',
-      label: 'Registrazioni Master Audio',
+      label: 'Audio Lezioni',
       shortLabel: 'Audio Lezioni',
       sizeMb: audioMb,
       color: 'bg-[#0A84FF]',
@@ -490,13 +495,13 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       badgeText: 'text-[#5AC8FA]',
       icon: FileAudio,
       path: normalizeDisplayPath(`${storagePath}/audio`),
-      desc: 'File master ad alta risoluzione 16-bit PCM 16kHz per trascrizione e ascolto.',
-      details: 'Audio fedele non compresso',
+      desc: 'Registrazioni audio delle lezioni universitarie.',
+      details: 'Tracce audio',
     },
     {
       id: 'sqlite',
-      label: 'Database Relazionale',
-      shortLabel: 'Database SQLite',
+      label: 'Database & Appunti',
+      shortLabel: 'Database',
       sizeMb: sqliteMb,
       color: 'bg-[#30D158]',
       dotColor: 'bg-[#30D158]',
@@ -505,13 +510,13 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       badgeText: 'text-[#6EE7B7]',
       icon: Database,
       path: normalizeDisplayPath(`${storagePath}/sqlite/sbobinai.db`),
-      desc: 'Corsi, trascrizioni parola per parola con timestamp, flashcard e note.',
-      details: 'Transazionale WAL / VACUUM',
+      desc: 'Trascrizioni, sbobine, quiz, flashcard e note dei corsi.',
+      details: 'Dati e appunti',
     },
     {
       id: 'lancedb',
-      label: 'Indice Vettoriale RAG',
-      shortLabel: 'LanceDB',
+      label: 'Memoria Semantica',
+      shortLabel: 'Memoria RAG',
       sizeMb: lancedbMb,
       color: 'bg-[#FF9F0A]',
       dotColor: 'bg-[#FF9F0A]',
@@ -520,13 +525,13 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       badgeText: 'text-[#FDBA74]',
       icon: Layers,
       path: normalizeDisplayPath(`${storagePath}/lancedb`),
-      desc: 'Embeddings a 1024 dimensioni per ricerca semantica e quiz intelligente.',
-      details: 'Vector DB zero-copy locale',
+      desc: 'Indice concettuale per la ricerca intelligente.',
+      details: 'Indice vettoriale',
     },
     {
       id: 'uploads',
-      label: 'Materiali & Documenti',
-      shortLabel: 'Uploads',
+      label: 'Materiali di Studio',
+      shortLabel: 'Materiali',
       sizeMb: uploadsMb,
       color: 'bg-[#FF375F]',
       dotColor: 'bg-[#FF375F]',
@@ -535,8 +540,8 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       badgeText: 'text-[#FDA4AF]',
       icon: Folder,
       path: normalizeDisplayPath(`${storagePath}/uploads`),
-      desc: 'Slide PDF, appunti in PDF e allegati di supporto caricati per i corsi.',
-      details: 'Dispense universitarie',
+      desc: 'Slide, dispense e documenti PDF dei corsi.',
+      details: 'Documenti PDF',
     },
   ];
 
@@ -591,7 +596,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                 <span>Archiviazione</span>
               </button>
 
-              {/* Tab 2: Modelli */}
+              {/* Tab 2: Modelli IA */}
               <button
                 onClick={() => setActiveTab('models')}
                 className={clsx(
@@ -602,10 +607,10 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                 )}
               >
                 <Cpu size={15} className="text-white/70" />
-                <span>Modelli</span>
+                <span>Modelli IA</span>
               </button>
 
-              {/* Tab 3: Motore Audio */}
+              {/* Tab 3: Audio & Registrazione */}
               <button
                 onClick={() => setActiveTab('audio')}
                 className={clsx(
@@ -616,7 +621,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                 )}
               >
                 <Mic size={15} className="text-white/70" />
-                <span>Motore Audio & VAD</span>
+                <span>Audio & Registrazione</span>
               </button>
 
               {/* Tab 4: Sistema & Privacy */}
@@ -630,20 +635,20 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                 )}
               >
                 <ShieldCheck size={15} className="text-white/70" />
-                <span>Privacy & Sistema</span>
+                <span>Sistema & Privacy</span>
               </button>
             </div>
 
-            {/* Bottom Sidebar: Subtle macOS Version Note */}
-            <div className="p-3 rounded-2xl bg-white/[0.02] border border-white/[0.06] text-center">
-              <span className="text-[10px] text-white/35 font-mono">
-                SbobinAI per macOS
+            {/* Bottom Sidebar: Subtle macOS/Windows Version Note */}
+            <div className="px-3 py-2 text-center">
+              <span className="text-[10px] text-white/30 font-mono">
+                v{updater.currentVersion || '0.0.13'} · {osBadge || 'Desktop'}
               </span>
             </div>
           </div>
 
           {/* ── Main Tab Content Panel con scroll fluido e spaziatura corretta ── */}
-          <div className="flex-1 p-6 pb-12 overflow-y-auto space-y-6 [scrollbar-gutter:stable]">
+          <div className="flex-1 p-6 pb-24 overflow-y-auto space-y-6 [scrollbar-gutter:stable]">
             
             {/* Banner Notifica Azione / Toast */}
             {notification && (
@@ -675,9 +680,9 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
             {activeTab === 'storage' && (
               <div className="space-y-6 animate-fade-in">
                 <div>
-                  <h3 className="text-sm font-bold text-white">Archiviazione & Memoria Locale</h3>
+                  <h3 className="text-sm font-bold text-white">Archiviazione</h3>
                   <p className="text-xs text-white/50 mt-1 leading-relaxed">
-                    Monitora lo spazio occupato su disco da registrazioni master, database, indici vettoriali e modelli di intelligenza artificiale.
+                    Gestisci lo spazio su disco occupato da lezioni, trascrizioni e modelli IA.
                   </p>
                 </div>
 
@@ -686,89 +691,44 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                   <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
                     <div>
                       <span className="text-[11px] font-semibold uppercase tracking-wider text-white/45 block">
-                        Utilizzo Spazio Disco SbobinAI
+                        Spazio occupato
                       </span>
-                      <div className="flex items-baseline gap-2.5 mt-0.5">
-                        <h4 className="text-2xl font-bold font-mono text-white tracking-tight">
-                          {formatSize(combinedTotalMb)}
+                      <div className="flex items-baseline gap-2 mt-0.5 whitespace-nowrap">
+                        <h4 className="text-3xl font-bold font-mono text-white tracking-tight">
+                          {combinedTotalMb >= 1024 ? (combinedTotalMb / 1024).toFixed(2) : combinedTotalMb.toFixed(1)}
                         </h4>
-                        <span className="text-xs text-white/50">
-                          totali impiegati sul Mac
+                        <span className="text-base font-semibold font-mono text-white/70">
+                          {combinedTotalMb >= 1024 ? 'GB' : 'MB'}
+                        </span>
+                        <span className="text-xs text-white/40 ml-1 hidden sm:inline">
+                          totali su disco ({isMac ? 'Mac' : 'PC'})
                         </span>
                       </div>
                     </div>
 
-                    {/* Tasti Azione: Ottimizza & Pulisci + Comprimi Archivio + Ricalcola */}
+                    {/* Tasto Azione Unificato: Ottimizza e Ricalcola */}
                     <div className="flex items-center gap-2 self-start sm:self-center">
                       <button
                         type="button"
-                        onClick={handleCompressArchive}
-                        disabled={isCompressingArchive}
+                        onClick={handleRecalculateAndOptimize}
+                        disabled={isCleaningOrphans || loadingModels}
                         className={clsx(
-                          "px-3 py-1.5 rounded-xl border text-xs font-semibold transition-all flex items-center gap-1.5 cursor-pointer shadow-liquid-sm whitespace-nowrap",
-                          isCompressingArchive
-                            ? "bg-emerald-500/20 text-emerald-200 border-emerald-500/30 cursor-wait"
-                            : "bg-white/[0.08] hover:bg-white/[0.14] border-white/14 text-white/80 hover:text-white"
-                        )}
-                        title="Converte tutte le registrazioni WAV non compresse in M4A AAC (-85% di spazio sul disco)"
-                      >
-                        {isCompressingArchive ? (
-                          <>
-                            <Loader2 size={13} className="animate-spin text-emerald-300" />
-                            <span>Compressione...</span>
-                          </>
-                        ) : (
-                          <>
-                            <FileAudio size={13} className="text-emerald-400" />
-                            <span>Comprimi Archivio</span>
-                          </>
-                        )}
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={handleCleanOrphans}
-                        disabled={isCleaningOrphans}
-                        className={clsx(
-                          "px-3 py-1.5 rounded-xl border text-xs font-semibold transition-all flex items-center gap-1.5 cursor-pointer shadow-liquid-sm whitespace-nowrap",
+                          "px-3.5 py-2 rounded-xl border text-xs font-semibold transition-all flex items-center gap-2 cursor-pointer shadow-liquid-sm whitespace-nowrap disabled:opacity-50",
                           isCleaningOrphans
-                            ? "bg-amber-500/20 text-amber-200 border-amber-500/30 cursor-wait"
+                            ? "bg-blue-500/20 text-blue-200 border-blue-500/30 cursor-wait"
                             : "bg-white/[0.08] hover:bg-white/[0.14] border-white/14 text-white/80 hover:text-white"
                         )}
-                        title="Elimina vecchi audio orfani e compatta il database (VACUUM)"
+                        title="Pulisce i file temporanei, deframmenta il database ed aggiorna lo spazio su disco"
                       >
-                        {isCleaningOrphans ? (
-                          <>
-                            <Loader2 size={13} className="animate-spin text-amber-300" />
-                            <span>Pulizia in corso...</span>
-                          </>
-                        ) : (
-                          <>
-                            <RotateCcw size={13} className="text-amber-400" />
-                            <span>Ottimizza & Pulisci</span>
-                          </>
-                        )}
-                      </button>
-
-                      <button
-                        type="button"
-                        onClick={() => {
-                          fetchStorageStats();
-                          fetchModelsStatus(true);
-                        }}
-                        disabled={loadingModels}
-                        className="px-3 py-1.5 rounded-xl liquid-glass-pill border border-white/12 hover:border-white/22 text-white/70 hover:text-white transition-all cursor-pointer text-xs flex items-center gap-1.5 whitespace-nowrap"
-                        title="Ricalcola spazio disco"
-                      >
-                        <RefreshCw size={13} className={clsx(loadingModels && "animate-spin text-blue-400")} />
-                        <span>Ricalcola</span>
+                        <RefreshCw size={13} className={clsx((isCleaningOrphans || loadingModels) && "animate-spin text-blue-400")} />
+                        <span>{isCleaningOrphans ? "Ottimizzazione in corso..." : "Ricalcola spazio"}</span>
                       </button>
                     </div>
                   </div>
 
                   {/* ── Barra Orizzontale Multicolore Stile Apple ── */}
                   <div className="space-y-3">
-                    <div className="w-full h-3.5 rounded-full bg-white/[0.06] p-0.5 flex gap-1 overflow-hidden border border-white/[0.12]">
+                    <div className="w-full h-3 rounded-full bg-white/[0.06] p-0.5 flex gap-1 overflow-hidden border border-white/[0.12]">
                       {combinedTotalMb === 0 ? (
                         <div className="h-full w-full bg-white/10 rounded-full animate-pulse" />
                       ) : (
@@ -785,25 +745,34 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       )}
                     </div>
 
-                    {/* ── Legenda Stile macOS Storage ── */}
-                    <div className="flex flex-wrap items-center gap-x-4 gap-y-2 pt-1 text-[11px]">
-                      {storageCategories.map((cat) => (
-                        <div key={cat.id} className="flex items-center gap-1.5 whitespace-nowrap">
-                          <span className={clsx('w-2.5 h-2.5 rounded-full flex-shrink-0 shadow-sm', cat.dotColor)} />
-                          <span className="text-white/80 font-medium">{cat.shortLabel}:</span>
-                          <span className="font-mono text-white/60">{formatSize(cat.sizeMb)}</span>
-                          <span className="text-[10px] text-white/35 font-mono">({formatPct(cat.sizeMb)})</span>
-                        </div>
-                      ))}
+                    {/* ── Legenda Ordinata a Griglia Stile macOS Storage ── */}
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-2 pt-2 border-t border-white/[0.06] text-xs">
+                      {storageCategories.map((cat) => {
+                        const hasData = cat.sizeMb > 0;
+                        return (
+                          <div
+                            key={cat.id}
+                            className={clsx(
+                              "flex items-center gap-1.5 whitespace-nowrap transition-opacity",
+                              hasData ? "opacity-100" : "opacity-45"
+                            )}
+                          >
+                            <span className={clsx('w-2 h-2 rounded-full flex-shrink-0 shadow-sm', cat.dotColor)} />
+                            <span className="text-white/80 font-medium text-[11px] truncate">{cat.shortLabel}:</span>
+                            <span className="font-mono text-[11px] text-white/70">{formatSize(cat.sizeMb)}</span>
+                            <span className="text-[10px] text-white/40 font-mono">({formatPct(cat.sizeMb)})</span>
+                          </div>
+                        );
+                      })}
                     </div>
                   </div>
                 </div>
 
-                {/* ── Griglia Dati: Ripartizione Dettagliata (con cestino su hover per Modelli IA) ── */}
+                {/* ── Griglia Dati: Categorie di Archiviazione ── */}
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-semibold uppercase tracking-wider text-white/50 block">
-                      Ripartizione Dettagliata per Categoria
+                      Categorie di Archiviazione
                     </span>
                     <span className="text-[11px] text-white/40 font-mono">
                       5 categorie monitorate
@@ -1052,9 +1021,9 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                 {/* ── Header Tab Modelli ── */}
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-2 border-b border-white/[0.08]">
                   <div>
-                    <h3 className="text-sm font-bold text-white">Modelli di Intelligenza Artificiale</h3>
+                    <h3 className="text-sm font-bold text-white">Modelli IA</h3>
                     <p className="text-xs text-white/50 mt-0.5 leading-relaxed">
-                      Motori vocali, vettoriali e modelli linguistici eseguiti al 100% in locale sul tuo Mac con accelerazione Apple Silicon MLX.
+                      Modelli locali per trascrizione, memoria e riassunti. Eseguiti al 100% sul tuo computer.
                     </p>
                   </div>
                   <button
@@ -1082,7 +1051,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                           : 'text-white/50 hover:text-white'
                       )}
                     >
-                      Motori di Sistema Base (Audio & Memoria)
+                      Modelli di Base
                     </button>
                     <button
                       type="button"
@@ -1094,7 +1063,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                           : 'text-white/50 hover:text-white'
                       )}
                     >
-                      Modelli Linguistici LLM (Quaderno & Chat)
+                      Modelli Linguistici (LLM)
                     </button>
                   </div>
                 </div>
@@ -1104,10 +1073,10 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                   <div className="space-y-4">
                     <div>
                       <span className="text-xs font-semibold uppercase tracking-wider text-white/50 block">
-                        Componenti di Sistema Obbligatori{osBadge ? ` — ${osBadge}` : ''}
+                        Modelli di Sistema
                       </span>
                       <p className="text-[11px] text-white/45 mt-1 leading-relaxed">
-                        Questi due motori costituiscono il nucleo stabile di SbobinAI: Whisper Large Turbo per la trascrizione in memoria e Qwen3-Embedding per la memoria RAG (1024 dim) su LanceDB.
+                        Componenti essenziali per la trascrizione vocale e la memoria delle lezioni.
                       </p>
                     </div>
 
@@ -1118,7 +1087,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                             name: 'Whisper Large-v3-Turbo Q4 (locale)',
                             type: 'whisper' as const,
                             approx_size: '~580 MB',
-                            description: 'Motore Vocale di sistema obbligatorio: trascrizione ad alta precisione 4-bit (~580 MB). Fedeltà massima e consumo nullo in pausa.',
+                            description: 'Trascrive le registrazioni audio parola per parola con alta precisione.',
                             downloaded: false,
                             status: 'idle' as const,
                             disk_size_mb: null,
@@ -1129,7 +1098,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                             name: 'Qwen3 Embedding 0.6B 4-bit DWQ',
                             type: 'embedding' as const,
                             approx_size: '~300 MB',
-                            description: 'Motore Memoria RAG di sistema obbligatorio: architettura Qwen3 nativa, 1024 dimensioni (~300 MB in RAM). Indicizzazione ad altissima velocità e ricerca ibrida su LanceDB.',
+                            description: 'Organizza la memoria semantica per consentire la ricerca intelligente nelle lezioni.',
                             downloaded: false,
                             status: 'idle' as const,
                             disk_size_mb: null,
@@ -1276,10 +1245,10 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                   <div className="space-y-4">
                     <div>
                       <span className="text-xs font-semibold uppercase tracking-wider text-white/50 block">
-                        Modelli Linguistici LLM (esecuzione locale)
+                        Modelli Linguistici (LLM)
                       </span>
                       <p className="text-[11px] text-white/45 mt-1 leading-relaxed">
-                        I modelli 4-bit generano capitoli di studio e rispondono nella chat. Puoi scaricare il modello desiderato, impostarlo come attivo o eliminarlo per recuperare spazio su disco.
+                        I modelli linguistici locali generano capitoli di studio, sintesi e rispondono alle domande sul quaderno.
                       </p>
                     </div>
 
@@ -1453,18 +1422,18 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
             )}
 
             {/* ══════════════════════════════════════════════════════════════════
-                TAB 3: FILTRO ATTIVITÀ VOCALE (VAD) — DESIGN MINIMAL APPLE
+                TAB 3: FILTRO VOCALE (VAD) & FORMATO AUDIO
             ══════════════════════════════════════════════════════════════════ */}
             {activeTab === 'audio' && (
               <div className="space-y-6 animate-fade-in">
                 <div>
-                  <h3 className="text-sm font-semibold tracking-tight text-white">Filtro Attività Vocale (VAD)</h3>
+                  <h3 className="text-sm font-semibold tracking-tight text-white">Filtro Vocale (VAD)</h3>
                   <p className="text-xs text-white/50 mt-1 leading-relaxed">
-                    Regola la sensibilità con cui SbobinAI rileva la voce del docente ed esclude le pause di silenzio e il brusio d'aula durante la registrazione.
+                    Regola la sensibilità con cui viene isolata la voce del docente durante la lezione, escludendo silenzi e brusio d'aula.
                   </p>
                 </div>
 
-                {/* Selezione a 3 Opzioni Minimal Stile macOS */}
+                {/* Selezione a 3 Opzioni Minimal */}
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                   {/* Opzione 1: Ampia */}
                   <button
@@ -1498,14 +1467,14 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                           Ampia
                         </span>
                         <p className="text-[11px] text-white/50 leading-relaxed">
-                          Sensibilità elevata per cattedre distanti o aule ampie. Cattura anche le spiegazioni a voce moderata.
+                          Sensibilità alta per cattedre distanti o aule grandi. Cattura anche spiegazioni a voce moderata.
                         </p>
                       </div>
                     </div>
 
                     <div className="mt-4 pt-3 border-t border-white/[0.06]">
-                      <span className="text-[10px] font-mono text-white/40 block">
-                        Raggio: Ampio · RMS 140
+                      <span className="text-[10px] text-white/40 block">
+                        Per aule grandi o docente distante
                       </span>
                     </div>
                   </button>
@@ -1547,14 +1516,14 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                           Standard
                         </span>
                         <p className="text-[11px] text-white/50 leading-relaxed">
-                          Bilanciamento ottimale per la maggior parte delle lezioni. Isola la voce ed esclude il brusio circostante.
+                          Bilanciamento ottimale per la maggior parte delle lezioni. Isola la voce ed esclude il brusio.
                         </p>
                       </div>
                     </div>
 
                     <div className="mt-4 pt-3 border-t border-white/[0.06]">
-                      <span className="text-[10px] font-mono text-white/40 block">
-                        Raggio: 3–8m · RMS 190
+                      <span className="text-[10px] text-emerald-400/90 font-medium block">
+                        Consigliata per la maggior parte delle lezioni
                       </span>
                     </div>
                   </button>
@@ -1591,42 +1560,42 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                           Diretta
                         </span>
                         <p className="text-[11px] text-white/50 leading-relaxed">
-                          Filtro rigoroso per prime file o microfoni vicini (AirPods o USB). Esclude mormorii e voci dei compagni.
+                          Filtro rigoroso per prime file o microfoni vicini. Esclude mormorii e voci dei compagni.
                         </p>
                       </div>
                     </div>
 
                     <div className="mt-4 pt-3 border-t border-white/[0.06]">
-                      <span className="text-[10px] font-mono text-white/40 block">
-                        Raggio: 1–3m · RMS 260
+                      <span className="text-[10px] text-white/40 block">
+                        Per prime file o microfoni vicini
                       </span>
                     </div>
                   </button>
                 </div>
 
-                {/* Parametri di Sistema Stile macOS */}
-                <div className="p-4 rounded-2xl bg-white/[0.02] border border-white/[0.06] flex items-center justify-between text-xs">
+                {/* Stato Rilevamento Audio */}
+                <div className="p-3.5 rounded-2xl bg-white/[0.02] border border-white/[0.06] flex items-center justify-between text-xs">
                   <div className="flex items-center gap-2.5 text-white/70">
                     <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                    <span>WebRTC VAD attivo a 16 kHz Mono (PCM 16-bit LE)</span>
+                    <span>Rilevamento vocale attivo in tempo reale</span>
                   </div>
-                  <span className="text-[11px] font-mono text-white/40">
-                    Ring Buffer in RAM (zero logorio SSD)
+                  <span className="text-[11px] text-white/40">
+                    Elaborazione locale in memoria
                   </span>
                 </div>
 
                 {/* ══════════════════════════════════════════════════════════════════
-                    SEZIONE: FORMATO REGISTRAZIONE AUDIO & SALVA-SPAZIO (5.6)
+                    SEZIONE: FORMATO REGISTRAZIONE AUDIO
                 ══════════════════════════════════════════════════════════════════ */}
                 <div className="pt-2 space-y-3">
                   <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                     <div>
                       <h3 className="text-sm font-semibold tracking-tight text-white flex items-center gap-2">
                         <FileAudio size={16} className="text-white/80" />
-                        Formato Registrazione Audio & Salva-Spazio
+                        Formato Registrazione Audio
                       </h3>
                       <p className="text-xs text-white/50 mt-0.5 leading-relaxed">
-                        Configura il formato con cui salvare automaticamente le lezioni. La compressione M4A riduce lo spazio dell'85% preservando la chiarezza della voce.
+                        Configura il formato con cui salvare le lezioni. Il formato compresso M4A riduce lo spazio dell'85%.
                       </p>
                     </div>
 
@@ -1635,12 +1604,12 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       onClick={handleCompressArchive}
                       disabled={isCompressingArchive}
                       className={clsx(
-                        "px-3 py-1.5 rounded-xl border text-xs font-semibold transition-all flex items-center gap-1.5 cursor-pointer shadow-liquid-sm self-start sm:self-center whitespace-nowrap",
+                        "px-3.5 py-1.5 rounded-xl border text-xs font-semibold transition-all flex items-center gap-1.5 cursor-pointer shadow-liquid-sm self-start sm:self-center whitespace-nowrap",
                         isCompressingArchive
                           ? "bg-emerald-500/20 text-emerald-200 border-emerald-500/30 cursor-wait"
                           : "bg-white/[0.06] hover:bg-white/[0.12] border-white/12 text-white/80 hover:text-white"
                       )}
-                      title="Comprime tutte le registrazioni passate ancora in formato WAV liberando spazio sul disco"
+                      title="Comprime tutte le registrazioni passate ancora in formato non compresso"
                     >
                       {isCompressingArchive ? (
                         <>
@@ -1678,7 +1647,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                           </div>
                           <div className="flex items-center gap-1.5">
                             <span className="text-[9px] font-medium px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
-                              Consigliato · -85% Spazio
+                              Consigliato
                             </span>
                             <div className={clsx(
                               'w-4 h-4 rounded-full border flex items-center justify-center transition-all',
@@ -1691,17 +1660,17 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
 
                         <div className="space-y-1">
                           <span className="text-xs font-semibold text-white tracking-tight block">
-                            M4A Compresso (AAC Vocale 48 kbps)
+                            M4A (Consigliato)
                           </span>
                           <p className="text-[11px] text-white/50 leading-relaxed">
-                            Occupa solo ~18 MB per ora (risparmia circa 97 MB/h). Riproduzione istantanea, sincronizzazione karaoke parola per parola e disco protetto dalla saturazione.
+                            Occupa circa 18 MB per ora di lezione. Preserva la chiarezza vocale e protegge il disco dalla saturazione.
                           </p>
                         </div>
                       </div>
 
-                      <div className="mt-4 pt-3 border-t border-white/[0.06] flex items-center justify-between text-[10px] font-mono text-white/40">
-                        <span>Codec: AAC · 48 kbps Mono</span>
-                        <span className="text-emerald-400 font-medium">~18 MB / ora</span>
+                      <div className="mt-4 pt-3 border-t border-white/[0.06] flex items-center justify-between text-[10px]">
+                        <span className="text-white/40">Compressione efficiente</span>
+                        <span className="text-emerald-400 font-mono font-medium">~18 MB / ora</span>
                       </div>
                     </button>
 
@@ -1726,7 +1695,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                           </div>
                           <div className="flex items-center gap-1.5">
                             <span className="text-[9px] font-medium px-2 py-0.5 rounded-full bg-white/[0.08] text-white/70 border border-white/[0.12]">
-                              Lineare PCM
+                              Non compresso
                             </span>
                             <div className={clsx(
                               'w-4 h-4 rounded-full border flex items-center justify-center transition-all',
@@ -1739,17 +1708,17 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
 
                         <div className="space-y-1">
                           <span className="text-xs font-semibold text-white tracking-tight block">
-                            WAV Originale Non Compresso
+                            WAV (Originale)
                           </span>
                           <p className="text-[11px] text-white/50 leading-relaxed">
-                            Copia identica al campione microfonico grezzo a 16-bit 16 kHz. Massima fedeltà d'archivio senza compressione lossy (~115 MB/ora).
+                            Copia originale senza compressione. Massima fedeltà d'archivio, ma occupa più spazio sul disco.
                           </p>
                         </div>
                       </div>
 
-                      <div className="mt-4 pt-3 border-t border-white/[0.06] flex items-center justify-between text-[10px] font-mono text-white/40">
-                        <span>Formato: PCM 16-bit · 16 kHz</span>
-                        <span className="text-white/50">~115 MB / ora</span>
+                      <div className="mt-4 pt-3 border-t border-white/[0.06] flex items-center justify-between text-[10px]">
+                        <span className="text-white/40">Audio grezzo</span>
+                        <span className="text-white/50 font-mono">~115 MB / ora</span>
                       </div>
                     </button>
                   </div>
@@ -1758,43 +1727,31 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
             )}
 
             {/* ══════════════════════════════════════════════════════════════════
-                TAB 4: PRIVACY, SICUREZZA & RESET SISTEMA
+                TAB 4: SISTEMA & PRIVACY
             ══════════════════════════════════════════════════════════════════ */}
             {activeTab === 'system' && (
               <div className="space-y-6 animate-fade-in">
                 <div>
-                  <h3 className="text-sm font-bold text-white">Privacy & Controllo Sistema</h3>
+                  <h3 className="text-sm font-bold text-white">Sistema & Privacy</h3>
                   <p className="text-xs text-white/50 mt-1 leading-relaxed">
-                    SbobinAI opera al 100% in locale sul processore del tuo computer. Nessun audio viene mai trasmesso all'esterno.
+                    SbobinAI opera al 100% in locale sul tuo computer. Nessun file né dato audio viene mai inviato all'esterno.
                   </p>
-                </div>
-
-                <div className="p-4 rounded-3xl bg-emerald-500/10 border border-emerald-500/25 flex items-start gap-3">
-                  <ShieldCheck size={20} className="text-emerald-400 flex-shrink-0 mt-0.5" />
-                  <div className="text-xs text-white/80 space-y-1">
-                    <h4 className="font-bold text-emerald-300">Confidenzialità Accademica Totale</h4>
-                    <p className="text-[11px] text-white/60 leading-relaxed">
-                      Le registrazioni e gli appunti risiedono esclusivamente sul disco del tuo computer. I modelli IA girano direttamente sul tuo computer senza connessioni a server remoti.
-                    </p>
-                  </div>
                 </div>
 
                 {/* Sezione Aggiornamenti */}
                 <div className="p-4 rounded-3xl liquid-glass border border-white/[0.12] space-y-4">
                   <div className="flex items-start justify-between gap-3">
                     <div>
-                      <div className="flex items-center gap-2">
-                        <h4 className="text-sm font-bold text-white">Aggiornamenti</h4>
-                        <span className="text-[10px] font-mono font-medium px-2 py-0.5 rounded-full bg-white/[0.08] text-white/70 border border-white/10">
-                          v{updater.currentVersion || '0.0.12'}
-                        </span>
-                      </div>
+                      <h4 className="text-sm font-bold text-white">Aggiornamenti</h4>
                       <p className="text-[11px] text-white/50 mt-0.5">
                         {updater.supported
-                          ? "Mantieni SbobinAI sempre aggiornato con le ultime correzioni e modelli."
+                          ? "Mantieni SbobinAI aggiornato con le ultime correzioni e miglioramenti."
                           : "Gli aggiornamenti automatici sono disponibili solo nell'app desktop."}
                       </p>
                     </div>
+                    <span className="text-[10px] font-mono font-medium px-2.5 py-1 rounded-full bg-white/[0.08] text-white/70 border border-white/10 flex-shrink-0">
+                      v{updater.currentVersion || '0.0.13'}
+                    </span>
                   </div>
 
                   {/* Toggle Aggiornamento Automatico */}
@@ -1807,7 +1764,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                         </span>
                       </div>
                       <p className="text-[11px] text-white/50 leading-relaxed">
-                        Controlla e installa automaticamente le nuove versioni ad ogni apertura dell'app, risolvendo tempestivamente bug e problemi di avvio.
+                        Verifica e installa automaticamente gli aggiornamenti ad ogni avvio dell'app.
                       </p>
                     </div>
                     <button
@@ -1840,43 +1797,74 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                     </button>
                   </div>
 
-                  <div className="flex items-center gap-3 flex-wrap pt-1">
-                    <button
-                      type="button"
-                      disabled={!updater.supported || updater.status === 'checking' || updater.status === 'downloading' || updater.status === 'installing'}
-                      onClick={() => void updater.checkNow()}
-                      className="px-4 py-1.5 rounded-full bg-white/[0.10] hover:bg-white/[0.18] border border-white/[0.12] text-xs font-semibold text-white disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer transition-colors"
-                    >
-                      {updater.status === 'checking' ? 'Controllo in corso...' : 'Controlla aggiornamenti'}
-                    </button>
-                    <span className="text-[11px] text-white/40 font-medium">
-                      Versione installata: <strong className="font-mono text-white/80">v{updater.currentVersion || '0.0.12'}</strong>
-                    </span>
-                    {updater.status === 'uptodate' && <span className="text-[11px] text-emerald-300 font-medium">Sei all'ultima versione</span>}
-                    {updater.status === 'available' && (
-                      <>
-                        <span className="text-[11px] text-blue-300">Versione {updater.version} disponibile</span>
-                        <button
-                          type="button"
-                          onClick={() => void updater.install()}
-                          className="px-4 py-1.5 rounded-full bg-blue-500 hover:bg-blue-400 text-xs font-semibold text-white cursor-pointer"
-                        >
-                          Aggiorna e Riavvia
-                        </button>
-                      </>
-                    )}
-                    {updater.status === 'downloading' && <span className="text-[11px] text-white/60">Download {updater.progress}%</span>}
-                    {updater.status === 'installing' && <span className="text-[11px] text-white/60">Installazione e riavvio...</span>}
-                    {updater.status === 'error' && <span className="text-[11px] text-red-300">Errore: {updater.error}</span>}
-                  </div>
+                  {/* Stato / Azione Aggiornamento */}
+                  {updater.status === 'available' ? (
+                    <div className="flex items-center justify-between gap-3 pt-1 animate-fade-in">
+                      <span className="text-xs text-blue-300 font-semibold">
+                        Versione {updater.version} disponibile
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => void updater.install()}
+                        className="px-4 py-2 rounded-full bg-blue-500 hover:bg-blue-400 text-xs font-semibold text-white cursor-pointer transition-all shadow-liquid-sm flex items-center gap-1.5"
+                      >
+                        <Download size={13} />
+                        <span>Aggiorna e Riavvia</span>
+                      </button>
+                    </div>
+                  ) : updater.status === 'downloading' || updater.status === 'installing' ? (
+                    <div className="pt-1 space-y-2 animate-fade-in">
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="text-white/80 font-medium">
+                          {updater.status === 'installing'
+                            ? 'Installazione e riavvio in corso...'
+                            : `Download aggiornamento (${updater.version || ''})...`}
+                        </span>
+                        <span className="font-mono font-bold text-blue-300">
+                          {updater.progress}%
+                        </span>
+                      </div>
+                      <div className="w-full h-2 rounded-full bg-white/10 overflow-hidden">
+                        <div
+                          className="h-full bg-gradient-to-r from-blue-500 to-emerald-400 rounded-full transition-all duration-200"
+                          style={{ width: `${Math.max(4, updater.progress)}%` }}
+                        />
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-3 flex-wrap pt-1">
+                      <button
+                        type="button"
+                        disabled={!updater.supported || updater.status === 'checking'}
+                        onClick={() => void updater.checkNow()}
+                        className="px-4 py-1.5 rounded-full bg-white/[0.10] hover:bg-white/[0.18] border border-white/[0.12] text-xs font-semibold text-white disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer transition-colors flex items-center gap-2"
+                      >
+                        {updater.status === 'checking' && <Loader2 size={12} className="animate-spin text-blue-400" />}
+                        <span>{updater.status === 'checking' ? 'Controllo in corso...' : 'Controlla aggiornamenti'}</span>
+                      </button>
+                      {updater.status === 'uptodate' && (
+                        <span className="text-[11px] text-emerald-300 font-medium flex items-center gap-1.5">
+                          <Check size={13} />
+                          <span>Sei all'ultima versione</span>
+                        </span>
+                      )}
+                      {updater.status === 'error' && (
+                        <span className="text-[11px] text-red-300">
+                          {updater.error?.includes('release JSON') || updater.error?.includes('404')
+                            ? 'Nessun nuovo aggiornamento disponibile.'
+                            : `Errore: ${updater.error}`}
+                        </span>
+                      )}
+                    </div>
+                  )}
                 </div>
 
                 {/* Sezione Reset Onboarding */}
                 <div className="p-4 rounded-3xl liquid-glass border border-white/[0.10] shadow-liquid-sm space-y-3">
                   <div>
-                    <h4 className="text-xs font-bold text-white">Ripristino Configurazione Iniziale</h4>
+                    <h4 className="text-xs font-bold text-white">Configurazione Iniziale (Wizard)</h4>
                     <p className="text-[11px] text-white/50 mt-0.5 leading-relaxed">
-                      Se vuoi ripercorrere i passaggi del Wizard (benvenuto, selezione cartella e download modelli), puoi riavviare la procedura guidata in qualsiasi momento.
+                      Ripercorri i passaggi del primo avvio per riconfigurare la cartella della libreria e i modelli.
                     </p>
                   </div>
 
@@ -1891,7 +1879,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                     )}
                   >
                     <RotateCcw size={13} className={confirmReset ? "animate-spin text-white" : ""} />
-                    <span>{confirmReset ? 'Sei sicuro? Clicca per riavviare il Wizard' : 'Riavvia Configurazione Wizard'}</span>
+                    <span>{confirmReset ? 'Sei sicuro? Clicca per riavviare' : 'Riavvia configurazione guidata'}</span>
                   </button>
                 </div>
 

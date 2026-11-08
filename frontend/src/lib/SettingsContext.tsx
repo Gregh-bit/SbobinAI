@@ -93,8 +93,8 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         if (typeof settingsData.models_downloaded === 'boolean') {
           patch.modelsDownloaded = settingsData.models_downloaded;
         }
-        if (typeof settingsData.setup_complete === 'boolean') {
-          patch.setupComplete = settingsData.setup_complete;
+        if (settingsData.setup_complete === true) {
+          patch.setupComplete = true;
         }
         if (settingsData.audio_format === 'm4a' || settingsData.audio_format === 'wav') {
           patch.audioFormat = settingsData.audio_format;
@@ -107,6 +107,9 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         );
         const hasAnyInstalled = (modelsData.installed_count && modelsData.installed_count > 0) || Boolean(hasRealWhisper);
         patch.modelsDownloaded = Boolean(hasRealWhisper);
+        if (hasRealWhisper || hasAnyInstalled) {
+          patch.setupComplete = true;
+        }
         if (hasAnyInstalled) {
           if (!patch.whisperModel || patch.whisperModel === 'mock_mode' || patch.whisperModel === 'dual-tier-whisper') {
             patch.whisperModel = 'large-v3-turbo-q4';
@@ -114,9 +117,16 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         }
       }
 
-      if (Object.keys(patch).length > 0) {
-        setSettings((prev) => ({ ...prev, ...patch }));
-      }
+      setSettings((prev) => {
+        // Non retrocedere mai a setupComplete=false se in locale era già true o se i modelli sono su disco
+        const nextSetupComplete = (patch.setupComplete ?? prev.setupComplete) || prev.setupComplete;
+        const merged = { ...prev, ...patch, setupComplete: nextSetupComplete };
+        // Se il setup risulta completato ma il backend aveva setup_complete=false, sincronizzalo al backend
+        if (nextSetupComplete && settingsData && settingsData.setup_complete !== true) {
+          void api.settings.update({ setup_complete: true, models_downloaded: merged.modelsDownloaded }).catch(() => null);
+        }
+        return merged;
+      });
     } catch (err) {
       console.warn('[SettingsContext] Impossibile contattare backend per sincronizzazione:', err);
     }
@@ -163,6 +173,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     if (partial.embeddingModel !== undefined) backendPayload.embedding_model = partial.embeddingModel;
     if (partial.vadSensitivity !== undefined) backendPayload.vad_sensitivity = partial.vadSensitivity;
     if (partial.modelsDownloaded !== undefined) backendPayload.models_downloaded = partial.modelsDownloaded;
+    if (partial.setupComplete !== undefined) backendPayload.setup_complete = partial.setupComplete;
     if (partial.audioFormat !== undefined) backendPayload.audio_format = partial.audioFormat;
 
     if (Object.keys(backendPayload).length > 0) {
@@ -193,7 +204,10 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       }
     }
     setSettings(updated);
-    const backendPayload: Record<string, any> = {};
+    const backendPayload: Record<string, any> = {
+      setup_complete: true,
+      models_downloaded: updated.modelsDownloaded,
+    };
     if (updated.whisperModel) backendPayload.whisper_model = updated.whisperModel;
     if (updated.llmModel) {
       backendPayload.llm_model = updated.llmModel;
@@ -205,7 +219,6 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     if (updated.embeddingModel) backendPayload.embedding_model = updated.embeddingModel;
     if (updated.vadSensitivity) backendPayload.vad_sensitivity = updated.vadSensitivity;
     if (updated.audioFormat) backendPayload.audio_format = updated.audioFormat;
-    backendPayload.models_downloaded = updated.modelsDownloaded;
     try {
       await api.settings.update(backendPayload);
     } catch (e) {
@@ -224,7 +237,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       localStorage.removeItem(LEGACY_STORAGE_KEY);
     } catch {}
     setSettings(fresh);
-    api.settings.update({ models_downloaded: false }).catch(() => null);
+    api.settings.update({ models_downloaded: false, setup_complete: false }).catch(() => null);
   };
 
   return (

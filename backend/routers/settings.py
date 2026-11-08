@@ -37,6 +37,9 @@ def _normalize_whisper_state(current: Dict[str, Any]) -> bool:
             if current.get("models_downloaded") != is_dl:
                 current["models_downloaded"] = is_dl
                 changed = True
+            if is_dl and not current.get("setup_complete"):
+                current["setup_complete"] = True
+                changed = True
     except Exception:
         pass
     return changed
