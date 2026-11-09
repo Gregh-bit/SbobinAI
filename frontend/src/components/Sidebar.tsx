@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Plus, BookOpen, Settings, Trash2, Pencil } from 'lucide-react';
 import { clsx } from 'clsx';
 import type { Subject } from '../types';
@@ -22,6 +22,19 @@ export default function Sidebar({ subjects, selectedId, onSelect, onAdd, onUpdat
   const [subjectToDelete, setSubjectToDelete] = useState<Subject | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  // Chiusura modal di eliminazione corso con ESC
+  useEffect(() => {
+    if (!subjectToDelete) return;
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !isDeleting) {
+        e.stopPropagation();
+        setSubjectToDelete(null);
+      }
+    };
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, [subjectToDelete, isDeleting]);
 
   return (
     <>

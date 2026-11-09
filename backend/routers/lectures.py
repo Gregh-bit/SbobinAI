@@ -100,6 +100,12 @@ def get_lecture_audio(lecture_id: int, db: Session = Depends(get_db)):
         base, _ = os.path.splitext(audio_path)
         if os.path.exists(base + ".m4a"):
             audio_path = base + ".m4a"
+            if lecture.audio_path != audio_path:
+                try:
+                    lecture.audio_path = audio_path
+                    db.commit()
+                except Exception:
+                    pass
         elif os.path.exists(base + ".wav"):
             audio_path = base + ".wav"
         else:

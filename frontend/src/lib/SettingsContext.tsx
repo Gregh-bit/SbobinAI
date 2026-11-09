@@ -12,7 +12,7 @@ export interface AppSettings {
   embeddingModel: string;
   ollamaModel: string; // Retrocompatibilità UI
   vadSensitivity: number; // 1 (permissivo) a 3 (molto reattivo/aggressivo)
-  audioFormat: 'm4a' | 'wav'; // 'm4a' (compresso AAC ~48kbps, -85% spazio) o 'wav' (lineare PCM)
+  audioFormat?: 'm4a';
 }
 
 interface SettingsContextType {
@@ -96,8 +96,8 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         if (settingsData.setup_complete === true) {
           patch.setupComplete = true;
         }
-        if (settingsData.audio_format === 'm4a' || settingsData.audio_format === 'wav') {
-          patch.audioFormat = settingsData.audio_format;
+        if (settingsData.audio_format) {
+          patch.audioFormat = 'm4a';
         }
       }
 

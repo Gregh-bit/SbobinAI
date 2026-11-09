@@ -141,8 +141,9 @@ class AudioEngine:
                 logger.warning(f"[AudioEngine] Inizializzazione VAD fallita: {e}")
 
         # Soglia RMS dinamica basata su vad_aggressiveness:
-        # 1: permissivo (rms > 140), 2: standard (rms > 190), 3: reattivo/anti-rumore (rms > 260)
-        self.rms_threshold = 140.0 if vad_aggressiveness == 1 else (260.0 if vad_aggressiveness == 3 else 190.0)
+        # Calibrata per catturare voce naturale anche su microfoni integrati di laptop Windows a bassa amplificazione
+        # 1: permissivo (rms > 45), 2: standard (rms > 65), 3: reattivo/anti-rumore (rms > 105)
+        self.rms_threshold = 45.0 if vad_aggressiveness == 1 else (105.0 if vad_aggressiveness == 3 else 65.0)
 
         # Buffer di pre-roll (ultimi ~240ms / 8 frame prima dell'attacco della voce)
         self._preroll_buffer: collections.deque[bytes] = collections.deque(maxlen=8)
@@ -201,16 +202,34 @@ class AudioEngine:
         except Exception as q_err:
             logger.warning(f"[AudioEngine] Query dispositivo input fallita ({q_err}), uso valori standard.")
 
-        candidates = [
-            (self.SAMPLE_RATE, 1),
-            (self.SAMPLE_RATE, min(2, max_ch)),
-            (int(native_sr), 1),
-            (int(native_sr), min(2, max_ch)),
-            (48000, 1),
-            (48000, min(2, max_ch)),
-            (44100, 1),
-            (44100, min(2, max_ch)),
-        ]
+        import sys
+        if sys.platform == "win32":
+            # Su Windows, i driver hardware (WASAPI / Realtek / Intel) operano quasi sempre a 48kHz o 44.1kHz stereo.
+            # Richiedere 16kHz al driver WASAPI genera timeout COM di 4-5s per ciascun tentativo fallito (~20s di freeze iniziale).
+            # Diamo massima priorità al formato nativo del dispositivo (apertura istantanea in <50ms),
+            # demandando il ricampionamento a 16 kHz ad alta precisione a _StreamResampler.
+            candidates = [
+                (int(native_sr), min(2, max_ch)),
+                (int(native_sr), 1),
+                (48000, min(2, max_ch)),
+                (48000, 1),
+                (44100, min(2, max_ch)),
+                (44100, 1),
+                (self.SAMPLE_RATE, min(2, max_ch)),
+                (self.SAMPLE_RATE, 1),
+            ]
+        else:
+            # Su macOS (CoreAudio) e Linux, la conversione a 16 kHz mono hardware/sistema è nativa e istantanea
+            candidates = [
+                (self.SAMPLE_RATE, 1),
+                (self.SAMPLE_RATE, min(2, max_ch)),
+                (int(native_sr), 1),
+                (int(native_sr), min(2, max_ch)),
+                (48000, 1),
+                (48000, min(2, max_ch)),
+                (44100, 1),
+                (44100, min(2, max_ch)),
+            ]
         # Rimuovi duplicati mantenendo l'ordine di priorità
         unique_candidates = []
         seen = set()
@@ -361,10 +380,12 @@ class AudioEngine:
                 vad_active = self.vad.is_speech(raw_bytes, self.SAMPLE_RATE)
             except Exception:
                 vad_active = False
-            is_speech = vad_active and (rms > self.rms_threshold)
+            # Se WebRTC VAD rileva fonemi vocali, confermiamo con una soglia minima anti-rumore (35 RMS)
+            # Se WebRTC VAD è incerto, usiamo la soglia energetica rms_threshold
+            is_speech = (vad_active and rms >= 35.0) or (rms >= self.rms_threshold)
         else:
-            # Fallback energetico permissivo: cattura bene anche microfoni laptop Windows con basso guadagno
-            is_speech = (rms > max(110.0, self.rms_threshold))
+            # Fallback energetico quando webrtcvad non è presente (es. Windows senza wheel C++)
+            is_speech = (rms >= self.rms_threshold)
 
         now = time.time()
 
@@ -440,7 +461,7 @@ class AudioEngine:
         samples_f = samples.astype(np.float32)
         seg_energy = float(np.dot(samples_f, samples_f))
         seg_rms = float(np.sqrt(seg_energy / len(samples_f)))
-        min_rms = 160.0 if self.vad else 240.0
+        min_rms = 40.0 if self.vad else 50.0
         if seg_rms < min_rms:
             logger.debug(f"[AudioEngine] Blocco ignorato (RMS troppo basso: {seg_rms:.1f})")
             return
@@ -539,9 +560,9 @@ class AudioEngine:
 
         if self._stream:
             try:
-                self._stream.abort()
-            except Exception as e:
-                logger.warning(f"[AudioEngine] Errore abort stream: {e}")
+                self._stream.stop()
+            except Exception:
+                pass
             try:
                 self._stream.close()
             except Exception as e:
@@ -582,7 +603,17 @@ class AudioEngine:
                             if not block:
                                 break
                             wf.writeframesraw(block)
-                os.replace(part_path, output_path)
+                # Sostituzione atomica con retry difensivo per blocchi file su Windows
+                replaced = False
+                for _ in range(5):
+                    try:
+                        os.replace(part_path, output_path)
+                        replaced = True
+                        break
+                    except PermissionError:
+                        time.sleep(0.05)
+                if not replaced and os.path.exists(part_path):
+                    os.replace(part_path, output_path)
             finally:
                 if self._temp_pcm_file:
                     try:
@@ -602,23 +633,16 @@ class AudioEngine:
 
         logger.info(f"[AudioEngine] Registrazione WAV esportata: {output_path}")
 
-        # Determina formato desiderato (da parametro o da settings.json)
-        if not audio_format:
-            try:
-                from config import load_settings
-                audio_format = load_settings().get("audio_format", "m4a")
-            except Exception:
-                audio_format = "m4a"
-
+        # Converte nel formato finale salva-spazio M4A (a meno di flush asincrono temporaneo)
         final_path = output_path
-        if audio_format == "m4a":
+        if audio_format != "wav":
             try:
                 final_path = compress_wav_to_m4a(output_path, bitrate=48000, remove_original=True)
             except Exception as e:
                 logger.error(f"[AudioEngine] Fallback su WAV non compresso ({e})")
                 final_path = output_path
 
-        logger.info(f"[AudioEngine] Registrazione finalizzata con successo: {final_path} (formato: {audio_format})")
+        logger.info(f"[AudioEngine] Registrazione finalizzata con successo: {final_path}")
         return final_path
 
 
@@ -684,6 +708,14 @@ def compress_wav_to_m4a(wav_path: str, bitrate: int = 48000, remove_original: bo
                     for packet in out_stream.encode(None):
                         out_container.mux(packet)
 
+        # Rilascia esplicitamente i puntatori C di PyAV/FFmpeg e forza gc per sbloccare i file su Windows
+        try:
+            del in_stream, out_stream, in_container, out_container
+            import gc
+            gc.collect()
+        except Exception:
+            pass
+
         if not os.path.exists(part_path) or os.path.getsize(part_path) == 0:
             logger.warning(f"[AudioEngine] File compresso vuoto o non generato per {wav_path}")
             if os.path.exists(part_path):
@@ -693,8 +725,17 @@ def compress_wav_to_m4a(wav_path: str, bitrate: int = 48000, remove_original: bo
                     pass
             return wav_path
 
-        # Sostituzione atomica del file compresso
-        os.replace(part_path, m4a_path)
+        # Sostituzione atomica del file compresso con retry difensivo su Windows
+        replaced = False
+        for _ in range(5):
+            try:
+                os.replace(part_path, m4a_path)
+                replaced = True
+                break
+            except PermissionError:
+                time.sleep(0.05)
+        if not replaced and os.path.exists(part_path):
+            os.replace(part_path, m4a_path)
 
         orig_size = os.path.getsize(wav_path) if os.path.exists(wav_path) else 0
         new_size = os.path.getsize(m4a_path) if os.path.exists(m4a_path) else 0
@@ -705,12 +746,14 @@ def compress_wav_to_m4a(wav_path: str, bitrate: int = 48000, remove_original: bo
             f"{new_size / (1024*1024):.1f} MB (-{ratio:.1f}%, liberati {saved_bytes / (1024*1024):.1f} MB)"
         )
 
-        # Se richiesto, rimuovi il WAV originale
+        # Se richiesto, rimuovi il WAV originale con retry su Windows
         if remove_original and os.path.exists(wav_path) and os.path.abspath(wav_path) != os.path.abspath(m4a_path):
-            try:
-                os.remove(wav_path)
-            except OSError as del_err:
-                logger.warning(f"[AudioEngine] Impossibile eliminare WAV temporaneo {wav_path}: {del_err}")
+            for _ in range(5):
+                try:
+                    os.remove(wav_path)
+                    break
+                except OSError:
+                    time.sleep(0.05)
 
         # Se esiste una cache di timestamp pre-calcolata, migrala al nuovo nome file
         old_cache = wav_path + ".timestamps.json"

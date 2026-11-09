@@ -22,7 +22,7 @@ const LLM_OPTIONS = [
   {
     id: 'mlx-community/Qwen3.5-4B-MLX-4bit',
     name: 'Qwen 3.5 4B (4-bit)',
-    badge: 'Consigliato 2026',
+    badge: 'Predefinito',
     badgeColor: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30',
     description: 'Architettura Gated DeltaNet 2026, KV cache quantizzata 4-bit, ideale per computer con 8GB di RAM. Risposte flash istantanee live e capitoli completi del Quaderno.',
     downloadSize: '~2.4 GB',

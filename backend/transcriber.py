@@ -458,12 +458,12 @@ def is_speech_spectral(audio_np: np.ndarray, sample_rate: int = 16000) -> bool:
 
     energy = float(np.dot(audio_np, audio_np))
     rms = float(np.sqrt(energy / total_samples))
-    if rms < 0.003:
+    if rms < 0.001:
         return False
 
     # Zero Crossing Rate (ZCR)
     zero_crossings = np.sum(np.abs(np.diff(np.sign(audio_np)))) / (2.0 * total_samples)
-    if zero_crossings < 0.005 or zero_crossings > 0.60:
+    if zero_crossings < 0.003 or zero_crossings > 0.65:
         return False
 
     # Analisi spettrale rapida FFT sulla finestra a massima energia (evita falsi negativi su pause/respiro iniziale)
@@ -490,7 +490,7 @@ def is_speech_spectral(audio_np: np.ndarray, sample_rate: int = 16000) -> bool:
         return False
     speech_vals = fft_vals[speech_band]
     speech_energy = float(np.dot(speech_vals, speech_vals))
-    return (speech_energy / total_energy) >= 0.20
+    return (speech_energy / total_energy) >= 0.12
 
 
 def release_metal_cache() -> None:

@@ -134,9 +134,8 @@ def load_settings() -> Dict[str, Any]:
             if _same_path(sp, LEGACY_STORAGE_ROOT):
                 sp = DEFAULT_STORAGE_ROOT
             merged["storage_path"] = sp
-        # Validazione formato di registrazione audio (default "m4a" compresso AAC)
-        if merged.get("audio_format") not in ("m4a", "wav"):
-            merged["audio_format"] = "m4a"
+        # Formato standard unico audio: M4A salva-spazio AAC (~18 MB/h)
+        merged["audio_format"] = "m4a"
         return merged
     except Exception as e:
         logger.error(f"[Config] Errore lettura {SETTINGS_FILE}: {e}. Uso defaults.")

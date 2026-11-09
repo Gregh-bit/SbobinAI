@@ -8,7 +8,7 @@ import {
 import { clsx } from 'clsx';
 import { useSettings } from '../lib/SettingsContext';
 import { pickFolder, isTauri } from '../lib/tauri';
-import { isMac, osBadge, fileManagerName, normalizeDisplayPath } from '../lib/platform';
+import { isMac, fileManagerName, normalizeDisplayPath } from '../lib/platform';
 import { useUpdater } from '../lib/useUpdater';
 import { api } from '../lib/api';
 import type { ModelsStatusResponse, ModelInfo } from '../types';
@@ -20,15 +20,14 @@ interface Props {
 }
 
 type TabType = 'storage' | 'models' | 'audio' | 'system';
-type ModelFilterType = 'system_core' | 'llm';
 
 const defaultLlms: ModelInfo[] = [
   {
     id: 'mlx-community/Qwen3.5-4B-MLX-4bit',
-    name: 'Qwen 3.5 4B (Consigliato)',
+    name: 'Qwen 3.5 4B',
     type: 'llm',
     approx_size: '~2.8 GB',
-    description: 'Consigliato: compatto e veloce. Genera capitoli, sintesi ed evidenzia i concetti chiave.',
+    description: 'Compatto e veloce. Genera capitoli, sintesi ed evidenzia i concetti chiave.',
     downloaded: false,
     status: 'idle',
     disk_size_mb: null,
@@ -48,7 +47,7 @@ const defaultLlms: ModelInfo[] = [
     name: 'Qwen 3.5 8B (Avanzato)',
     type: 'llm',
     approx_size: '~5.5 GB',
-    description: 'Modello ad alta capacità di ragionamento. Consigliato per computer con 16 GB o più di RAM.',
+    description: 'Modello ad alta capacità di ragionamento per computer con 16 GB o più di RAM.',
     downloaded: false,
     status: 'idle',
     disk_size_mb: null,
@@ -65,7 +64,6 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
 
   const updater = useUpdater();
   const [activeTab, setActiveTab] = useState<TabType>('models');
-  const [modelFilter, setModelFilter] = useState<ModelFilterType>('system_core');
 
   // Form State
   const [storagePath, setStoragePath] = useState(settings.storagePath);
@@ -73,8 +71,6 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
   const [llmModel, setLlmModel] = useState(settings.llmModel || 'mlx-community/Qwen3.5-4B-MLX-4bit');
   const [embeddingModel, setEmbeddingModel] = useState(settings.embeddingModel || 'mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ');
   const [vadSensitivity, setVadSensitivity] = useState(settings.vadSensitivity);
-  const [audioFormat, setAudioFormat] = useState<'m4a' | 'wav'>(settings.audioFormat || 'm4a');
-  const [isCompressingArchive, setIsCompressingArchive] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
   const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
   const [confirmDeleteModelId, setConfirmDeleteModelId] = useState<string | null>(null);
@@ -216,14 +212,64 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
     return () => clearInterval(timer);
   }, [isOpen, modelsStatus, actionInProgress, fetchModelsStatus]);
 
-  // Gestione tasto ESC
+  // Gestione tasto ESC con logica a livelli a cascata (standard macOS / desktop app)
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !isUninstalling) onClose();
+      if (e.key !== 'Escape' || isUninstalling) return;
+      e.stopPropagation();
+
+      // Livello 1: Sotto-finestra di disinstallazione aperta -> chiudi solo la sotto-finestra
+      if (showUninstallModal) {
+        setShowUninstallModal(false);
+        return;
+      }
+
+      // Livello 2: Conferma ripristino configurazione attiva -> annulla la conferma
+      if (confirmReset) {
+        setConfirmReset(false);
+        return;
+      }
+
+      // Livello 3: Conferma eliminazione modelli attiva -> annulla la conferma
+      if (confirmDeleteAll) {
+        setConfirmDeleteAll(false);
+        return;
+      }
+      if (confirmDeleteModelId) {
+        setConfirmDeleteModelId(null);
+        return;
+      }
+
+      // Livello 4: Nessuna finestra interna o conferma in sospeso -> chiudi le impostazioni
+      onClose();
     };
     if (isOpen) window.addEventListener('keydown', handleKey);
     return () => window.removeEventListener('keydown', handleKey);
-  }, [isOpen, onClose, isUninstalling]);
+  }, [isOpen, onClose, isUninstalling, showUninstallModal, confirmReset, confirmDeleteAll, confirmDeleteModelId]);
+
+  // Se confirmReset è attivo, cliccare su qualsiasi altra parte dell'app lo annulla
+  useEffect(() => {
+    if (!confirmReset) return;
+    const handlePointerDown = (e: MouseEvent | TouchEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target?.closest('[data-reset-wizard-btn]')) return;
+      setConfirmReset(false);
+    };
+    window.addEventListener('pointerdown', handlePointerDown);
+    return () => window.removeEventListener('pointerdown', handlePointerDown);
+  }, [confirmReset]);
+
+  // Se confirmDeleteModelId è attivo, cliccare altrove annulla la conferma
+  useEffect(() => {
+    if (!confirmDeleteModelId) return;
+    const handlePointerDown = (e: MouseEvent | TouchEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target?.closest(`[data-delete-model-btn="${confirmDeleteModelId}"]`)) return;
+      setConfirmDeleteModelId(null);
+    };
+    window.addEventListener('pointerdown', handlePointerDown);
+    return () => window.removeEventListener('pointerdown', handlePointerDown);
+  }, [confirmDeleteModelId]);
 
   // Avvio download di un modello con aggiornamento ottimistico istantaneo
   const handleDownloadModel = async (modelId: string) => {
@@ -349,49 +395,22 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
     }
   };
 
-  useEffect(() => {
-    if (settings.audioFormat) {
-      setAudioFormat(settings.audioFormat);
-    }
-  }, [settings.audioFormat]);
-
   const handleVadChange = (newVal: number) => {
     setVadSensitivity(newVal);
     updateSettings({ vadSensitivity: newVal });
   };
 
-  const handleAudioFormatChange = async (newFormat: 'm4a' | 'wav') => {
-    setAudioFormat(newFormat);
-    try {
-      await updateSettings({ audioFormat: newFormat });
-      showNotification(
-        newFormat === 'm4a'
-          ? 'Formato impostato su M4A compresso AAC (~18 MB/h, -85% di spazio sul disco).'
-          : 'Formato impostato su WAV originale PCM non compresso (~115 MB/h).',
-        'success'
-      );
-    } catch (err: any) {
-      showNotification(`Errore salvataggio formato audio: ${err?.message || err}`, 'error');
-    }
+  const handleTabChange = (tab: TabType) => {
+    setConfirmReset(false);
+    setConfirmDeleteAll(false);
+    setConfirmDeleteModelId(null);
+    setActiveTab(tab);
   };
 
-  const handleCompressArchive = async () => {
-    try {
-      setIsCompressingArchive(true);
-      const res = await api.settings.compressArchive();
-      showNotification(res.message, res.converted_count > 0 ? 'success' : 'info');
-      await fetchStorageStats();
-    } catch (err: any) {
-      showNotification(err?.message || 'Errore durante la compressione dell\'archivio audio.', 'error');
-    } finally {
-      setIsCompressingArchive(false);
-    }
-  };
-
-  const handleResetWizard = () => {
+  const handleResetWizard = (e?: React.MouseEvent) => {
+    e?.stopPropagation();
     if (!confirmReset) {
       setConfirmReset(true);
-      setTimeout(() => setConfirmReset(false), 4000);
       return;
     }
     resetSetup();
@@ -495,8 +514,8 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       badgeText: 'text-[#5AC8FA]',
       icon: FileAudio,
       path: normalizeDisplayPath(`${storagePath}/audio`),
-      desc: 'Registrazioni audio delle lezioni universitarie.',
-      details: 'Tracce audio',
+      desc: 'Registrazioni audio compresse in formato M4A.',
+      details: 'Formato M4A salva-spazio',
     },
     {
       id: 'sqlite',
@@ -562,7 +581,6 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
             </div>
             <div>
               <h2 className="text-xs font-semibold tracking-tight text-white">Impostazioni SbobinAI</h2>
-              <p className="text-[11px] text-white/45">Preferenze locali del quaderno universitario</p>
             </div>
           </div>
 
@@ -580,11 +598,11 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
         <div className="flex-1 flex overflow-hidden">
           
           {/* ── Sidebar Categorie (Design coerente senza arcobaleno) ── */}
-          <div className="w-56 border-r border-white/[0.08] liquid-glass-subtle p-3 flex flex-col justify-between flex-shrink-0">
+          <div className="w-56 border-r border-white/[0.08] liquid-glass-subtle p-3 flex flex-col justify-start flex-shrink-0">
             <div className="space-y-1">
               {/* Tab 1: Archiviazione */}
               <button
-                onClick={() => setActiveTab('storage')}
+                onClick={() => handleTabChange('storage')}
                 className={clsx(
                   'w-full flex items-center gap-2.5 px-3 py-2.5 rounded-2xl text-xs font-medium transition-all text-left cursor-pointer',
                   activeTab === 'storage'
@@ -598,7 +616,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
 
               {/* Tab 2: Modelli IA */}
               <button
-                onClick={() => setActiveTab('models')}
+                onClick={() => handleTabChange('models')}
                 className={clsx(
                   'w-full flex items-center gap-2.5 px-3 py-2.5 rounded-2xl text-xs font-medium transition-all text-left cursor-pointer',
                   activeTab === 'models'
@@ -612,7 +630,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
 
               {/* Tab 3: Audio & Registrazione */}
               <button
-                onClick={() => setActiveTab('audio')}
+                onClick={() => handleTabChange('audio')}
                 className={clsx(
                   'w-full flex items-center gap-2.5 px-3 py-2.5 rounded-2xl text-xs font-medium transition-all text-left cursor-pointer',
                   activeTab === 'audio'
@@ -626,7 +644,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
 
               {/* Tab 4: Sistema & Privacy */}
               <button
-                onClick={() => setActiveTab('system')}
+                onClick={() => handleTabChange('system')}
                 className={clsx(
                   'w-full flex items-center gap-2.5 px-3 py-2.5 rounded-2xl text-xs font-medium transition-all text-left cursor-pointer',
                   activeTab === 'system'
@@ -637,13 +655,6 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                 <ShieldCheck size={15} className="text-white/70" />
                 <span>Sistema & Privacy</span>
               </button>
-            </div>
-
-            {/* Bottom Sidebar: Subtle macOS/Windows Version Note */}
-            <div className="px-3 py-2 text-center">
-              <span className="text-[10px] text-white/30 font-mono">
-                v{updater.currentVersion || '0.0.13'} · {osBadge || 'Desktop'}
-              </span>
             </div>
           </div>
 
@@ -1013,410 +1024,336 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
             )}
 
             {/* ══════════════════════════════════════════════════════════════════
-                TAB 2: MODELLI (DISCO & RETI NEURALI)
+                TAB 2: MODELLI IA (DESIGN UNIFICATO E MINIMALE)
             ══════════════════════════════════════════════════════════════════ */}
             {activeTab === 'models' && (
               <div className="space-y-6 animate-fade-in">
                 
                 {/* ── Header Tab Modelli ── */}
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-2 border-b border-white/[0.08]">
+                <div className="pb-2 border-b border-white/[0.08]">
+                  <h3 className="text-sm font-bold text-white">Modelli IA</h3>
+                  <p className="text-xs text-white/50 mt-0.5 leading-relaxed">
+                    Eseguiti al 100% in locale sul tuo computer per la massima riservatezza e velocità.
+                  </p>
+                </div>
+
+                {/* ── SEZIONE 1: MODELLI DI BASE ── */}
+                <div className="space-y-3">
                   <div>
-                    <h3 className="text-sm font-bold text-white">Modelli IA</h3>
-                    <p className="text-xs text-white/50 mt-0.5 leading-relaxed">
-                      Modelli locali per trascrizione, memoria e riassunti. Eseguiti al 100% sul tuo computer.
+                    <span className="text-xs font-semibold uppercase tracking-wider text-white/50 block">
+                      Modelli di Base
+                    </span>
+                    <p className="text-[11px] text-white/40 mt-0.5">
+                      Necessari per la trascrizione audio e la ricerca concettuale.
                     </p>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => fetchModelsStatus()}
-                    disabled={loadingModels}
-                    className="self-start sm:self-center px-3 py-1.5 rounded-xl liquid-glass-pill border border-white/12 hover:border-white/22 text-white/70 hover:text-white transition-all cursor-pointer disabled:opacity-50 flex items-center gap-1.5 text-xs flex-shrink-0"
-                    title="Ricarica stato da disco"
-                  >
-                    <RefreshCw size={13} className={clsx(loadingModels && "animate-spin text-blue-400")} />
-                    <span>Ricarica stato</span>
-                  </button>
-                </div>
 
-                {/* ── Barra Filtri Modelli (Motori Base vs LLM) ── */}
-                <div className="flex items-center justify-between border-b border-white/[0.08] pb-2">
-                  <div className="flex items-center gap-1.5 p-1 rounded-2xl liquid-glass-subtle border border-white/[0.08]">
-                    <button
-                      type="button"
-                      onClick={() => setModelFilter('system_core')}
-                      className={clsx(
-                        'px-3.5 py-1.5 rounded-xl text-xs font-semibold transition-all cursor-pointer',
-                        modelFilter === 'system_core'
-                          ? 'bg-white/[0.18] text-white shadow-liquid-sm border border-white/[0.15]'
-                          : 'text-white/50 hover:text-white'
-                      )}
-                    >
-                      Modelli di Base
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setModelFilter('llm')}
-                      className={clsx(
-                        'px-3.5 py-1.5 rounded-xl text-xs font-semibold transition-all cursor-pointer',
-                        modelFilter === 'llm'
-                          ? 'bg-white/[0.18] text-white shadow-liquid-sm border border-white/[0.15]'
-                          : 'text-white/50 hover:text-white'
-                      )}
-                    >
-                      Modelli Linguistici (LLM)
-                    </button>
-                  </div>
-                </div>
+                  <div className="space-y-2.5">
+                    {(() => {
+                      const coreWhisper = modelsStatus?.whisper?.find((m) => m.id === 'large-v3-turbo-q4') || {
+                        id: 'large-v3-turbo-q4',
+                        name: 'Whisper Large-v3-Turbo',
+                        type: 'whisper' as const,
+                        approx_size: '~580 MB',
+                        description: 'Trascrive le registrazioni audio parola per parola con alta precisione.',
+                        downloaded: false,
+                        status: 'idle' as const,
+                        disk_size_mb: null,
+                      };
 
-                {/* ── LISTA MOTORI DI SISTEMA BASE (Whisper + Qwen3-Embedding) ── */}
-                {modelFilter === 'system_core' && (
-                  <div className="space-y-4">
-                    <div>
-                      <span className="text-xs font-semibold uppercase tracking-wider text-white/50 block">
-                        Modelli di Sistema
-                      </span>
-                      <p className="text-[11px] text-white/45 mt-1 leading-relaxed">
-                        Componenti essenziali per la trascrizione vocale e la memoria delle lezioni.
-                      </p>
-                    </div>
+                      const coreEmbedding = modelsStatus?.embedding?.find((m) => m.id === 'mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ') || {
+                        id: 'mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ',
+                        name: 'Qwen3 Embedding 0.6B',
+                        type: 'embedding' as const,
+                        approx_size: '~300 MB',
+                        description: 'Organizza la memoria concettuale delle lezioni per la ricerca istantanea.',
+                        downloaded: false,
+                        status: 'idle' as const,
+                        disk_size_mb: null,
+                      };
 
-                    <div className="space-y-3">
-                      {(() => {
-                        const coreWhisper = modelsStatus?.whisper?.find((m) => m.id === 'large-v3-turbo-q4') || {
-                            id: 'large-v3-turbo-q4',
-                            name: 'Whisper Large-v3-Turbo Q4 (locale)',
-                            type: 'whisper' as const,
-                            approx_size: '~580 MB',
-                            description: 'Trascrive le registrazioni audio parola per parola con alta precisione.',
-                            downloaded: false,
-                            status: 'idle' as const,
-                            disk_size_mb: null,
-                          };
+                      const coreItems = [coreWhisper, coreEmbedding];
 
-                          const coreEmbedding = modelsStatus?.embedding?.find((m) => m.id === 'mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ') || {
-                            id: 'mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ',
-                            name: 'Qwen3 Embedding 0.6B 4-bit DWQ',
-                            type: 'embedding' as const,
-                            approx_size: '~300 MB',
-                            description: 'Organizza la memoria semantica per consentire la ricerca intelligente nelle lezioni.',
-                            downloaded: false,
-                            status: 'idle' as const,
-                            disk_size_mb: null,
-                          };
+                      return coreItems.map((m) => {
+                        const isDownloading = m.status === 'downloading' || actionInProgress === m.id;
+                        const isCancellingThis = actionInProgress === `cancel-${m.id}`;
+                        const isMic = m.type === 'whisper';
+                        const sizeDisplay = m.downloaded
+                          ? `${m.disk_size_mb || m.total_mb || '—'} MB`
+                          : m.approx_size;
 
-                          const coreItems = [coreWhisper, coreEmbedding];
-
-                          return coreItems.map((m) => {
-                            const isDownloading = m.status === 'downloading' || actionInProgress === m.id;
-                            const isCancellingThis = actionInProgress === `cancel-${m.id}`;
-                            const isMic = m.type === 'whisper';
-
-                            return (
-                              <div
-                                key={m.id}
-                                className={clsx(
-                                  'p-4 rounded-3xl border transition-all space-y-3',
+                        return (
+                          <div
+                            key={m.id}
+                            className={clsx(
+                              'p-3.5 rounded-2xl border transition-all space-y-2.5',
+                              m.downloaded
+                                ? 'liquid-glass border-white/[0.12] shadow-liquid-sm'
+                                : 'liquid-glass-subtle border-white/[0.08] hover:border-white/16'
+                            )}
+                          >
+                            <div className="flex items-center justify-between gap-3">
+                              <div className="flex items-center gap-3 min-w-0">
+                                <div className={clsx(
+                                  'w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0',
                                   m.downloaded
-                                    ? 'liquid-glass border-white/[0.14] shadow-liquid-sm'
-                                    : 'liquid-glass-subtle border-white/[0.08] hover:border-white/16'
-                                )}
-                              >
-                                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                                  <div className="flex items-start gap-3 min-w-0">
-                                    <div className={clsx(
-                                      'w-9 h-9 rounded-2xl flex items-center justify-center flex-shrink-0 mt-0.5',
-                                      m.downloaded
-                                        ? 'bg-white/[0.10] text-white border border-white/[0.14]'
-                                        : 'bg-white/5 text-white/40 border border-white/10'
-                                    )}>
-                                      {isMic ? <Mic size={16} /> : <Database size={16} />}
-                                    </div>
-
-                                    <div className="min-w-0">
-                                      <div className="flex items-center gap-2 flex-wrap">
-                                        <h4 className="text-xs font-bold text-white">{m.name}</h4>
-                                        <span className="text-[10px] px-2 py-0.5 rounded-full font-mono bg-white/[0.06] text-white/60 border border-white/[0.10]">
-                                          Componente Base
-                                        </span>
-                                        {m.downloaded ? (
-                                          <span className="text-[10px] font-mono text-white/40">
-                                            {m.disk_size_mb || m.total_mb} MB
-                                          </span>
-                                        ) : (
-                                          <span className="text-[10px] px-2 py-0.5 rounded-full font-mono bg-amber-500/15 text-amber-300 border border-amber-500/25">
-                                            Da installare ({m.approx_size})
-                                          </span>
-                                        )}
-                                      </div>
-                                      <p className="text-[11px] text-white/50 mt-1 leading-relaxed">
-                                        {m.description}
-                                      </p>
-                                    </div>
-                                  </div>
-
-                                  <div className="flex items-center gap-2 flex-shrink-0 self-end sm:self-center">
-                                    {m.downloaded ? (
-                                      <>
-                                        <span className="text-[11px] font-semibold text-emerald-300 bg-emerald-500/15 border border-emerald-500/30 px-2.5 py-1 rounded-full flex items-center gap-1.5 shadow-liquid-sm">
-                                          <Check size={11} strokeWidth={2.5} />
-                                          <span>Operativo</span>
-                                        </span>
-                                        <button
-                                          type="button"
-                                          onClick={() => handleDownloadModel(m.id)}
-                                          disabled={actionInProgress !== null}
-                                          className="px-3 py-1.5 rounded-xl text-xs font-medium text-white/60 hover:text-white bg-white/[0.06] hover:bg-white/[0.12] border border-white/[0.10] transition-all cursor-pointer"
-                                          title="Reinstalla o ripara i pesi del modello"
-                                        >
-                                          Ripara
-                                        </button>
-                                      </>
-                                    ) : isDownloading ? (
-                                      <button
-                                        type="button"
-                                        onClick={() => handleCancelDownload(m.id)}
-                                        disabled={isCancellingThis}
-                                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold bg-red-500/20 text-red-200 border border-red-500/35 hover:bg-red-500/30 transition-all cursor-pointer"
-                                      >
-                                        <X size={13} className="text-red-300" />
-                                        <span>{isCancellingThis ? 'Annullamento...' : 'Interrompi'}</span>
-                                      </button>
-                                    ) : (
-                                      <button
-                                        type="button"
-                                        onClick={() => handleDownloadModel(m.id)}
-                                        disabled={actionInProgress !== null}
-                                        className="flex items-center gap-1.5 px-4 py-1.5 rounded-xl text-xs font-semibold bg-blue-500 hover:bg-blue-600 text-white shadow-liquid-sm transition-all cursor-pointer disabled:opacity-50"
-                                      >
-                                        <Download size={13} />
-                                        <span>Installa ({m.approx_size})</span>
-                                      </button>
-                                    )}
-                                  </div>
+                                    ? 'bg-white/[0.10] text-white border border-white/[0.14]'
+                                    : 'bg-white/5 text-white/40 border border-white/10'
+                                )}>
+                                  {isMic ? <Mic size={16} /> : <Database size={16} />}
                                 </div>
 
-                                {isDownloading && (
-                                  <div className="w-full pt-2 border-t border-white/[0.08] space-y-1.5 animate-fade-in">
-                                    <div className="flex justify-between items-center text-[11px] font-mono">
-                                      <span className="flex items-center gap-1.5 text-blue-300 font-medium truncate max-w-[80%]">
-                                        <Loader2 size={12} className="animate-spin flex-shrink-0" />
-                                        <span className="truncate">{m.stage || "Download pesi da Hugging Face..."}</span>
-                                      </span>
-                                      <span className="font-bold text-white text-xs">{m.progress || 0}%</span>
-                                    </div>
-                                    <div className="w-full h-2 rounded-full bg-white/10 overflow-hidden relative">
-                                      <div
-                                        className="h-full bg-gradient-to-r from-blue-500 via-indigo-500 to-emerald-400 rounded-full transition-all duration-300"
-                                        style={{ width: `${Math.min(100, Math.max(4, m.progress || 0))}%` }}
-                                      />
-                                    </div>
-                                    <div className="flex justify-between text-[10px] font-mono text-white/50">
-                                      <span>{Math.min(m.downloaded_mb || 0, m.total_mb || 580)} MB scaricati</span>
-                                      <span>Totale: ~{m.total_mb || '580'} MB</span>
-                                    </div>
-                                  </div>
-                                )}
-
-                                {m.status === 'error' && !isDownloading && (
-                                  <div className="w-full pt-2 border-t border-red-500/20 text-xs text-red-300 flex items-center justify-between gap-2 animate-fade-in">
-                                    <div className="flex items-center gap-1.5 truncate max-w-[75%]">
-                                      <AlertCircle size={13} className="text-red-400 shrink-0" />
-                                      <span className="truncate">{m.error || "Errore durante il download dei pesi."}</span>
-                                    </div>
-                                    <button
-                                      type="button"
-                                      onClick={() => handleDownloadModel(m.id)}
-                                      className="px-2.5 py-1 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-200 text-[10px] font-semibold shrink-0 cursor-pointer"
-                                    >
-                                      Riprova
-                                    </button>
-                                  </div>
-                                )}
-                              </div>
-                            );
-                          });
-                        })()}
-                    </div>
-                  </div>
-                )}
-
-                {/* ── LISTA MODELLI LLM (mlx-lm: Qwen3.5 & Gemma 4) ── */}
-                {modelFilter === 'llm' && (
-                  <div className="space-y-4">
-                    <div>
-                      <span className="text-xs font-semibold uppercase tracking-wider text-white/50 block">
-                        Modelli Linguistici (LLM)
-                      </span>
-                      <p className="text-[11px] text-white/45 mt-1 leading-relaxed">
-                        I modelli linguistici locali generano capitoli di studio, sintesi e rispondono alle domande sul quaderno.
-                      </p>
-                    </div>
-
-                    <div className="space-y-3">
-                      {(() => {
-                        const llmList = (modelsStatus?.llm && modelsStatus.llm.length > 0) ? modelsStatus.llm : defaultLlms;
-                        return llmList.map((m: ModelInfo) => {
-                          const isCurrentActive = llmModel === m.id;
-                          const isDownloading = m.status === 'downloading' || actionInProgress === m.id;
-                          const isDeletingThis = actionInProgress === `delete-${m.id}`;
-                          const isCancellingThis = actionInProgress === `cancel-${m.id}`;
-
-                          return (
-                            <div
-                              key={m.id}
-                              className={clsx(
-                                'p-4 rounded-3xl border transition-all space-y-3',
-                                isCurrentActive
-                                  ? 'bg-white/[0.08] border-white/25 shadow-liquid-sm'
-                                  : 'liquid-glass-subtle border-white/[0.08] hover:border-white/16'
-                              )}
-                            >
-                              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                                <div className="flex items-start gap-3 min-w-0">
-                                  <div className={clsx(
-                                    'w-9 h-9 rounded-2xl flex items-center justify-center flex-shrink-0 mt-0.5',
-                                    m.downloaded
-                                      ? 'bg-white/10 text-white/90 border border-white/15'
-                                      : 'bg-white/5 text-white/40 border border-white/10'
-                                  )}>
-                                    <Cpu size={16} />
-                                  </div>
-
-                                  <div className="min-w-0">
-                                    <div className="flex items-center gap-2 flex-wrap">
-                                      <h4 className="text-xs font-bold text-white">{m.name}</h4>
-                                      {m.downloaded ? (
-                                        <span className="text-[10px] font-mono text-white/40">
-                                          {m.disk_size_mb || m.total_mb} MB
-                                        </span>
-                                      ) : (
-                                        <span className="text-[10px] px-2 py-0.5 rounded-full font-mono bg-white/[0.06] text-white/45 border border-white/[0.08]">
-                                          Non scaricato ({m.approx_size})
-                                        </span>
-                                      )}
-                                    </div>
-                                    <p className="text-[11px] text-white/50 mt-1 leading-relaxed">
-                                      {m.description}
-                                    </p>
-                                  </div>
-                                </div>
-
-                                <div className="flex items-center gap-2 flex-shrink-0 self-end sm:self-center">
-                                  {m.downloaded ? (
-                                    <>
-                                      {isCurrentActive ? (
-                                        <span className="text-[11px] font-semibold text-emerald-300 bg-emerald-500/15 border border-emerald-500/30 px-2.5 py-1 rounded-full flex items-center gap-1.5 shadow-liquid-sm">
-                                          <Check size={11} strokeWidth={2.5} />
-                                          <span>In uso</span>
-                                        </span>
-                                      ) : (
-                                        <button
-                                          type="button"
-                                          onClick={() => handleSelectActiveLlm(m.id)}
-                                          className="px-3.5 py-1.5 rounded-xl text-xs font-semibold bg-white/[0.12] hover:bg-white/[0.20] text-white border border-white/[0.16] transition-all cursor-pointer shadow-liquid-sm"
-                                        >
-                                          Attiva
-                                        </button>
-                                      )}
-
-                                      {confirmDeleteModelId === m.id ? (
-                                        <div className="flex items-center gap-1.5 animate-fade-in">
-                                          <button
-                                            type="button"
-                                            onClick={() => setConfirmDeleteModelId(null)}
-                                            className="px-2 py-1 rounded-lg text-[10px] text-white/60 hover:text-white"
-                                          >
-                                            Annulla
-                                          </button>
-                                          <button
-                                            type="button"
-                                            onClick={() => handleDeleteModel(m.id)}
-                                            disabled={isDeletingThis}
-                                            className="px-2.5 py-1 rounded-lg text-[10px] font-bold bg-red-500 text-white hover:bg-red-600 cursor-pointer"
-                                          >
-                                            {isDeletingThis ? 'Elimino...' : 'Conferma'}
-                                          </button>
-                                        </div>
-                                      ) : (
-                                        <button
-                                          type="button"
-                                          onClick={() => setConfirmDeleteModelId(m.id)}
-                                          disabled={isDeletingThis}
-                                          className="p-2 rounded-xl text-red-300 hover:text-red-200 hover:bg-red-500/20 border border-transparent hover:border-red-500/30 transition-all cursor-pointer"
-                                          title="Elimina questo modello per liberare spazio"
-                                        >
-                                          <Trash2 size={14} />
-                                        </button>
-                                      )}
-                                    </>
-                                  ) : isDownloading ? (
-                                    <button
-                                      type="button"
-                                      onClick={() => handleCancelDownload(m.id)}
-                                      disabled={isCancellingThis}
-                                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold bg-red-500/20 text-red-200 border border-red-500/35 hover:bg-red-500/30 transition-all cursor-pointer"
-                                    >
-                                      <X size={13} className="text-red-300" />
-                                      <span>{isCancellingThis ? 'Annullamento...' : 'Interrompi'}</span>
-                                    </button>
-                                  ) : (
-                                    <button
-                                      type="button"
-                                      onClick={() => handleDownloadModel(m.id)}
-                                      disabled={actionInProgress !== null}
-                                      className="flex items-center gap-1.5 px-4 py-1.5 rounded-xl text-xs font-semibold bg-white/[0.14] hover:bg-white/[0.22] text-white border border-white/[0.20] transition-all cursor-pointer shadow-liquid-sm disabled:opacity-50"
-                                    >
-                                      <Download size={13} />
-                                      <span>Scarica ({m.approx_size})</span>
-                                    </button>
-                                  )}
-                                </div>
-                              </div>
-
-                              {isDownloading && (
-                                <div className="w-full pt-2 border-t border-white/[0.08] space-y-1.5 animate-fade-in">
-                                  <div className="flex justify-between items-center text-[11px] font-mono">
-                                    <span className="flex items-center gap-1.5 text-blue-300 font-medium truncate max-w-[80%]">
-                                      <Loader2 size={12} className="animate-spin flex-shrink-0" />
-                                      <span className="truncate">{m.stage || "Download pesi da Hugging Face..."}</span>
+                                <div className="min-w-0">
+                                  <div className="flex items-center gap-2">
+                                    <h4 className="text-xs font-semibold text-white truncate">{m.name}</h4>
+                                    <span className="text-[10px] font-mono text-white/40 flex-shrink-0">
+                                      {sizeDisplay}
                                     </span>
-                                    <span className="font-bold text-white text-xs">{m.progress || 0}%</span>
                                   </div>
-                                  <div className="w-full h-2 rounded-full bg-white/10 overflow-hidden relative">
-                                    <div
-                                      className="h-full bg-gradient-to-r from-blue-500 via-indigo-500 to-emerald-400 rounded-full transition-all duration-300"
-                                      style={{ width: `${Math.min(100, Math.max(4, m.progress || 0))}%` }}
-                                    />
-                                  </div>
-                                  <div className="flex justify-between text-[10px] font-mono text-white/50">
-                                    <span>{Math.min(m.downloaded_mb || 0, m.total_mb || 2300)} MB scaricati</span>
-                                    <span>Totale: ~{m.total_mb || '2300'} MB</span>
-                                  </div>
+                                  <p className="text-[11px] text-white/50 truncate">
+                                    {m.description}
+                                  </p>
                                 </div>
-                              )}
+                              </div>
 
-                              {m.status === 'error' && !isDownloading && (
-                                <div className="w-full pt-2 border-t border-red-500/20 text-xs text-red-300 flex items-center justify-between gap-2 animate-fade-in">
-                                  <div className="flex items-center gap-1.5 truncate max-w-[75%]">
-                                    <AlertCircle size={13} className="text-red-400 shrink-0" />
-                                    <span className="truncate">{m.error || "Errore durante il download dei pesi."}</span>
-                                  </div>
+                              <div className="flex items-center gap-2 flex-shrink-0">
+                                {m.downloaded ? (
+                                  <span className="text-[11px] font-medium text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2.5 py-1 rounded-full flex items-center gap-1.5">
+                                    <Check size={11} strokeWidth={2.5} />
+                                    <span>Pronto</span>
+                                  </span>
+                                ) : isDownloading ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleCancelDownload(m.id)}
+                                    disabled={isCancellingThis}
+                                    className="flex items-center gap-1 px-3 py-1 rounded-xl text-xs font-medium bg-red-500/20 text-red-200 border border-red-500/35 hover:bg-red-500/30 transition-all cursor-pointer"
+                                  >
+                                    <X size={12} className="text-red-300" />
+                                    <span>{isCancellingThis ? 'Annullamento...' : 'Interrompi'}</span>
+                                  </button>
+                                ) : (
                                   <button
                                     type="button"
                                     onClick={() => handleDownloadModel(m.id)}
-                                    className="px-2.5 py-1 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-200 text-[10px] font-semibold shrink-0 cursor-pointer"
+                                    disabled={actionInProgress !== null}
+                                    className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-medium bg-blue-500 hover:bg-blue-600 text-white shadow-liquid-sm transition-all cursor-pointer disabled:opacity-50"
                                   >
-                                    Riprova
+                                    <Download size={12} />
+                                    <span>Installa</span>
                                   </button>
-                                </div>
-                              )}
+                                )}
+                              </div>
                             </div>
-                          );
-                        });
-                      })()}
-                    </div>
+
+                            {isDownloading && (
+                              <div className="w-full pt-1.5 border-t border-white/[0.08] space-y-1 animate-fade-in">
+                                <div className="flex justify-between items-center text-[10px] font-mono">
+                                  <span className="flex items-center gap-1.5 text-blue-300 font-medium truncate max-w-[80%]">
+                                    <Loader2 size={11} className="animate-spin flex-shrink-0" />
+                                    <span className="truncate">{m.stage || "Download in corso..."}</span>
+                                  </span>
+                                  <span className="font-bold text-white">{m.progress || 0}%</span>
+                                </div>
+                                <div className="w-full h-1.5 rounded-full bg-white/10 overflow-hidden">
+                                  <div
+                                    className="h-full bg-gradient-to-r from-blue-500 to-emerald-400 rounded-full transition-all duration-300"
+                                    style={{ width: `${Math.min(100, Math.max(4, m.progress || 0))}%` }}
+                                  />
+                                </div>
+                              </div>
+                            )}
+
+                            {m.status === 'error' && !isDownloading && (
+                              <div className="w-full pt-1.5 border-t border-red-500/20 text-xs text-red-300 flex items-center justify-between gap-2 animate-fade-in">
+                                <div className="flex items-center gap-1.5 truncate max-w-[75%]">
+                                  <AlertCircle size={12} className="text-red-400 shrink-0" />
+                                  <span className="truncate text-[11px]">{m.error || "Errore durante il download."}</span>
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() => handleDownloadModel(m.id)}
+                                  className="px-2 py-0.5 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-200 text-[10px] font-medium shrink-0 cursor-pointer"
+                                >
+                                  Riprova
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      });
+                    })()}
                   </div>
-                )}
+                </div>
+
+                {/* ── SEZIONE 2: MODELLI LINGUISTICI (LLM) ── */}
+                <div className="space-y-3 pt-2">
+                  <div>
+                    <span className="text-xs font-semibold uppercase tracking-wider text-white/50 block">
+                      Modelli Linguistici (LLM)
+                    </span>
+                    <p className="text-[11px] text-white/40 mt-0.5">
+                      Generano capitoli di studio, sintesi e rispondono sul quaderno delle lezioni.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2.5">
+                    {(() => {
+                      const llmList = (modelsStatus?.llm && modelsStatus.llm.length > 0) ? modelsStatus.llm : defaultLlms;
+                      return llmList.map((m: ModelInfo) => {
+                        const isCurrentActive = llmModel === m.id;
+                        const isDownloading = m.status === 'downloading' || actionInProgress === m.id;
+                        const isDeletingThis = actionInProgress === `delete-${m.id}`;
+                        const isCancellingThis = actionInProgress === `cancel-${m.id}`;
+                        const sizeDisplay = m.downloaded
+                          ? `${m.disk_size_mb || m.total_mb || '—'} MB`
+                          : m.approx_size;
+
+                        return (
+                          <div
+                            key={m.id}
+                            className={clsx(
+                              'p-3.5 rounded-2xl border transition-all space-y-2.5',
+                              m.downloaded
+                                ? 'liquid-glass border-white/[0.12] shadow-liquid-sm'
+                                : 'liquid-glass-subtle border-white/[0.08] hover:border-white/16'
+                            )}
+                          >
+                            <div className="flex items-center justify-between gap-3">
+                              <div className="flex items-center gap-3 min-w-0">
+                                <div className={clsx(
+                                  'w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0',
+                                  m.downloaded
+                                    ? 'bg-white/10 text-white/90 border border-white/15'
+                                    : 'bg-white/5 text-white/40 border border-white/10'
+                                )}>
+                                  <Cpu size={16} />
+                                </div>
+
+                                <div className="min-w-0">
+                                  <div className="flex items-center gap-2">
+                                    <h4 className="text-xs font-semibold text-white truncate">{m.name}</h4>
+                                    <span className="text-[10px] font-mono text-white/40 flex-shrink-0">
+                                      {sizeDisplay}
+                                    </span>
+                                  </div>
+                                  <p className="text-[11px] text-white/50 truncate">
+                                    {m.description}
+                                  </p>
+                                </div>
+                              </div>
+
+                              <div className="flex items-center gap-2 flex-shrink-0">
+                                {m.downloaded ? (
+                                  <>
+                                    {isCurrentActive ? (
+                                      <span className="text-[11px] font-medium text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2.5 py-1 rounded-full flex items-center gap-1.5">
+                                        <Check size={11} strokeWidth={2.5} />
+                                        <span>In uso</span>
+                                      </span>
+                                    ) : (
+                                      <button
+                                        type="button"
+                                        onClick={() => handleSelectActiveLlm(m.id)}
+                                        className="px-3 py-1 rounded-xl text-xs font-medium bg-white/[0.10] hover:bg-white/[0.18] text-white border border-white/12 transition-all cursor-pointer"
+                                      >
+                                        Attiva
+                                      </button>
+                                    )}
+
+                                    {confirmDeleteModelId === m.id ? (
+                                      <div className="flex items-center gap-1.5 animate-fade-in">
+                                        <button
+                                          type="button"
+                                          onClick={() => setConfirmDeleteModelId(null)}
+                                          className="px-2 py-0.5 rounded-lg text-[10px] text-white/60 hover:text-white"
+                                        >
+                                          Annulla
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => handleDeleteModel(m.id)}
+                                          disabled={isDeletingThis}
+                                          className="px-2 py-0.5 rounded-lg text-[10px] font-semibold bg-red-500 text-white hover:bg-red-600 cursor-pointer"
+                                        >
+                                          {isDeletingThis ? '...' : 'Elimina'}
+                                        </button>
+                                      </div>
+                                    ) : (
+                                      <button
+                                        type="button"
+                                        onClick={() => setConfirmDeleteModelId(m.id)}
+                                        disabled={isDeletingThis}
+                                        className="p-1.5 rounded-lg text-white/40 hover:text-red-300 hover:bg-red-500/15 transition-all cursor-pointer"
+                                        title="Elimina modello per liberare spazio"
+                                      >
+                                        <Trash2 size={13} />
+                                      </button>
+                                    )}
+                                  </>
+                                ) : isDownloading ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleCancelDownload(m.id)}
+                                    disabled={isCancellingThis}
+                                    className="flex items-center gap-1 px-3 py-1 rounded-xl text-xs font-medium bg-red-500/20 text-red-200 border border-red-500/35 hover:bg-red-500/30 transition-all cursor-pointer"
+                                  >
+                                    <X size={12} className="text-red-300" />
+                                    <span>{isCancellingThis ? 'Annullamento...' : 'Interrompi'}</span>
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleDownloadModel(m.id)}
+                                    disabled={actionInProgress !== null}
+                                    className="flex items-center gap-1.5 px-3 py-1 rounded-xl text-xs font-medium bg-white/[0.10] hover:bg-white/[0.18] text-white border border-white/12 transition-all cursor-pointer shadow-liquid-sm disabled:opacity-50"
+                                  >
+                                    <Download size={12} />
+                                    <span>Scarica</span>
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+
+                            {isDownloading && (
+                              <div className="w-full pt-1.5 border-t border-white/[0.08] space-y-1 animate-fade-in">
+                                <div className="flex justify-between items-center text-[10px] font-mono">
+                                  <span className="flex items-center gap-1.5 text-blue-300 font-medium truncate max-w-[80%]">
+                                    <Loader2 size={11} className="animate-spin flex-shrink-0" />
+                                    <span className="truncate">{m.stage || "Download in corso..."}</span>
+                                  </span>
+                                  <span className="font-bold text-white">{m.progress || 0}%</span>
+                                </div>
+                                <div className="w-full h-1.5 rounded-full bg-white/10 overflow-hidden">
+                                  <div
+                                    className="h-full bg-gradient-to-r from-blue-500 to-emerald-400 rounded-full transition-all duration-300"
+                                    style={{ width: `${Math.min(100, Math.max(4, m.progress || 0))}%` }}
+                                  />
+                                </div>
+                              </div>
+                            )}
+
+                            {m.status === 'error' && !isDownloading && (
+                              <div className="w-full pt-1.5 border-t border-red-500/20 text-xs text-red-300 flex items-center justify-between gap-2 animate-fade-in">
+                                <div className="flex items-center gap-1.5 truncate max-w-[75%]">
+                                  <AlertCircle size={12} className="text-red-400 shrink-0" />
+                                  <span className="truncate text-[11px]">{m.error || "Errore durante il download."}</span>
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() => handleDownloadModel(m.id)}
+                                  className="px-2 py-0.5 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-200 text-[10px] font-medium shrink-0 cursor-pointer"
+                                >
+                                  Riprova
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      });
+                    })()}
+                  </div>
+                </div>
 
               </div>
             )}
@@ -1479,7 +1416,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                     </div>
                   </button>
 
-                  {/* Opzione 2: Standard (Consigliata) */}
+                  {/* Opzione 2: Standard */}
                   <button
                     type="button"
                     onClick={() => handleVadChange(2)}
@@ -1498,16 +1435,11 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                         )}>
                           <Sparkles size={15} strokeWidth={2} />
                         </div>
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-white/[0.10] text-white/80 border border-white/[0.14]">
-                            Consigliata
-                          </span>
-                          <div className={clsx(
-                            'w-4 h-4 rounded-full border flex items-center justify-center transition-all',
-                            vadSensitivity === 2 ? 'border-white bg-white text-black' : 'border-white/20'
-                          )}>
-                            {vadSensitivity === 2 && <div className="w-1.5 h-1.5 rounded-full bg-black" />}
-                          </div>
+                        <div className={clsx(
+                          'w-4 h-4 rounded-full border flex items-center justify-center transition-all',
+                          vadSensitivity === 2 ? 'border-white bg-white text-black' : 'border-white/20'
+                        )}>
+                          {vadSensitivity === 2 && <div className="w-1.5 h-1.5 rounded-full bg-black" />}
                         </div>
                       </div>
 
@@ -1522,8 +1454,8 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                     </div>
 
                     <div className="mt-4 pt-3 border-t border-white/[0.06]">
-                      <span className="text-[10px] text-emerald-400/90 font-medium block">
-                        Consigliata per la maggior parte delle lezioni
+                      <span className="text-[10px] text-white/40 block">
+                        Per la maggior parte delle lezioni
                       </span>
                     </div>
                   </button>
@@ -1572,157 +1504,6 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                     </div>
                   </button>
                 </div>
-
-                {/* Stato Rilevamento Audio */}
-                <div className="p-3.5 rounded-2xl bg-white/[0.02] border border-white/[0.06] flex items-center justify-between text-xs">
-                  <div className="flex items-center gap-2.5 text-white/70">
-                    <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                    <span>Rilevamento vocale attivo in tempo reale</span>
-                  </div>
-                  <span className="text-[11px] text-white/40">
-                    Elaborazione locale in memoria
-                  </span>
-                </div>
-
-                {/* ══════════════════════════════════════════════════════════════════
-                    SEZIONE: FORMATO REGISTRAZIONE AUDIO
-                ══════════════════════════════════════════════════════════════════ */}
-                <div className="pt-2 space-y-3">
-                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                    <div>
-                      <h3 className="text-sm font-semibold tracking-tight text-white flex items-center gap-2">
-                        <FileAudio size={16} className="text-white/80" />
-                        Formato Registrazione Audio
-                      </h3>
-                      <p className="text-xs text-white/50 mt-0.5 leading-relaxed">
-                        Configura il formato con cui salvare le lezioni. Il formato compresso M4A riduce lo spazio dell'85%.
-                      </p>
-                    </div>
-
-                    <button
-                      type="button"
-                      onClick={handleCompressArchive}
-                      disabled={isCompressingArchive}
-                      className={clsx(
-                        "px-3.5 py-1.5 rounded-xl border text-xs font-semibold transition-all flex items-center gap-1.5 cursor-pointer shadow-liquid-sm self-start sm:self-center whitespace-nowrap",
-                        isCompressingArchive
-                          ? "bg-emerald-500/20 text-emerald-200 border-emerald-500/30 cursor-wait"
-                          : "bg-white/[0.06] hover:bg-white/[0.12] border-white/12 text-white/80 hover:text-white"
-                      )}
-                      title="Comprime tutte le registrazioni passate ancora in formato non compresso"
-                    >
-                      {isCompressingArchive ? (
-                        <>
-                          <Loader2 size={13} className="animate-spin text-emerald-300" />
-                          <span>Compressione...</span>
-                        </>
-                      ) : (
-                        <>
-                          <Sparkles size={13} className="text-emerald-400" />
-                          <span>Comprimi archivio esistente</span>
-                        </>
-                      )}
-                    </button>
-                  </div>
-
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                    {/* Opzione 1: M4A Compresso (Consigliato) */}
-                    <button
-                      type="button"
-                      onClick={() => handleAudioFormatChange('m4a')}
-                      className={clsx(
-                        'p-4 rounded-2xl border text-left transition-all duration-200 flex flex-col justify-between cursor-pointer select-none relative',
-                        audioFormat === 'm4a'
-                          ? 'bg-white/[0.09] border-white/30 shadow-liquid-sm'
-                          : 'bg-white/[0.02] border-white/[0.07] hover:bg-white/[0.05] hover:border-white/[0.14]'
-                      )}
-                    >
-                      <div>
-                        <div className="flex items-center justify-between mb-3">
-                          <div className={clsx(
-                            'w-8 h-8 rounded-xl flex items-center justify-center transition-colors',
-                            audioFormat === 'm4a' ? 'bg-white text-black' : 'bg-white/[0.06] text-white/70'
-                          )}>
-                            <Sparkles size={15} strokeWidth={2} />
-                          </div>
-                          <div className="flex items-center gap-1.5">
-                            <span className="text-[9px] font-medium px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
-                              Consigliato
-                            </span>
-                            <div className={clsx(
-                              'w-4 h-4 rounded-full border flex items-center justify-center transition-all',
-                              audioFormat === 'm4a' ? 'border-white bg-white text-black' : 'border-white/20'
-                            )}>
-                              {audioFormat === 'm4a' && <div className="w-1.5 h-1.5 rounded-full bg-black" />}
-                            </div>
-                          </div>
-                        </div>
-
-                        <div className="space-y-1">
-                          <span className="text-xs font-semibold text-white tracking-tight block">
-                            M4A (Consigliato)
-                          </span>
-                          <p className="text-[11px] text-white/50 leading-relaxed">
-                            Occupa circa 18 MB per ora di lezione. Preserva la chiarezza vocale e protegge il disco dalla saturazione.
-                          </p>
-                        </div>
-                      </div>
-
-                      <div className="mt-4 pt-3 border-t border-white/[0.06] flex items-center justify-between text-[10px]">
-                        <span className="text-white/40">Compressione efficiente</span>
-                        <span className="text-emerald-400 font-mono font-medium">~18 MB / ora</span>
-                      </div>
-                    </button>
-
-                    {/* Opzione 2: WAV Non Compresso */}
-                    <button
-                      type="button"
-                      onClick={() => handleAudioFormatChange('wav')}
-                      className={clsx(
-                        'p-4 rounded-2xl border text-left transition-all duration-200 flex flex-col justify-between cursor-pointer select-none',
-                        audioFormat === 'wav'
-                          ? 'bg-white/[0.09] border-white/30 shadow-liquid-sm'
-                          : 'bg-white/[0.02] border-white/[0.07] hover:bg-white/[0.05] hover:border-white/[0.14]'
-                      )}
-                    >
-                      <div>
-                        <div className="flex items-center justify-between mb-3">
-                          <div className={clsx(
-                            'w-8 h-8 rounded-xl flex items-center justify-center transition-colors',
-                            audioFormat === 'wav' ? 'bg-white text-black' : 'bg-white/[0.06] text-white/70'
-                          )}>
-                            <Volume2 size={15} strokeWidth={2} />
-                          </div>
-                          <div className="flex items-center gap-1.5">
-                            <span className="text-[9px] font-medium px-2 py-0.5 rounded-full bg-white/[0.08] text-white/70 border border-white/[0.12]">
-                              Non compresso
-                            </span>
-                            <div className={clsx(
-                              'w-4 h-4 rounded-full border flex items-center justify-center transition-all',
-                              audioFormat === 'wav' ? 'border-white bg-white text-black' : 'border-white/20'
-                            )}>
-                              {audioFormat === 'wav' && <div className="w-1.5 h-1.5 rounded-full bg-black" />}
-                            </div>
-                          </div>
-                        </div>
-
-                        <div className="space-y-1">
-                          <span className="text-xs font-semibold text-white tracking-tight block">
-                            WAV (Originale)
-                          </span>
-                          <p className="text-[11px] text-white/50 leading-relaxed">
-                            Copia originale senza compressione. Massima fedeltà d'archivio, ma occupa più spazio sul disco.
-                          </p>
-                        </div>
-                      </div>
-
-                      <div className="mt-4 pt-3 border-t border-white/[0.06] flex items-center justify-between text-[10px]">
-                        <span className="text-white/40">Audio grezzo</span>
-                        <span className="text-white/50 font-mono">~115 MB / ora</span>
-                      </div>
-                    </button>
-                  </div>
-                </div>
               </div>
             )}
 
@@ -1750,7 +1531,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       </p>
                     </div>
                     <span className="text-[10px] font-mono font-medium px-2.5 py-1 rounded-full bg-white/[0.08] text-white/70 border border-white/10 flex-shrink-0">
-                      v{updater.currentVersion || '0.0.13'}
+                      v{updater.currentVersion || '0.0.14'}
                     </span>
                   </div>
 
@@ -1862,28 +1643,29 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                 {/* Sezione Reset Onboarding */}
                 <div className="p-4 rounded-3xl liquid-glass border border-white/[0.10] shadow-liquid-sm space-y-3">
                   <div>
-                    <h4 className="text-xs font-bold text-white">Configurazione Iniziale (Wizard)</h4>
+                    <h4 className="text-xs font-bold text-white">Riconfigurazione</h4>
                     <p className="text-[11px] text-white/50 mt-0.5 leading-relaxed">
-                      Ripercorri i passaggi del primo avvio per riconfigurare la cartella della libreria e i modelli.
+                      Ripercorri la procedura iniziale per riconfigurare la cartella delle lezioni e i modelli.
                     </p>
                   </div>
 
                   <button
                     type="button"
+                    data-reset-wizard-btn="true"
                     onClick={handleResetWizard}
                     className={clsx(
-                      "flex items-center gap-2 px-4 py-2 rounded-2xl text-xs font-semibold transition-all cursor-pointer",
+                      "flex items-center gap-2 px-4 h-9 rounded-2xl text-xs font-semibold border transition-all cursor-pointer whitespace-nowrap select-none",
                       confirmReset
-                        ? "bg-red-500 text-white shadow-liquid-sm"
-                        : "bg-white/[0.08] hover:bg-white/[0.16] text-white/80 border border-white/14"
+                        ? "bg-red-500 text-white border-red-500 shadow-liquid-sm"
+                        : "bg-white/[0.08] hover:bg-white/[0.16] text-white/80 border-white/14"
                     )}
                   >
-                    <RotateCcw size={13} className={confirmReset ? "animate-spin text-white" : ""} />
+                    <RotateCcw size={13} className={clsx("flex-shrink-0", confirmReset && "animate-spin text-white")} />
                     <span>{confirmReset ? 'Sei sicuro? Clicca per riavviare' : 'Riavvia configurazione guidata'}</span>
                   </button>
                 </div>
 
-                {/* ── Sezione Disinstallazione Completa SbobinAI (Zona Pericolosa) ── */}
+                {/* ── Sezione Disinstallazione SbobinAI ── */}
                 <div className="p-4 rounded-3xl bg-red-500/[0.04] border border-red-500/20 shadow-liquid-sm space-y-3">
                   <div>
                     <div className="flex items-center gap-2">
@@ -1891,16 +1673,16 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       <h4 className="text-xs font-bold text-red-300">Disinstalla SbobinAI</h4>
                     </div>
                     <p className="text-[11px] text-white/50 mt-1 leading-relaxed">
-                      Disinstalla completamente SbobinAI dal computer eliminando ogni componente scaricato (motore Python, modelli AI, cache e l'applicazione stessa).
-                      <span className="block text-emerald-400/90 font-medium mt-1">
-                        La cartella selezionata per salvare i file in locale ({normalizeDisplayPath(storagePath)}) rimarrà intatta.
-                      </span>
+                      Rimuove completamente SbobinAI dal computer eliminando il motore locale, i modelli IA scaricati e la cache di sistema.
                     </p>
                   </div>
 
                   <button
                     type="button"
-                    onClick={() => setShowUninstallModal(true)}
+                    onClick={() => {
+                      setDeleteStorageFolder(false);
+                      setShowUninstallModal(true);
+                    }}
                     className="flex items-center gap-2 px-4 py-2 rounded-2xl text-xs font-semibold bg-red-500/15 hover:bg-red-500/25 border border-red-500/30 text-red-200 hover:text-white transition-all shadow-liquid-sm cursor-pointer"
                   >
                     <Trash2 size={13} />
@@ -1953,7 +1735,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
               className="absolute inset-0 z-50 bg-[#0B0F19]/95 backdrop-blur-xl flex flex-col items-center justify-center p-6 text-center select-none"
             >
               {!isUninstalling ? (
-                <div className="max-w-lg w-full space-y-4 animate-scale-up text-left max-h-[85vh] overflow-y-auto pr-1">
+                <div className="max-w-md w-full space-y-5 animate-scale-up text-left">
                   <div className="flex items-center gap-3 border-b border-white/10 pb-3">
                     <div className="w-10 h-10 rounded-2xl bg-red-500/15 border border-red-500/30 flex items-center justify-center text-red-400 shadow-liquid-sm flex-shrink-0">
                       <Trash2 size={20} />
@@ -1962,19 +1744,15 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       <h3 className="text-base font-bold text-white tracking-tight">
                         Disinstallazione di SbobinAI
                       </h3>
-                      <p className="text-xs text-white/50 leading-relaxed">
-                        Scegli come gestire la cartella con le tue lezioni e registrazioni.
+                      <p className="text-xs text-white/50 mt-0.5">
+                        Scegli come gestire la cartella con le tue lezioni.
                       </p>
                     </div>
                   </div>
 
-                  {/* ── SELETTORE OPZIONI DISINSTALLAZIONE ── */}
-                  <div className="space-y-2.5 pt-1">
-                    <label className="text-[11px] font-semibold text-white/70 uppercase tracking-wider block">
-                      Opzione di disinstallazione:
-                    </label>
-
-                    {/* Opzione 1: Conserva la cartella delle lezioni */}
+                  {/* ── 2 OPZIONI CHIARE E MINIMALI ── */}
+                  <div className="space-y-2.5">
+                    {/* Opzione 1: Conserva i file personali */}
                     <div
                       role="button"
                       tabIndex={0}
@@ -1982,35 +1760,27 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       className={clsx(
                         "p-3.5 rounded-2xl border transition-all cursor-pointer flex items-start gap-3",
                         !deleteStorageFolder
-                          ? "bg-blue-500/15 border-blue-500/50 shadow-liquid-sm"
-                          : "bg-white/[0.03] border-white/10 hover:bg-white/[0.06]"
+                          ? "bg-white/[0.08] border-white/30 shadow-liquid-sm"
+                          : "bg-white/[0.02] border-white/[0.08] hover:bg-white/[0.05]"
                       )}
                     >
                       <div className={clsx(
                         "w-4 h-4 rounded-full border mt-0.5 flex items-center justify-center flex-shrink-0 transition-colors",
-                        !deleteStorageFolder ? "border-blue-400 bg-blue-500" : "border-white/30 bg-transparent"
+                        !deleteStorageFolder ? "border-white bg-white" : "border-white/30 bg-transparent"
                       )}>
-                        {!deleteStorageFolder && <div className="w-1.5 h-1.5 rounded-full bg-white" />}
+                        {!deleteStorageFolder && <div className="w-1.5 h-1.5 rounded-full bg-black" />}
                       </div>
-                      <div className="space-y-1 flex-1">
-                        <div className="flex items-center justify-between">
-                          <span className="text-xs font-semibold text-white">
-                            Mantieni la cartella delle lezioni
-                          </span>
-                          <span className="text-[10px] font-medium text-emerald-400 bg-emerald-500/15 px-2 py-0.5 rounded-full border border-emerald-500/30">
-                            Consigliato
-                          </span>
-                        </div>
-                        <p className="text-[11px] text-white/60 leading-relaxed">
-                          Conserva le registrazioni audio, gli appunti e i documenti in:
-                        </p>
-                        <span className="font-mono text-[11px] text-white/90 bg-black/40 px-2 py-0.5 rounded border border-white/10 block break-all mt-1">
-                          {normalizeDisplayPath(storagePath)}
+                      <div className="space-y-0.5 flex-1">
+                        <span className="text-xs font-semibold text-white block">
+                          Conserva lezioni e registrazioni
                         </span>
+                        <p className="text-[11px] text-white/50 leading-relaxed">
+                          Rimuove l'app e i modelli IA. I tuoi audio, le trascrizioni e gli appunti rimarranno al sicuro sul disco.
+                        </p>
                       </div>
                     </div>
 
-                    {/* Opzione 2: Pulizia totale con eliminazione cartella lezioni */}
+                    {/* Opzione 2: Pulizia totale */}
                     <div
                       role="button"
                       tabIndex={0}
@@ -2018,8 +1788,8 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       className={clsx(
                         "p-3.5 rounded-2xl border transition-all cursor-pointer flex items-start gap-3",
                         deleteStorageFolder
-                          ? "bg-red-500/15 border-red-500/50 shadow-liquid-sm"
-                          : "bg-white/[0.03] border-white/10 hover:bg-white/[0.06]"
+                          ? "bg-red-500/15 border-red-500/40 shadow-liquid-sm"
+                          : "bg-white/[0.02] border-white/[0.08] hover:bg-white/[0.05]"
                       )}
                     >
                       <div className={clsx(
@@ -2028,55 +1798,23 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       )}>
                         {deleteStorageFolder && <div className="w-1.5 h-1.5 rounded-full bg-white" />}
                       </div>
-                      <div className="space-y-1 flex-1">
-                        <div className="flex items-center justify-between">
-                          <span className="text-xs font-semibold text-red-300">
-                            Elimina anche la cartella delle lezioni (Pulizia totale)
-                          </span>
-                          <span className="text-[10px] font-medium text-red-400 bg-red-500/15 px-2 py-0.5 rounded-full border border-red-500/30">
-                            Zero tracce
-                          </span>
-                        </div>
-                        <p className="text-[11px] text-white/60 leading-relaxed">
-                          Elimina <strong className="text-red-300 font-semibold">ogni singola traccia</strong> dell'app dal computer, compresa la cartella con audio e lezioni. Reinstallare SbobinAI dopo sarà come farlo per la prima volta.
+                      <div className="space-y-0.5 flex-1">
+                        <span className="text-xs font-semibold text-red-300 block">
+                          Elimina anche la cartella delle lezioni
+                        </span>
+                        <p className="text-[11px] text-white/50 leading-relaxed">
+                          Rimuove l'app, i modelli IA e cancella definitivamente tutte le lezioni, gli audio e gli appunti.
                         </p>
                       </div>
                     </div>
                   </div>
 
-                  {/* ── Box Informativo Dinamico ── */}
-                  {!deleteStorageFolder ? (
-                    <div className="p-3 rounded-2xl bg-emerald-500/10 border border-emerald-500/25 text-left flex items-start gap-2.5">
-                      <CheckCircle2 size={16} className="text-emerald-400 flex-shrink-0 mt-0.5" />
-                      <div className="text-[11px] text-white/70 space-y-0.5">
-                        <span className="font-semibold text-emerald-300 block">
-                          I tuoi file personali non verranno toccati
-                        </span>
-                        <p className="text-white/60 leading-relaxed">
-                          Verranno rimossi: applicazione, modelli AI scaricati (Whisper/LLM), ambiente Python, log e cache di sistema. Le registrazioni in <span className="font-mono text-white/80">{normalizeDisplayPath(storagePath)}</span> rimarranno intatte.
-                        </p>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="p-3 rounded-2xl bg-red-500/15 border border-red-500/30 text-left flex items-start gap-2.5">
-                      <AlertTriangle size={16} className="text-red-400 flex-shrink-0 mt-0.5" />
-                      <div className="text-[11px] text-red-200/90 space-y-0.5">
-                        <span className="font-semibold text-red-300 block">
-                          Attenzione: Eliminazione totale irreversibile
-                        </span>
-                        <p className="leading-relaxed text-red-200/80">
-                          Verrà eliminata <span className="font-bold underline">anche</span> la cartella <span className="font-mono underline">{normalizeDisplayPath(storagePath)}</span> con tutte le registrazioni audio, gli appunti e il database. Nessuna traccia rimarrà sul sistema.
-                        </p>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* ── Pulsanti Azione ── */}
-                  <div className="flex items-center justify-end gap-3 pt-2">
+                  {/* ── Pulsanti Azione (Annulla fisso a sinistra, Disinstalla a destra) ── */}
+                  <div className="flex items-center justify-between pt-3 border-t border-white/10">
                     <button
                       type="button"
                       onClick={() => setShowUninstallModal(false)}
-                      className="px-4 py-2 rounded-2xl text-xs font-semibold bg-white/[0.08] hover:bg-white/[0.16] border border-white/14 text-white/80 transition-all cursor-pointer"
+                      className="px-4 py-2 rounded-2xl text-xs font-semibold bg-white/[0.08] hover:bg-white/[0.14] border border-white/12 text-white/80 transition-all cursor-pointer"
                     >
                       Annulla
                     </button>
@@ -2086,14 +1824,12 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       className={clsx(
                         "flex items-center gap-2 px-5 py-2 rounded-2xl text-xs font-semibold text-white shadow-liquid-sm transition-all cursor-pointer",
                         deleteStorageFolder
-                          ? "bg-red-600 hover:bg-red-700 border border-red-400/40"
-                          : "bg-red-500 hover:bg-red-600 border border-red-500/40"
+                          ? "bg-red-600 hover:bg-red-700 border border-red-400/50"
+                          : "bg-red-500 hover:bg-red-600 border border-red-400/30"
                       )}
                     >
-                      <Trash2 size={13} />
-                      <span>
-                        {deleteStorageFolder ? 'Elimina Definitivamente Ogni Traccia' : 'Disinstalla SbobinAI'}
-                      </span>
+                      {deleteStorageFolder ? <AlertTriangle size={13} /> : <Trash2 size={13} />}
+                      <span>Disinstalla</span>
                     </button>
                   </div>
                 </div>

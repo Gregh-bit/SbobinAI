@@ -494,7 +494,6 @@ async def _post_lecture_pipeline(
     lecture_id: int,
     audio_path: Optional[str],
     full_transcript: str,
-    user_fmt: str,
 ) -> None:
     """Pipeline asincrona post-lezione eseguita in sequenza ordinata per evitare race condition."""
     # 1. Calcola i timestamp sincronizzati mentre Whisper è ancora in memoria
@@ -505,8 +504,8 @@ async def _post_lecture_pipeline(
         except Exception as exc:
             logger.warning(f"[WS Pipeline] Errore calcolo timestamps lezione {lecture_id}: {exc}")
 
-    # 2. Comprime in M4A se richiesto, rinomina eventuale cache timestamps e aggiorna DB
-    if audio_path and user_fmt == "m4a" and audio_path.endswith(".wav") and os.path.exists(audio_path):
+    # 2. Converte la traccia temporanea in formato definitivo M4A salva-spazio ed aggiorna DB
+    if audio_path and audio_path.endswith(".wav") and os.path.exists(audio_path):
         try:
             from audio_engine import compress_wav_to_m4a
             m4a_path = await asyncio.to_thread(compress_wav_to_m4a, audio_path, 48000, True)
@@ -543,11 +542,10 @@ async def _post_lecture_pipeline(
 async def _finalize_session(session: LiveSession, subject_id: int) -> Tuple[float, Optional[str]]:
     """
     Chiude una sessione live in modo idempotente e reattivo:
-    1. ferma worker ed esporta subito il file WAV (istantaneo),
-    2. trascrive al più un eventuale ultimo blocco vocale rimasto in coda con timeout stretto,
-    3. rimuove la sessione dal registry e libera la memoria del transcriber,
-    4. salva trascrizione, durata, audio e domande su SQLite immediatamente,
-    5. delega compressione M4A, generazione capitolo e timestamp in una pipeline sequenziale in background.
+    1. Ferma subito l'audio engine ed esporta il file audio su disco (~5ms).
+    2. Salva IMMEDIATAMENTE trascrizione, durata e audio_path su SQLite per rendere subito disponibile il player.
+    3. Rimuove la sessione dal registry attivo e sblocca la risposta WebSocket.
+    4. Sposta in background non bloccante la trascrizione dell'ultimo chunk, il rilascio della memoria e la compressione M4A.
     """
     if session.finalized:
         return session.elapsed_seconds(), None
@@ -560,7 +558,7 @@ async def _finalize_session(session: LiveSession, subject_id: int) -> Tuple[floa
     if task and not task.done():
         task.cancel()
         try:
-            await asyncio.wait({task}, timeout=2.0)
+            await asyncio.wait({task}, timeout=1.0)
         except Exception:
             pass
 
@@ -570,34 +568,12 @@ async def _finalize_session(session: LiveSession, subject_id: int) -> Tuple[floa
             # stop(audio_format="wav") è istantaneo (scrittura PCM su file senza codec blocking)
             audio_path = await asyncio.wait_for(
                 asyncio.to_thread(session.audio_engine.stop, audio_format="wav"),
-                timeout=8.0,
+                timeout=6.0,
             )
     except Exception as exc:
         logger.error(f"[WS] Errore arresto AudioEngine: {exc}")
 
-    # Trascrive al più l'ultimo frammento residuo con timeout limitato
-    if not session.transcriber.mock_mode:
-        try:
-            chunk = session.audio_engine.speech_queue.get_nowait()
-            try:
-                tail = await asyncio.wait_for(session.transcriber.transcribe(chunk), timeout=3.0)
-                if tail:
-                    session.push_transcript(tail)
-            except Exception as exc:
-                logger.debug(f"[WS] Coda finale non completata in tempo: {exc}")
-        except queue.Empty:
-            pass
-
-    # Registry + rilascio memoria transcriber (evita doppia invocazione di stop su audio_engine)
-    try:
-        from live_session import _active_sessions
-        if _active_sessions.get(subject_id) is session:
-            _active_sessions.pop(subject_id, None)
-        if hasattr(session, "transcriber") and session.transcriber:
-            await asyncio.to_thread(session.transcriber.release_memory)
-    except Exception as exc:
-        logger.debug(f"[WS] Errore pulizia sessione e rilascio memoria: {exc}")
-
+    # ── Salvataggio IMMEDIATO nel Database (priorità assoluta per il player) ──
     full_transcript = session.get_full_transcript()
     db_sess = SessionLocal()
     try:
@@ -613,28 +589,68 @@ async def _finalize_session(session: LiveSession, subject_id: int) -> Tuple[floa
                 else None
             )
             db_sess.commit()
+            logger.info(f"[WS] Salvataggio immediato SQLite completato: lezione={session.lecture_id}, audio={audio_path}")
     except Exception as db_err:
-        logger.error(f"[WS] Errore salvataggio lezione su DB: {db_err}")
+        logger.error(f"[WS] Errore salvataggio immediato lezione su DB: {db_err}")
     finally:
         db_sess.close()
 
-    # Avvia la pipeline post-lezione in background (non blocca la risposta WebSocket dello stop)
+    # Rimuovi dal registry sessioni attive
     try:
-        from config import load_settings
-        user_fmt = load_settings().get("audio_format", "m4a")
+        from live_session import _active_sessions
+        if _active_sessions.get(subject_id) is session:
+            _active_sessions.pop(subject_id, None)
     except Exception:
-        user_fmt = "m4a"
+        pass
 
-    _spawn(_post_lecture_pipeline(
-        subject_id=subject_id,
-        lecture_id=session.lecture_id,
-        audio_path=audio_path,
-        full_transcript=full_transcript,
-        user_fmt=user_fmt,
-    ))
+    # ── Task in background: coda residua, rilascio memoria ed elaborazione post-lezione ──
+    async def _background_post_stop():
+        # Trascrive eventuali frammenti residui rimasti in coda (non scarta il parlato su CPU più lente)
+        if not session.transcriber.mock_mode:
+            drained_any = False
+            while not session.audio_engine.speech_queue.empty():
+                try:
+                    chunk = session.audio_engine.speech_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    tail = await asyncio.wait_for(session.transcriber.transcribe(chunk), timeout=15.0)
+                    if tail:
+                        session.push_transcript(tail)
+                        drained_any = True
+                except Exception as exc:
+                    logger.debug(f"[WS] Coda finale non completata: {exc}")
+                    break
+
+            if drained_any:
+                try:
+                    with SessionLocal() as s_db:
+                        lec = s_db.query(Lecture).filter(Lecture.id == session.lecture_id).first()
+                        if lec:
+                            lec.raw_transcript = session.get_full_transcript()
+                            s_db.commit()
+                except Exception as exc:
+                    logger.warning(f"[WS] Errore aggiornamento trascrizione finale DB: {exc}")
+
+        # Rilascio memoria transcriber (non blocca la risposta client)
+        if hasattr(session, "transcriber") and session.transcriber:
+            try:
+                await asyncio.to_thread(session.transcriber.release_memory)
+            except Exception as exc:
+                logger.debug(f"[WS] Errore pulizia sessione e rilascio memoria: {exc}")
+
+        # Pipeline post-lezione (calcolo timestamps, compressione M4A, capitoli/RAG)
+        await _post_lecture_pipeline(
+            subject_id=subject_id,
+            lecture_id=session.lecture_id,
+            audio_path=audio_path,
+            full_transcript=session.get_full_transcript(),
+        )
+
+    _spawn(_background_post_stop())
 
     logger.info(
-        f"[WS] Sessione chiusa: lezione={session.lecture_id}, durata={duration:.1f}s, "
+        f"[WS] Sessione chiusa con successo: lezione={session.lecture_id}, durata={duration:.1f}s, "
         f"chunk totali={len(session.full_transcript)}, wav={audio_path}"
     )
     return duration, audio_path

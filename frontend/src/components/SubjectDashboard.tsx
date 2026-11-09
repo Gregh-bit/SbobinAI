@@ -104,7 +104,7 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
     const isDone = (data: Lecture[] | null) => {
       const lec = data?.find((l) => l.id === lectureId);
       if (!lec) return false;
-      return Boolean(lec.processed_notes);
+      return Boolean(lec.processed_notes && lec.audio_path);
     };
     notesPollRef.current = setInterval(async () => {
       const data = await loadLectures(false);
@@ -121,7 +121,7 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
     loadLectures(false).then((data) => {
       if (!finished || !isMountedRef.current) return;
       const lec = data?.find((l) => l.id === finished.id);
-      if (!lec || !lec.processed_notes) pollUntilNotesReady(finished.id);
+      if (!lec || !lec.processed_notes || !lec.audio_path) pollUntilNotesReady(finished.id);
     });
   }, [loadLectures, pollUntilNotesReady]);
 

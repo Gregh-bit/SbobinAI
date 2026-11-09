@@ -340,6 +340,14 @@ def cleanup_orphan_files(db: Session = None) -> Dict[str, Any]:
         except Exception as hf_clean_err:
             logger.debug(f"[Cleaner] Bonifica file temporanei Hugging Face: {hf_clean_err}")
 
+        # 4.9. Migrazione trasparente di eventuali file audio legacy .wav in .m4a salva-spazio
+        try:
+            conv_res = compress_archive_audio()
+            if conv_res.get("converted_count", 0) > 0:
+                total_freed_bytes += int(conv_res.get("freed_mb", 0) * 1024 * 1024)
+        except Exception as conv_err:
+            logger.debug(f"[Cleaner] Migrazione automatica WAV->M4A: {conv_err}")
+
         # 5. Compattazione database e vector store
         vac_ok = vacuum_sqlite()
         opt_ok = optimize_lancedb()

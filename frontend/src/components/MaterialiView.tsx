@@ -42,6 +42,25 @@ export default function MaterialiView({
     };
   }, []);
 
+  // Gestione tasto Escape a livelli per modali interne (anteprima e conferma eliminazione)
+  useEffect(() => {
+    if (!itemToDelete && !previewMaterial) return;
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.stopPropagation();
+      if (itemToDelete) {
+        if (!isDeleting) setItemToDelete(null);
+        return;
+      }
+      if (previewMaterial) {
+        setPreviewMaterial(null);
+        return;
+      }
+    };
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, [itemToDelete, previewMaterial, isDeleting]);
+
   const loadMaterials = useCallback(async () => {
     const seq = ++loadSeqRef.current;
     const isStale = () => !isMountedRef.current || seq !== loadSeqRef.current;

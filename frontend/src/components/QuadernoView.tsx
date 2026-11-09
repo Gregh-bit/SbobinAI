@@ -188,6 +188,25 @@ export default function QuadernoView({
   // Modal Eliminazione
   const [showDeleteModal, setShowDeleteModal] = useState(false);
 
+  // ── Gestione Tasto ESC per Sottofinestre (Menu Esportazione e Modal Eliminazione) ──
+  useEffect(() => {
+    if (!showDeleteModal && !showExportMenu) return;
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.stopPropagation();
+      if (showDeleteModal) {
+        setShowDeleteModal(false);
+        return;
+      }
+      if (showExportMenu) {
+        setShowExportMenu(false);
+        return;
+      }
+    };
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+  }, [showDeleteModal, showExportMenu]);
+
   // Modal Finder Memoria (Materiali -> Quaderno)
   const [showFinderModal, setShowFinderModal] = useState(false);
 
