@@ -24,7 +24,7 @@ from typing import Any, Optional, Tuple
 import numpy as np
 
 import ai_models
-from platform_utils import USE_MLX, cpu_threads, cuda_device_count
+from platform_utils import USE_MLX, cpu_threads, cuda_device_count, disable_cuda, is_cuda_disabled
 from platform_utils import get_local_snapshot_dir as _get_local_snapshot_dir
 
 logger = logging.getLogger("sbobinai.transcriber")
@@ -91,7 +91,7 @@ class _FasterWhisperHolder:
 def _load_faster_whisper(model_path: str, force_cpu: bool = False) -> Any:
     """Carica (una sola volta) il WhisperModel. Va chiamato con _transcription_lock acquisito."""
     holder = _FasterWhisperHolder
-    want_cuda = (not force_cpu) and cuda_device_count() > 0
+    want_cuda = (not force_cpu) and (not is_cuda_disabled()) and cuda_device_count() > 0
     if holder.model is not None and holder.model_path == model_path and (holder.device == "cuda") == want_cuda:
         return holder.model
 
@@ -108,7 +108,8 @@ def _load_faster_whisper(model_path: str, force_cpu: bool = False) -> Any:
                 return holder.model
             except Exception as exc:
                 logger.warning(f"[Transcriber] CUDA {compute_type} non disponibile ({exc}).")
-        logger.warning("[Transcriber] Fallback su CPU int8 (verifica cuBLAS/cuDNN 12 nel PATH per la GPU).")
+        disable_cuda("caricamento modello CUDA non disponibile")
+        logger.warning("[Transcriber] Fallback permanente su CPU int8 (verifica cuBLAS/cuDNN 12 nel PATH per la GPU).")
 
     logger.info(f"[Transcriber] Caricamento faster-whisper su CPU (int8, {cpu_threads()} thread): {model_path}")
     holder.model = WhisperModel(model_path, device="cpu", compute_type="int8", cpu_threads=cpu_threads())
@@ -142,13 +143,40 @@ def _decode_audio_file(path: str, sample_rate: int = 16000) -> np.ndarray:
 
 def _is_cuda_runtime_error(exc: Exception) -> bool:
     msg = str(exc).lower()
-    return any(k in msg for k in ("cuda", "cublas", "cudnn", "cufft"))
+    return any(k in msg for k in ("cuda", "cublas", "cudnn", "cufft", "curand", "nvrtc", ".dll"))
+
+
+def _call_faster_whisper_with_cpu_fallback(model_path: str, audio: Any, **kwargs) -> Tuple[list[Any], float]:
+    """
+    Esegue model.transcribe e materializza i segmenti con fallback permanente a CPU
+    al primo eventuale errore runtime CUDA (previene deadlock C++ su chiamate CUDA successive).
+    Va chiamato con _transcription_lock acquisito.
+    """
+    for attempt in range(2):
+        model = _load_faster_whisper(model_path, force_cpu=attempt > 0)
+        try:
+            segments, info = model.transcribe(audio, **kwargs)
+            seg_list = list(segments)
+            return seg_list, float(getattr(info, "duration", 0.0) or 0.0)
+        except Exception as exc:
+            if attempt == 0 and _FasterWhisperHolder.device == "cuda" and _is_cuda_runtime_error(exc):
+                disable_cuda(str(exc))
+                logger.warning(f"[Transcriber] Errore runtime CUDA ({exc}): passaggio permanente a CPU int8.")
+                _FasterWhisperHolder.model = None
+                _FasterWhisperHolder.model_path = None
+                _FasterWhisperHolder.device = None
+                gc.collect()
+                continue
+            raise
+    return [], 0.0
 
 
 def _faster_whisper_run(model_path: str, audio: Any, *, live: bool, initial_prompt: Optional[str],
                         language: str = "it") -> Tuple[str, float]:
     """Esegue faster-whisper (blocking). Ritenta su CPU se il runtime CUDA fallisce in inferenza."""
-    kwargs = dict(
+    seg_list, dur = _call_faster_whisper_with_cpu_fallback(
+        model_path,
+        audio,
         language=language,
         initial_prompt=initial_prompt,
         beam_size=1,              # Greedy come su MLX: latenza minima
@@ -161,20 +189,19 @@ def _faster_whisper_run(model_path: str, audio: Any, *, live: bool, initial_prom
         without_timestamps=live,
         vad_filter=not live,      # Live: VAD già fatto da AudioEngine; file: Silero VAD salta i silenzi
     )
-    for attempt in range(2):
-        model = _load_faster_whisper(model_path, force_cpu=attempt > 0)
-        try:
-            segments, info = model.transcribe(audio, **kwargs)
-            text = " ".join(seg.text.strip() for seg in segments if seg.text)
-            return text.strip(), float(getattr(info, "duration", 0.0) or 0.0)
-        except Exception as exc:
-            if attempt == 0 and _FasterWhisperHolder.device == "cuda" and _is_cuda_runtime_error(exc):
-                logger.warning(f"[Transcriber] Errore runtime CUDA ({exc}): ricarico su CPU.")
-                _FasterWhisperHolder.model = None
-                _FasterWhisperHolder.device = None
-                continue
-            raise
-    return "", 0.0
+    text = " ".join(seg.text.strip() for seg in seg_list if getattr(seg, "text", None))
+    return text.strip(), dur
+
+
+def faster_whisper_word_segments(model_path: str, audio: Any, language: str = "it") -> list[Any]:
+    """Estrae i segmenti con word_timestamps=True in modo sicuro (con fallback permanente a CPU)."""
+    seg_list, _ = _call_faster_whisper_with_cpu_fallback(
+        model_path,
+        audio,
+        language=language,
+        word_timestamps=True,
+    )
+    return seg_list
 
 
 def warm_up_whisper() -> None:
@@ -458,12 +485,12 @@ def is_speech_spectral(audio_np: np.ndarray, sample_rate: int = 16000) -> bool:
 
     energy = float(np.dot(audio_np, audio_np))
     rms = float(np.sqrt(energy / total_samples))
-    if rms < 0.001:
+    if rms < 0.0004:
         return False
 
     # Zero Crossing Rate (ZCR)
     zero_crossings = np.sum(np.abs(np.diff(np.sign(audio_np)))) / (2.0 * total_samples)
-    if zero_crossings < 0.003 or zero_crossings > 0.65:
+    if zero_crossings < 0.002 or zero_crossings > 0.70:
         return False
 
     # Analisi spettrale rapida FFT sulla finestra a massima energia (evita falsi negativi su pause/respiro iniziale)
@@ -490,7 +517,7 @@ def is_speech_spectral(audio_np: np.ndarray, sample_rate: int = 16000) -> bool:
         return False
     speech_vals = fft_vals[speech_band]
     speech_energy = float(np.dot(speech_vals, speech_vals))
-    return (speech_energy / total_energy) >= 0.12
+    return (speech_energy / total_energy) >= 0.08
 
 
 def release_metal_cache() -> None:

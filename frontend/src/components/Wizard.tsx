@@ -3,7 +3,7 @@ import { useEffect, useState, useRef } from 'react';
 import { 
   Sparkles, Folder, ArrowRight, ArrowLeft, 
   CheckCircle2, HardDrive, ShieldCheck, Zap, Laptop,
-  Download, Loader2, X, AlertCircle, Bot, Check, Database, Mic, RefreshCw
+  Download, Loader2, X, AlertCircle, Bot, Check, RefreshCw
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import { useSettings } from '../lib/SettingsContext';
@@ -15,7 +15,7 @@ const STEPS = [
   { id: 1, label: 'Benvenuto' },
   { id: 2, label: 'Archiviazione' },
   { id: 3, label: 'Assistente AI' },
-  { id: 4, label: 'Motori di Sistema' },
+  { id: 4, label: 'Driver CUDA' },
 ];
 
 const LLM_OPTIONS = [
@@ -50,18 +50,21 @@ const LLM_OPTIONS = [
 
 const CORE_WHISPER_ID = 'large-v3-turbo-q4';
 const CORE_EMBEDDING_ID = 'mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ';
+const CUDA_RUNTIME_ID = 'cuda-runtime';
 
 const MODEL_SIZE_ESTIMATES: Record<string, number> = {
   [CORE_WHISPER_ID]: 580,
   [CORE_EMBEDDING_ID]: 300,
+  [CUDA_RUNTIME_ID]: 1195,
   'mlx-community/Qwen3.5-4B-MLX-4bit': 2400,
   'unsloth/gemma-4-E4B-it-UD-MLX-4bit': 2500,
   'later': 0,
 };
 
 function getModelDisplayName(id: string): string {
-  if (id === CORE_WHISPER_ID) return 'Whisper Large-v3-Turbo Q4';
+  if (id === CORE_WHISPER_ID) return 'Whisper Large-v3-Turbo';
   if (id === CORE_EMBEDDING_ID) return 'Qwen3-Embedding 0.6B RAG';
+  if (id === CUDA_RUNTIME_ID) return 'Accelerazione GPU NVIDIA (CUDA)';
   if (id === 'mlx-community/Qwen3.5-4B-MLX-4bit') return 'Qwen 3.5 4B (4-bit)';
   if (id === 'unsloth/gemma-4-E4B-it-UD-MLX-4bit') return 'Gemma 4 E4B (4-bit)';
   return id;
@@ -97,6 +100,7 @@ export default function Wizard() {
   // Form State
   const [storagePath, setStoragePath] = useState(settings.storagePath || '~/Documents/SbobinAI');
   const [llmModel, setLlmModel] = useState<string>('mlx-community/Qwen3.5-4B-MLX-4bit');
+  const [includeCuda, setIncludeCuda] = useState(true);
   const [isSelectingFolder, setIsSelectingFolder] = useState(false);
 
   useEffect(() => {
@@ -184,7 +188,12 @@ export default function Wizard() {
 
         // Se siamo nella schermata di download, verifica l'avanzamento sequenziale della coda
         if (isDl && curActive) {
-          const allModels = [...(res.whisper || []), ...(res.embedding || []), ...(res.llm || [])];
+          const allModels = [
+            ...(res.whisper || []),
+            ...(res.embedding || []),
+            ...(res.llm || []),
+            ...(res.runtime || []),
+          ];
           const curInfo = allModels.find((m) => m.id === curActive);
 
           if (curInfo?.status === 'completed') {
@@ -245,6 +254,11 @@ export default function Wizard() {
     }
   };
 
+  // Verifica OS Windows lato client (doppia guardia insieme al backend)
+  const isWindowsClient =
+    typeof navigator !== 'undefined' &&
+    (/Win/i.test(navigator.platform || '') || /Windows/i.test(navigator.userAgent || ''));
+
   // Verifica presenza su disco dei componenti
   const isWhisperDownloaded = Boolean(
     modelsStatus?.whisper?.find((m) => m.id === CORE_WHISPER_ID)?.downloaded
@@ -257,28 +271,55 @@ export default function Wizard() {
       ? true
       : Boolean(modelsStatus?.llm?.find((m) => m.id === llmModel)?.downloaded);
 
-  // Tutto pronto per iniziare
-  const isAllRequiredReady = isWhisperDownloaded && isEmbeddingDownloaded && isLlmDownloaded;
+  const cudaRuntimeInfo = modelsStatus?.runtime?.find((m) => m.id === CUDA_RUNTIME_ID);
+  const showCudaOption = Boolean(
+    isWindowsClient && modelsStatus?.nvidia_gpu_detected && cudaRuntimeInfo
+  );
+  const isCudaDownloaded = Boolean(cudaRuntimeInfo?.downloaded);
+  const showCudaStep = Boolean(showCudaOption && !isCudaDownloaded);
+  const wantsCudaDownload = showCudaStep && includeCuda;
+  const visibleSteps = showCudaStep ? STEPS : STEPS.slice(0, 3);
+  const lastStep: 3 | 4 = showCudaStep ? 4 : 3;
+  const effectiveStep = step > lastStep ? lastStep : step;
+
+  const getEstimatedMb = (id: string): number => {
+    const info = [
+      ...(modelsStatus?.whisper || []),
+      ...(modelsStatus?.embedding || []),
+      ...(modelsStatus?.llm || []),
+      ...(modelsStatus?.runtime || []),
+    ].find((m) => m.id === id);
+    if (info?.approx_bytes && info.approx_bytes > 0) {
+      return Math.round(info.approx_bytes / (1024 * 1024));
+    }
+    return MODEL_SIZE_ESTIMATES[id] || 500;
+  };
+
+  // Tutto pronto per iniziare (CUDA è opzionale ma incluso se selezionato e mancante)
+  const isAllRequiredReady =
+    isWhisperDownloaded && isEmbeddingDownloaded && isLlmDownloaded && !wantsCudaDownload;
 
   // Calcolo dinamico dei megabyte totali da scaricare
   let totalMbNeeded = 0;
-  if (!isWhisperDownloaded) totalMbNeeded += MODEL_SIZE_ESTIMATES[CORE_WHISPER_ID] || 580;
-  if (!isEmbeddingDownloaded) totalMbNeeded += MODEL_SIZE_ESTIMATES[CORE_EMBEDDING_ID] || 300;
+  if (!isWhisperDownloaded) totalMbNeeded += getEstimatedMb(CORE_WHISPER_ID);
+  if (!isEmbeddingDownloaded) totalMbNeeded += getEstimatedMb(CORE_EMBEDDING_ID);
   if (llmModel !== 'later' && !isLlmDownloaded) {
-    totalMbNeeded += MODEL_SIZE_ESTIMATES[llmModel] || 2400;
+    totalMbNeeded += getEstimatedMb(llmModel);
   }
+  if (wantsCudaDownload) totalMbNeeded += getEstimatedMb(CUDA_RUNTIME_ID);
 
   // Modello attualmente monitorato durante il download
   const allKnownModels = [
     ...(modelsStatus?.whisper || []),
     ...(modelsStatus?.embedding || []),
     ...(modelsStatus?.llm || []),
+    ...(modelsStatus?.runtime || []),
   ];
   const activeInfo = allKnownModels.find((m) => m.id === activeDownloadModel);
   const progressPct = Math.min(100, Math.max(0, activeInfo?.progress ?? 0));
   const totalMb = activeInfo?.total_mb && activeInfo.total_mb > 0
     ? Math.round(activeInfo.total_mb)
-    : (MODEL_SIZE_ESTIMATES[activeDownloadModel || ''] || 500);
+    : getEstimatedMb(activeDownloadModel || '');
   const rawDownloadedMb = activeInfo?.downloaded_mb ?? 0;
   const downloadedMb = progressPct >= 100 ? totalMb : Math.min(rawDownloadedMb, totalMb);
 
@@ -318,12 +359,21 @@ export default function Wizard() {
         llmModel === 'later'
           ? true
           : Boolean(currentStatus?.llm?.find((m) => m.id === llmModel)?.downloaded);
+      const cudaInfo = currentStatus?.runtime?.find((m) => m.id === CUDA_RUNTIME_ID);
+      const canDownloadCuda = Boolean(
+        isWindowsClient &&
+        currentStatus?.nvidia_gpu_detected &&
+        cudaInfo &&
+        includeCuda &&
+        !cudaInfo.downloaded
+      );
 
       // Costruisci la lista dei modelli da scaricare
       const queue: string[] = [];
       if (!whisperDone) queue.push(CORE_WHISPER_ID);
       if (!embeddingDone) queue.push(CORE_EMBEDDING_ID);
       if (llmModel !== 'later' && !llmDone) queue.push(llmModel);
+      if (canDownloadCuda) queue.push(CUDA_RUNTIME_ID);
 
       if (queue.length === 0) {
         setIsFadingOut(true);
@@ -480,9 +530,9 @@ export default function Wizard() {
           </div>
         ) : (
           <div className="flex items-center p-1 rounded-full liquid-glass-subtle border border-white/[0.09] shadow-liquid-sm gap-1" data-tauri-drag-region="false">
-            {STEPS.map((s) => {
-              const isActive = step === s.id;
-              const isCompleted = step > s.id;
+            {visibleSteps.map((s) => {
+              const isActive = effectiveStep === s.id;
+              const isCompleted = effectiveStep > s.id;
               return (
                 <button
                   key={s.id}
@@ -521,7 +571,7 @@ export default function Wizard() {
       <main className="flex-1 flex flex-col items-center justify-center p-8 max-w-4xl mx-auto w-full overflow-y-auto z-30">
         
         {/* ── STEP 1: BENVENUTO ── */}
-        {step === 1 && (
+        {effectiveStep === 1 && !isDownloadingScreen && (
           <div className="animate-fade-in space-y-8 text-center w-full max-w-2xl my-auto">
             <img
               src="/logo-icon.png"
@@ -560,7 +610,7 @@ export default function Wizard() {
         )}
 
         {/* ── STEP 2: ARCHIVIAZIONE ── */}
-        {step === 2 && (
+        {effectiveStep === 2 && !isDownloadingScreen && (
           <div className="animate-fade-in space-y-6 w-full max-w-2xl my-auto">
             <div className="space-y-2">
               <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full liquid-glass-subtle border border-white/10 text-xs text-white/80">
@@ -604,8 +654,23 @@ export default function Wizard() {
         )}
 
         {/* ── STEP 3: MODELLO LLM PER QUADERNO & CHAT (OPZIONALE) ── */}
-        {step === 3 && (
+        {effectiveStep === 3 && !isDownloadingScreen && (
           <div className="animate-fade-in space-y-6 w-full max-w-3xl my-auto">
+            {downloadError && !showCudaStep && (
+              <div className="p-3.5 rounded-2xl bg-red-500/15 border border-red-500/30 text-red-200 text-xs flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <AlertCircle size={15} className="text-red-400 flex-shrink-0" />
+                  <span>{downloadError}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setDownloadError(null)}
+                  className="p-1 hover:bg-white/10 rounded-lg text-white/60 hover:text-white cursor-pointer"
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            )}
             <div className="space-y-2">
               <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full liquid-glass-subtle border border-white/10 text-xs text-white/80">
                 <Bot size={13} className="text-blue-400" />
@@ -669,206 +734,73 @@ export default function Wizard() {
           </div>
         )}
 
-        {/* ── STEP 4: COMPONENTI DI SISTEMA (AUDIO, RAG E MODELLO IA) ── */}
-        {step === 4 && !isDownloadingScreen && (
-          <div className="animate-fade-in space-y-6 w-full max-w-3xl my-auto">
-            <div className="space-y-2">
-              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full liquid-glass-subtle border border-emerald-500/25 text-xs text-emerald-300 font-medium">
-                <CheckCircle2 size={13} className="text-emerald-400" />
-                <span>Riepilogo e Installazione Componenti</span>
-              </div>
-              <h2 className="text-2xl font-bold tracking-tight text-white">
-                Componenti per Audio, Ricerca e Assistente IA
-              </h2>
-              <p className="text-xs text-white/60 leading-relaxed">
-                Ecco i motori che verranno installati sul tuo computer. 
-                Tutti i pesi operano al 100% in locale sulla memoria del tuo dispositivo.
-              </p>
-            </div>
-
-            {/* Stato motore locale */}
-            {backendStatus?.status === 'error' ? (
-              <div className="p-4 rounded-2xl bg-red-500/15 border border-red-500/30 text-red-200 text-xs flex items-center justify-between gap-3 animate-fade-in">
-                <div className="flex items-center gap-2.5">
-                  <AlertCircle size={16} className="text-red-400 flex-shrink-0" />
-                  <span>{backendStatus.error || backendStatus.message || 'Errore nella preparazione del motore locale.'}</span>
-                </div>
-                <button
-                  type="button"
-                  onClick={relaunchApp}
-                  className="px-3 py-1.5 rounded-lg bg-red-500/25 hover:bg-red-500/40 text-red-100 text-xs font-medium cursor-pointer"
-                >
-                  Riavvia
-                </button>
-              </div>
-            ) : !isBackendReady ? (
-              <div className="p-3.5 rounded-2xl liquid-glass border border-blue-400/25 flex items-center justify-between text-xs text-blue-200">
-                <div className="flex items-center gap-2.5 min-w-0">
-                  <div className="w-3.5 h-3.5 rounded-full border-2 border-blue-400/30 border-t-blue-400 animate-spin flex-shrink-0" />
-                  <span className="truncate">
-                    <strong>Motore di sistema:</strong> {backendStatus?.message || "Configurazione dell'ambiente locale in corso..."}
-                  </span>
-                </div>
-                <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-blue-400/15 text-blue-200 border border-blue-400/25 flex-shrink-0">
-                  In background
-                </span>
-              </div>
-            ) : null}
-
-            {/* Eventuale messaggio di errore globale */}
+        {/* ── STEP 4: DRIVER CUDA (SOLO WINDOWS + GPU NVIDIA) ── */}
+        {effectiveStep === 4 && showCudaStep && !isDownloadingScreen && (
+          <div className="animate-fade-in w-full max-w-lg mx-auto text-center space-y-6 my-auto">
             {downloadError && (
-              <div className="p-4 rounded-2xl bg-red-500/15 border border-red-500/30 text-red-200 text-xs flex items-center justify-between gap-3 animate-fade-in">
-                <div className="flex items-center gap-2.5">
-                  <AlertCircle size={16} className="text-red-400 flex-shrink-0" />
+              <div className="p-3.5 rounded-2xl bg-red-500/15 border border-red-500/30 text-red-200 text-xs flex items-center justify-between gap-3 text-left">
+                <div className="flex items-center gap-2">
+                  <AlertCircle size={15} className="text-red-400 flex-shrink-0" />
                   <span>{downloadError}</span>
                 </div>
                 <button
                   type="button"
                   onClick={() => setDownloadError(null)}
-                  className="p-1 hover:bg-white/10 rounded-lg text-white/60 hover:text-white"
+                  className="p-1 hover:bg-white/10 rounded-lg text-white/60 hover:text-white cursor-pointer"
                 >
                   <X size={14} />
                 </button>
               </div>
             )}
 
-            {/* Le Card dei Componenti */}
-            <div className={clsx(
-              "grid gap-3.5",
-              llmModel !== 'later' ? "grid-cols-1 sm:grid-cols-3" : "grid-cols-1 sm:grid-cols-2"
-            )}>
-              {/* Card 1: Whisper Large-v3-Turbo Q4 */}
-              <div className={clsx(
-                'p-4 rounded-3xl border transition-all flex flex-col justify-between text-left space-y-2.5',
-                isWhisperDownloaded
-                  ? 'bg-emerald-500/10 border-emerald-500/30 shadow-liquid-sm'
-                  : 'liquid-glass border-white/[0.12]'
-              )}>
-                <div>
-                  <div className="flex items-center justify-between mb-2">
-                    <span className={clsx(
-                      'text-[10px] px-2.5 py-0.5 rounded-full font-semibold border',
-                      isWhisperDownloaded
-                        ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
-                        : 'bg-amber-500/20 text-amber-300 border-amber-500/30'
-                    )}>
-                      {isWhisperDownloaded ? 'Installato ✓' : 'Da Installare'}
-                    </span>
-                    <div className="w-7 h-7 rounded-xl bg-white/[0.08] flex items-center justify-center text-white/80">
-                      <Mic size={14} />
-                    </div>
-                  </div>
-
-                  <h3 className="text-xs font-bold text-white mb-0.5">Motore Whisper</h3>
-                  <p className="text-[10px] font-mono text-white/40">Whisper Large Turbo</p>
-                  <p className="text-[11px] text-white/60 mt-1.5 leading-relaxed">
-                    Trascrizione vocale continua accelerata in locale.
-                  </p>
-                </div>
-
-                <div className="pt-2 border-t border-white/[0.08] flex items-center justify-between text-[10px] font-mono text-white/50">
-                  <span>Stato: {isWhisperDownloaded ? 'Pronto' : 'Richiesto'}</span>
-                  <span>~580 MB</span>
-                </div>
-              </div>
-
-              {/* Card 2: Qwen3-Embedding-0.6B-4bit-DWQ */}
-              <div className={clsx(
-                'p-4 rounded-3xl border transition-all flex flex-col justify-between text-left space-y-2.5',
-                isEmbeddingDownloaded
-                  ? 'bg-emerald-500/10 border-emerald-500/30 shadow-liquid-sm'
-                  : 'liquid-glass border-white/[0.12]'
-              )}>
-                <div>
-                  <div className="flex items-center justify-between mb-2">
-                    <span className={clsx(
-                      'text-[10px] px-2.5 py-0.5 rounded-full font-semibold border',
-                      isEmbeddingDownloaded
-                        ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
-                        : 'bg-amber-500/20 text-amber-300 border-amber-500/30'
-                    )}>
-                      {isEmbeddingDownloaded ? 'Installato ✓' : 'Da Installare'}
-                    </span>
-                    <div className="w-7 h-7 rounded-xl bg-white/[0.08] flex items-center justify-center text-white/80">
-                      <Database size={14} />
-                    </div>
-                  </div>
-
-                  <h3 className="text-xs font-bold text-white mb-0.5">Memoria RAG</h3>
-                  <p className="text-[10px] font-mono text-white/40">Qwen3-Embedding DWQ</p>
-                  <p className="text-[11px] text-white/60 mt-1.5 leading-relaxed">
-                    Vettori per ricerca semantica e memoria lezioni.
-                  </p>
-                </div>
-
-                <div className="pt-2 border-t border-white/[0.08] flex items-center justify-between text-[10px] font-mono text-white/50">
-                  <span>Stato: {isEmbeddingDownloaded ? 'Pronto' : 'Richiesto'}</span>
-                  <span>~300 MB</span>
-                </div>
-              </div>
-
-              {/* Card 3: Modello LLM selezionato */}
-              {llmModel !== 'later' && (
-                <div className={clsx(
-                  'p-4 rounded-3xl border transition-all flex flex-col justify-between text-left space-y-2.5',
-                  isLlmDownloaded
-                    ? 'bg-emerald-500/10 border-emerald-500/30 shadow-liquid-sm'
-                    : 'liquid-glass border-white/[0.12]'
-                )}>
-                  <div>
-                    <div className="flex items-center justify-between mb-2">
-                      <span className={clsx(
-                        'text-[10px] px-2.5 py-0.5 rounded-full font-semibold border',
-                        isLlmDownloaded
-                          ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/30'
-                          : 'bg-blue-500/20 text-blue-300 border-blue-500/30'
-                      )}>
-                        {isLlmDownloaded ? 'Installato ✓' : 'Selezionato allo Step 3'}
-                      </span>
-                      <div className="w-7 h-7 rounded-xl bg-white/[0.08] flex items-center justify-center text-white/80">
-                        <Bot size={14} />
-                      </div>
-                    </div>
-
-                    <h3 className="text-xs font-bold text-white mb-0.5">Assistente IA</h3>
-                    <p className="text-[10px] font-mono text-white/40 truncate">
-                      {getModelDisplayName(llmModel)}
-                    </p>
-                    <p className="text-[11px] text-white/60 mt-1.5 leading-relaxed">
-                      Generazione capitoli Quaderno e risposte in chat.
-                    </p>
-                  </div>
-
-                  <div className="pt-2 border-t border-white/[0.08] flex items-center justify-between text-[10px] font-mono text-white/50">
-                    <span>Stato: {isLlmDownloaded ? 'Pronto' : 'Da scaricare'}</span>
-                    <span>{formatMbOrGb(MODEL_SIZE_ESTIMATES[llmModel] || 2400)}</span>
-                  </div>
-                </div>
-              )}
+            <div className="w-12 h-12 rounded-2xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center mx-auto shadow-liquid-sm">
+              <Zap size={22} className="text-emerald-400" />
             </div>
 
-            {/* Box informativo di stato */}
-            <div className={clsx(
-              'p-4 rounded-2xl border flex items-center gap-3 text-xs leading-relaxed',
-              isAllRequiredReady
-                ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-200'
-                : 'bg-blue-500/10 border-blue-500/25 text-blue-200'
-            )}>
-              {isAllRequiredReady ? (
-                <>
-                  <CheckCircle2 size={18} className="text-emerald-400 flex-shrink-0" />
-                  <span>
-                    <strong>Tutti i componenti sono pronti!</strong> Il tuo computer ha tutti i modelli necessari. Clicca su "Inizia a Studiare" per accedere all'applicazione.
-                  </span>
-                </>
-              ) : (
-                <>
-                  <Sparkles size={18} className="text-blue-400 flex-shrink-0" />
-                  <span>
-                    <strong>Download pronto:</strong> clicca su <strong>"Scarica ({formatMbOrGb(totalMbNeeded)})"</strong> per installare sul disco i modelli selezionati.
-                  </span>
-                </>
-              )}
+            <div className="space-y-2.5">
+              <h2 className="text-2xl font-bold tracking-tight text-white">
+                Vuoi scaricare i driver CUDA per la tua scheda video NVIDIA?
+              </h2>
+              <p className="text-sm text-white/65 leading-relaxed">
+                La trascrizione sarà fino a <span className="text-emerald-300 font-semibold">8 volte più veloce</span> rispetto al solo processore ({formatMbOrGb(getEstimatedMb(CUDA_RUNTIME_ID))}).
+              </p>
+            </div>
+
+            <div
+              role="radiogroup"
+              aria-label="Scaricare driver CUDA NVIDIA"
+              className="inline-flex items-center p-1.5 rounded-2xl liquid-glass border border-white/[0.12] shadow-liquid-sm gap-1.5"
+            >
+              <button
+                type="button"
+                role="radio"
+                aria-checked={includeCuda}
+                onClick={() => setIncludeCuda(true)}
+                className={clsx(
+                  'px-8 py-2.5 rounded-xl text-sm font-semibold border transition-all cursor-pointer flex items-center gap-2',
+                  includeCuda
+                    ? 'bg-emerald-500 text-white border-emerald-400/40 shadow-[0_0_18px_rgba(16,185,129,0.35)]'
+                    : 'text-white/55 border-transparent hover:text-white hover:bg-white/[0.06]'
+                )}
+              >
+                {includeCuda && <Check size={14} strokeWidth={3} />}
+                <span>Sì</span>
+              </button>
+              <button
+                type="button"
+                role="radio"
+                aria-checked={!includeCuda}
+                onClick={() => setIncludeCuda(false)}
+                className={clsx(
+                  'px-8 py-2.5 rounded-xl text-sm font-semibold border transition-all cursor-pointer flex items-center gap-2',
+                  !includeCuda
+                    ? 'bg-white/[0.18] text-white border-white/25 shadow-liquid-sm'
+                    : 'text-white/55 border-transparent hover:text-white hover:bg-white/[0.06]'
+                )}
+              >
+                {!includeCuda && <Check size={14} strokeWidth={3} />}
+                <span>No</span>
+              </button>
             </div>
           </div>
         )}
@@ -986,7 +918,7 @@ export default function Wizard() {
                     Installazione Componenti ({queueIndex + 1} di {downloadQueue.length || 1})
                   </span>
                   <h2 className="text-xl font-bold tracking-tight text-white">
-                    Download {getModelDisplayName(activeDownloadModel || '')} ({formatMbOrGb(MODEL_SIZE_ESTIMATES[activeDownloadModel || ''] || 500)})
+                    Download {getModelDisplayName(activeDownloadModel || '')} ({formatMbOrGb(getEstimatedMb(activeDownloadModel || ''))})
                   </h2>
                 </div>
 
@@ -1148,10 +1080,10 @@ export default function Wizard() {
         ) : (
           <>
             <div>
-              {step > 1 && (
+              {effectiveStep > 1 && (
                 <button
                   type="button"
-                  onClick={() => setStep((s) => (s - 1) as 1 | 2 | 3 | 4)}
+                  onClick={() => setStep((s) => Math.max(1, Math.min(lastStep, s) - 1) as 1 | 2 | 3 | 4)}
                   className="flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-medium text-white/60 hover:text-white hover:bg-white/[0.06] transition-colors cursor-pointer"
                 >
                   <ArrowLeft size={14} />
@@ -1161,17 +1093,17 @@ export default function Wizard() {
             </div>
 
             <div className="flex items-center gap-3">
-              {step < 4 ? (
+              {effectiveStep < lastStep ? (
                 <button
                   type="button"
-                  onClick={() => setStep((s) => (s + 1) as 1 | 2 | 3 | 4)}
+                  onClick={() => setStep((s) => Math.min(lastStep, s + 1) as 1 | 2 | 3 | 4)}
                   className="flex items-center gap-2 px-6 py-2.5 rounded-2xl text-xs font-semibold text-white bg-white/[0.16] hover:bg-white/[0.24] border border-white/[0.22] shadow-liquid-sm transition-all cursor-pointer"
                 >
                   <span>Continua</span>
                   <ArrowRight size={14} />
                 </button>
               ) : isAllRequiredReady ? (
-                /* ── STEP 4: TUTTO INSTALLATO -> INIZIA A STUDIARE ── */
+                /* ── ULTIMO STEP: TUTTO INSTALLATO -> INIZIA A STUDIARE ── */
                 <button
                   type="button"
                   onClick={async () => {
@@ -1186,7 +1118,7 @@ export default function Wizard() {
                   <span>Inizia a Studiare</span>
                 </button>
               ) : (
-                /* ── STEP 4: COMPONENTI DA SCARICARE -> PULSANTE DOWNLOAD DINAMICO ── */
+                /* ── ULTIMO STEP: COMPONENTI DA SCARICARE -> PULSANTE DOWNLOAD DINAMICO ── */
                 <button
                   type="button"
                   onClick={handleStartDownloads}

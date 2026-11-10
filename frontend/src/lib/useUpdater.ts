@@ -18,7 +18,7 @@ interface State {
   currentVersion: string;
 }
 
-let state: State = { status: 'idle', version: null, progress: 0, error: null, currentVersion: '0.0.14' };
+let state: State = { status: 'idle', version: null, progress: 0, error: null, currentVersion: '0.0.15' };
 let handle: UpdateHandle | null = null;
 let startupDone = false;
 let versionFetched = false;
@@ -64,10 +64,24 @@ async function runCheck(silent: boolean): Promise<void> {
     }
   } catch (e: any) {
     console.warn('[Updater] Controllo aggiornamenti fallito:', e);
+    const rawMsg = String(e?.message || e || 'Errore sconosciuto');
+    let friendlyMsg = rawMsg;
+    if (rawMsg.includes('None of the fallback platforms') || rawMsg.includes('fallback platforms')) {
+      friendlyMsg = 'Il pacchetto per questa piattaforma è in fase di finalizzazione sui server. Riprova tra un paio di minuti.';
+    }
     setState({
       status: silent ? 'idle' : 'error',
-      error: silent ? null : String(e?.message || e || 'Errore sconosciuto'),
+      error: silent ? null : friendlyMsg,
     });
+  }
+}
+
+async function stopBackendBeforeUpdate(): Promise<void> {
+  try {
+    const { invoke } = await import('@tauri-apps/api/core');
+    await invoke('stop_backend_for_update');
+  } catch (e) {
+    console.warn('[Updater] stop_backend_for_update warning:', e);
   }
 }
 
@@ -77,6 +91,7 @@ async function runInstall(): Promise<void> {
   let total = 0;
   let downloaded = 0;
   try {
+    await stopBackendBeforeUpdate();
     await handle.downloadAndInstall((event: any) => {
       if (event.event === 'Started') {
         total = event.data?.contentLength ?? 0;
@@ -125,6 +140,7 @@ export async function checkAndAutoInstall(
     const version = update.version;
     onProgress?.({ status: 'available', version, progress: 0 });
     setState({ status: 'downloading', version, progress: 0 });
+    await stopBackendBeforeUpdate();
 
     let total = 0;
     let downloaded = 0;

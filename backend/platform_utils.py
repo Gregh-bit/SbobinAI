@@ -41,37 +41,225 @@ USE_MLX = AI_BACKEND == "mlx"
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
 
+_dll_dir_handles: list = []
+_registered_dll_dirs: set[str] = set()
+
+
+def get_cuda_runtime_dir() -> str:
+    """Cartella locale dedicata alle librerie CUDA opzionali su Windows."""
+    if IS_WINDOWS:
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
+        return os.path.join(base, "SbobinAI", "cuda_runtime")
+    return os.path.expanduser("~/.sbobinai/cuda_runtime")
+
+
+def get_cuda_runtime_bin_dir() -> str:
+    return os.path.join(get_cuda_runtime_dir(), "bin")
+
+
+def _cuda_pending_delete_marker() -> str:
+    return os.path.join(get_cuda_runtime_dir(), ".pending_delete")
+
+
+def cleanup_pending_cuda_runtime() -> None:
+    """Elimina eventuali file CUDA marcati per la rimozione alla chiusura precedente (lock DLL Windows)."""
+    if not IS_WINDOWS:
+        return
+    marker = _cuda_pending_delete_marker()
+    cuda_dir = get_cuda_runtime_dir()
+    if os.path.isfile(marker):
+        try:
+            shutil.rmtree(cuda_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def _register_nvidia_dll_dirs() -> None:
     """
-    Windows: rende visibili a CTranslate2 le DLL CUDA installate via pip
-    (nvidia-cublas-cu12, nvidia-cudnn-cu12 → site-packages/nvidia/*/bin).
+    Windows: rende visibili a CTranslate2 le DLL CUDA scaricate in cuda_runtime/bin,
+    eventuali wheel nvidia in site-packages e il CUDA Toolkit di sistema.
     """
     if not IS_WINDOWS:
         return
+    cleanup_pending_cuda_runtime()
+
+    candidate_dirs: list[str] = []
+    # 1. Runtime CUDA gestito da SbobinAI (%LOCALAPPDATA%\SbobinAI\cuda_runtime\bin)
+    if not os.path.isfile(_cuda_pending_delete_marker()):
+        managed_bin = get_cuda_runtime_bin_dir()
+        if os.path.isdir(managed_bin):
+            candidate_dirs.append(managed_bin)
+
+    # 2. Eventuali pacchetti nvidia in site-packages
     try:
         import site
         roots = list(site.getsitepackages()) + [site.getusersitepackages()]
     except Exception:
         roots = [p for p in sys.path if p.endswith("site-packages")]
-    added = []
+
     for root in roots:
         nvidia_dir = os.path.join(root, "nvidia")
         if not os.path.isdir(nvidia_dir):
             continue
         for pkg in os.listdir(nvidia_dir):
             bin_dir = os.path.join(nvidia_dir, pkg, "bin")
-            if os.path.isdir(bin_dir) and bin_dir not in added:
-                added.append(bin_dir)
-                try:
-                    os.add_dll_directory(bin_dir)
-                except Exception:
-                    pass
+            if os.path.isdir(bin_dir):
+                candidate_dirs.append(bin_dir)
+
+    # 3. CUDA Toolkit di sistema (CUDA_PATH / CUDA_PATH_V12_*)
+    for env_key, env_val in os.environ.items():
+        if env_val and (env_key == "CUDA_PATH" or env_key.startswith("CUDA_PATH_V12")):
+            bin_dir = os.path.join(env_val, "bin")
+            if os.path.isdir(bin_dir):
+                candidate_dirs.append(bin_dir)
+
+    added: list[str] = []
+    for bin_dir in candidate_dirs:
+        norm = os.path.normcase(os.path.abspath(bin_dir))
+        if norm not in _registered_dll_dirs:
+            _registered_dll_dirs.add(norm)
+            added.append(bin_dir)
+            try:
+                _dll_dir_handles.append(os.add_dll_directory(bin_dir))
+            except Exception:
+                pass
     if added:
         os.environ["PATH"] = os.pathsep.join(added + [os.environ.get("PATH", "")])
 
 
 if not USE_MLX:
     _register_nvidia_dll_dirs()
+
+
+def _can_load_dll(name: str) -> bool:
+    """Su Windows verifica se una DLL è caricabile e rilascia subito l'handle di probe."""
+    if not IS_WINDOWS:
+        return True
+    try:
+        import ctypes
+        lib = ctypes.WinDLL(name)
+        handle = getattr(lib, "_handle", None)
+        del lib
+        if handle:
+            try:
+                ctypes.windll.kernel32.FreeLibrary(ctypes.c_void_p(handle))
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
+def _cuda_runtime_dlls_available() -> bool:
+    """
+    Su Windows verifica che le DLL CUDA 12 essenziali (cublas64_12.dll, cublasLt64_12.dll)
+    siano effettivamente caricabili prima di inizializzare CTranslate2 su GPU.
+    """
+    if not IS_WINDOWS:
+        return True
+    if _can_load_dll("cublas64_12.dll") and _can_load_dll("cublasLt64_12.dll"):
+        return True
+    logger.info(
+        "[Platform] GPU NVIDIA rilevata ma runtime CUDA 12 non ancora installato: "
+        "utilizzo automatico CPU int8."
+    )
+    return False
+
+
+_has_nvidia_cache: Optional[bool] = None
+
+
+def has_nvidia_gpu() -> bool:
+    """
+    True SOLO su Windows e SOLO se il sistema rileva una GPU NVIDIA.
+    Su macOS e Linux restituisce sempre False.
+    """
+    global _has_nvidia_cache
+    if not IS_WINDOWS or USE_MLX:
+        return False
+    if _has_nvidia_cache is not None:
+        return _has_nvidia_cache
+    detected = False
+    try:
+        import ctranslate2
+        if int(ctranslate2.get_cuda_device_count()) > 0:
+            detected = True
+    except Exception:
+        pass
+    if not detected:
+        try:
+            if shutil.which("nvidia-smi"):
+                detected = True
+        except Exception:
+            pass
+    _has_nvidia_cache = detected
+    return detected
+
+
+def cuda_runtime_status() -> tuple[bool, bool, float]:
+    """
+    Restituisce (scaricato_o_pronto, fornito_dal_sistema, dimensione_mb).
+    Sempre (False, False, 0.0) al di fuori di Windows o senza GPU NVIDIA.
+    """
+    if not IS_WINDOWS or not has_nvidia_gpu():
+        return False, False, 0.0
+    if os.path.isfile(_cuda_pending_delete_marker()):
+        return False, False, 0.0
+
+    managed_dir = get_cuda_runtime_dir()
+    managed_bin = get_cuda_runtime_bin_dir()
+    has_managed_cublas = (
+        os.path.isfile(os.path.join(managed_bin, "cublas64_12.dll"))
+        and os.path.isfile(os.path.join(managed_bin, "cublasLt64_12.dll"))
+    )
+    has_managed_cudnn = any(
+        os.path.isfile(os.path.join(managed_bin, dll))
+        for dll in ("cudnn_ops64_9.dll", "cudnn64_9.dll", "cudnn64_8.dll")
+    )
+    if has_managed_cublas and has_managed_cudnn:
+        return True, False, dir_size_mb(managed_dir)
+
+    # Verifica se già disponibile a livello di sistema (CUDA Toolkit globale o site-packages)
+    has_sys_cublas = _can_load_dll("cublas64_12.dll") and _can_load_dll("cublasLt64_12.dll")
+    has_sys_cudnn = any(
+        _can_load_dll(dll)
+        for dll in ("cudnn_ops64_9.dll", "cudnn64_9.dll", "cudnn_ops_infer64_8.dll", "cudnn64_8.dll")
+    )
+    if has_sys_cublas and has_sys_cudnn:
+        return True, True, 0.0
+
+    return False, False, 0.0
+
+
+def reset_cuda_state() -> None:
+    """Riattiva il rilevamento CUDA dopo l'installazione del runtime GPU in-app."""
+    global _cuda_count_cache, _cuda_disabled
+    _register_nvidia_dll_dirs()
+    _cuda_disabled = False
+    _cuda_count_cache = None
+    invalidate_dir_size_cache(get_cuda_runtime_dir())
+
+
+def remove_cuda_runtime() -> float:
+    """
+    Rimuove la cartella cuda_runtime scaricata da SbobinAI.
+    Se Windows mantiene una DLL bloccata in RAM fino al riavvio, marca .pending_delete
+    così viene disabilitata subito e rimossa al prossimo avvio.
+    """
+    disable_cuda("librerie CUDA rimosse dall'utente")
+    cuda_dir = get_cuda_runtime_dir()
+    if not os.path.exists(cuda_dir):
+        return 0.0
+    size_before = dir_size_mb(cuda_dir)
+    if not safe_rmtree(cuda_dir, retries=3, delay=0.2):
+        try:
+            os.makedirs(cuda_dir, exist_ok=True)
+            with open(_cuda_pending_delete_marker(), "w", encoding="utf-8") as fh:
+                fh.write("pending\n")
+        except Exception:
+            pass
+    invalidate_dir_size_cache(cuda_dir)
+    return size_before
 
 
 def backend_label() -> str:
@@ -85,18 +273,39 @@ def backend_label() -> str:
 # ── Accelerazione hardware (portable) ─────────────────────────────────────────
 
 _cuda_count_cache: Optional[int] = None
+_cuda_disabled: bool = False
+
+
+def disable_cuda(reason: str = "") -> None:
+    """Disabilita permanentemente CUDA per il processo corrente dopo un errore runtime."""
+    global _cuda_disabled, _cuda_count_cache
+    _cuda_disabled = True
+    _cuda_count_cache = 0
+    if reason:
+        logger.warning(f"[Platform] CUDA disabilitato permanentemente per questa sessione ({reason}).")
+
+
+def is_cuda_disabled() -> bool:
+    return _cuda_disabled
 
 
 def cuda_device_count() -> int:
-    """Numero di GPU CUDA visibili a CTranslate2 (0 se assente / non installato)."""
+    """Numero di GPU CUDA realmente utilizzabili da CTranslate2 (0 se assente o DLL mancanti)."""
     global _cuda_count_cache
+    if _cuda_disabled:
+        return 0
     if _cuda_count_cache is not None:
         return _cuda_count_cache
     count = 0
     if not USE_MLX:
         try:
-            import ctranslate2
-            count = int(ctranslate2.get_cuda_device_count())
+            if IS_WINDOWS and os.path.isfile(_cuda_pending_delete_marker()):
+                count = 0
+            else:
+                import ctranslate2
+                raw_count = int(ctranslate2.get_cuda_device_count())
+                if raw_count > 0 and _cuda_runtime_dlls_available():
+                    count = raw_count
         except Exception:
             count = 0
     _cuda_count_cache = count

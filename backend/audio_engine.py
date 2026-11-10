@@ -240,28 +240,29 @@ class AudioEngine:
 
         last_err = None
         for sr, ch in unique_candidates:
-            try:
-                block_size = int(round(sr * (self.FRAME_MS / 1000.0)))
-                stream = sd.InputStream(
-                    device=device,
-                    samplerate=sr,
-                    channels=ch,
-                    dtype="int16",
-                    blocksize=block_size,
-                    callback=self._raw_stream_callback,
-                )
-                self.device_samplerate = float(sr)
-                self.device_channels = ch
-                if sr != self.SAMPLE_RATE:
-                    logger.info(f"[AudioEngine] Dispositivo aperto a {sr:.0f} Hz ({ch} canali) con ricampionamento a 16 kHz.")
-                    self._resampler = _StreamResampler(sr, self.SAMPLE_RATE)
-                else:
-                    logger.info(f"[AudioEngine] Dispositivo aperto a 16 kHz nativi ({ch} canali).")
-                    self._resampler = None
-                self._pending = np.zeros(0, dtype=np.float32)
-                return stream
-            except Exception as e:
-                last_err = e
+            # Prova prima con blocksize calibrato a 30ms, poi con None (buffer nativo hardware consigliato da WASAPI)
+            for b_size in (int(round(sr * (self.FRAME_MS / 1000.0))), None):
+                try:
+                    stream = sd.InputStream(
+                        device=device,
+                        samplerate=sr,
+                        channels=ch,
+                        dtype="int16",
+                        blocksize=b_size,
+                        callback=self._raw_stream_callback,
+                    )
+                    self.device_samplerate = float(sr)
+                    self.device_channels = ch
+                    if sr != self.SAMPLE_RATE:
+                        logger.info(f"[AudioEngine] Dispositivo aperto a {sr:.0f} Hz ({ch} canali, blocksize={b_size}) con ricampionamento a 16 kHz.")
+                        self._resampler = _StreamResampler(sr, self.SAMPLE_RATE)
+                    else:
+                        logger.info(f"[AudioEngine] Dispositivo aperto a 16 kHz nativi ({ch} canali, blocksize={b_size}).")
+                        self._resampler = None
+                    self._pending = np.zeros(0, dtype=np.float32)
+                    return stream
+                except Exception as e:
+                    last_err = e
 
         raise RuntimeError(f"Nessuna configurazione audio hardware supportata dal dispositivo ({last_err})")
 
@@ -307,10 +308,9 @@ class AudioEngine:
         if not self.is_running or self.is_paused:
             return
 
-        # 1. Downmix a mono se il flusso hardware è multicanale (stereo)
+        # 1. Downmix a mono se il flusso hardware è multicanale (stereo / array microfonico)
         if indata.ndim == 2 and indata.shape[1] > 1:
-            # Media a 32-bit per evitare overflow
-            mono_int16 = ((indata[:, 0].astype(np.int32) + indata[:, 1].astype(np.int32)) // 2).astype(np.int16)
+            mono_int16 = np.mean(indata.astype(np.int32), axis=1).astype(np.int16)
         else:
             mono_int16 = indata.reshape(-1).astype(np.int16, copy=False)
 
@@ -461,7 +461,7 @@ class AudioEngine:
         samples_f = samples.astype(np.float32)
         seg_energy = float(np.dot(samples_f, samples_f))
         seg_rms = float(np.sqrt(seg_energy / len(samples_f)))
-        min_rms = 40.0 if self.vad else 50.0
+        min_rms = 15.0 if self.vad else 25.0
         if seg_rms < min_rms:
             logger.debug(f"[AudioEngine] Blocco ignorato (RMS troppo basso: {seg_rms:.1f})")
             return

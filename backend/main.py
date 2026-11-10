@@ -130,7 +130,28 @@ app.include_router(study_router, prefix="/api/v1")
 @app.get("/api/v1/health", tags=["System"])
 async def health_check():
     """Endpoint di healthcheck."""
-    return {"status": "ok", "service": "SbobinAI", "version": "0.1.0"}
+    return {
+        "status": "ok",
+        "service": "SbobinAI",
+        "version": "0.1.0",
+        "app_version": os.environ.get("SBOBINAI_APP_VERSION") or "0.0.15",
+    }
+
+
+@app.post("/api/v1/system/shutdown", tags=["System"])
+async def system_shutdown():
+    """Arresto pulito del server locale richiesto dal client desktop (es. aggiornamento app)."""
+    import signal
+    import threading
+
+    def _terminate():
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+        except Exception:
+            os._exit(0)
+
+    threading.Timer(0.15, _terminate).start()
+    return {"status": "shutting_down"}
 
 
 def extract_professor_questions(text: str) -> list[str]:
@@ -393,6 +414,28 @@ async def _transcription_worker(session: LiveSession, ws: WebSocket):
                 "payload": {"status": new_status}
             })
 
+    # Verifiche diagnostiche proattive per avvisare subito l'utente se qualcosa impedisce la trascrizione
+    if session.audio_engine._stream is None and not session.transcriber.mock_mode:
+        logger.warning(f"[WS Worker] Microfono hardware non attivo per lezione {session.lecture_id}")
+        await _safe_send_json(ws, {
+            "type": "error",
+            "payload": {
+                "message": "Accesso al microfono non riuscito. Controlla le impostazioni Privacy di Windows (Impostazioni -> Privacy -> Microfono) o verifica che il microfono non sia disattivato."
+            }
+        })
+
+    if not session.transcriber.mock_mode:
+        if not session.transcriber.local_model_path:
+            session.transcriber.local_model_path = _resolve_model_path(session.transcriber.repo_id)
+        if not session.transcriber.local_model_path:
+            logger.warning(f"[WS Worker] Modello Whisper non presente in locale per lezione {session.lecture_id}")
+            await _safe_send_json(ws, {
+                "type": "error",
+                "payload": {
+                    "message": "Modello Whisper non scaricato. Apri Impostazioni -> Modelli IA e premi 'Scarica' per iniziare a trascrivere."
+                }
+            })
+
     try:
         while session.is_active:
             if session.is_paused:
@@ -614,7 +657,7 @@ async def _finalize_session(session: LiveSession, subject_id: int) -> Tuple[floa
                 except queue.Empty:
                     break
                 try:
-                    tail = await asyncio.wait_for(session.transcriber.transcribe(chunk), timeout=15.0)
+                    tail = await asyncio.wait_for(session.transcriber.transcribe(chunk), timeout=25.0)
                     if tail:
                         session.push_transcript(tail)
                         drained_any = True
@@ -632,20 +675,20 @@ async def _finalize_session(session: LiveSession, subject_id: int) -> Tuple[floa
                 except Exception as exc:
                     logger.warning(f"[WS] Errore aggiornamento trascrizione finale DB: {exc}")
 
-        # Rilascio memoria transcriber (non blocca la risposta client)
-        if hasattr(session, "transcriber") and session.transcriber:
-            try:
-                await asyncio.to_thread(session.transcriber.release_memory)
-            except Exception as exc:
-                logger.debug(f"[WS] Errore pulizia sessione e rilascio memoria: {exc}")
-
-        # Pipeline post-lezione (calcolo timestamps, compressione M4A, capitoli/RAG)
-        await _post_lecture_pipeline(
-            subject_id=subject_id,
-            lecture_id=session.lecture_id,
-            audio_path=audio_path,
-            full_transcript=session.get_full_transcript(),
-        )
+        # Pipeline post-lezione (calcolo timestamps con Whisper ancora caldo, compressione M4A, capitoli/RAG)
+        try:
+            await _post_lecture_pipeline(
+                subject_id=subject_id,
+                lecture_id=session.lecture_id,
+                audio_path=audio_path,
+                full_transcript=session.get_full_transcript(),
+            )
+        finally:
+            if not has_active_sessions() and hasattr(session, "transcriber") and session.transcriber:
+                try:
+                    await asyncio.to_thread(session.transcriber.release_memory)
+                except Exception as exc:
+                    logger.debug(f"[WS] Errore pulizia sessione e rilascio memoria: {exc}")
 
     _spawn(_background_post_stop())
 

@@ -154,10 +154,12 @@ export interface ModelInfo {
   repo_id?: string;
   repos?: string[];
   ollama_tag?: string;
-  type: 'whisper' | 'llm' | 'embedding' | 'ollama';
+  type: 'whisper' | 'llm' | 'embedding' | 'ollama' | 'cuda';
   approx_size: string;
+  approx_bytes?: number;
   description?: string;
   downloaded: boolean;
+  system_installed?: boolean;
   disk_size_mb?: number | null;
   status: 'idle' | 'downloading' | 'completed' | 'error' | 'cancelled';
   progress?: number;
@@ -179,6 +181,10 @@ export interface ModelsStatusResponse {
   whisper: ModelInfo[];
   llm?: ModelInfo[];
   embedding?: ModelInfo[];
+  runtime?: ModelInfo[];
+  nvidia_gpu_detected?: boolean;
+  backend?: string;
+  backend_label?: string;
   ollama?: ModelInfo[];
   ollama_running?: boolean;
   installed_count?: number;

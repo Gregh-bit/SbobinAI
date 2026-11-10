@@ -205,26 +205,114 @@ fn get_backend_status(state: tauri::State<BackendState>) -> BackendStatus {
     state.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
-fn backend_is_up() -> bool {
+#[tauri::command]
+fn stop_backend_for_update(app: tauri::AppHandle) {
+    request_http_shutdown();
+    kill_backend(&app);
+    terminate_stale_backend_on_port_8000();
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum BackendHealth {
+    Down,
+    MatchingVersion,
+    StaleVersion,
+}
+
+fn probe_backend_health() -> BackendHealth {
     let addr: SocketAddr = ([127, 0, 0, 1], 8000).into();
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(400)) else {
-        return false;
+        return BackendHealth::Down;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(600)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(400)));
 
     let req = b"GET /health HTTP/1.1\r\nHost: 127.0.0.1:8000\r\nConnection: close\r\n\r\n";
     if stream.write_all(req).is_err() {
-        return false;
+        return BackendHealth::Down;
     }
 
-    let mut buf = [0u8; 512];
+    let mut buf = [0u8; 1024];
     match stream.read(&mut buf) {
         Ok(n) if n > 0 => {
             let resp = String::from_utf8_lossy(&buf[..n]);
-            resp.starts_with("HTTP/1.1 200") && (resp.contains("SbobinAI") || (resp.contains("status") && resp.contains("ok")))
+            if !resp.starts_with("HTTP/1.1 200")
+                || !(resp.contains("SbobinAI") || (resp.contains("status") && resp.contains("ok")))
+            {
+                return BackendHealth::Down;
+            }
+            if cfg!(debug_assertions) {
+                return BackendHealth::MatchingVersion;
+            }
+            if let Some((_, body)) = resp.split_once("\r\n\r\n") {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(body.trim()) {
+                    if json.get("app_version").and_then(|v| v.as_str()) == Some(env!("CARGO_PKG_VERSION")) {
+                        return BackendHealth::MatchingVersion;
+                    }
+                }
+            }
+            BackendHealth::StaleVersion
         }
-        _ => false,
+        _ => BackendHealth::Down,
+    }
+}
+
+fn backend_is_up() -> bool {
+    probe_backend_health() != BackendHealth::Down
+}
+
+fn request_http_shutdown() {
+    let addr: SocketAddr = ([127, 0, 0, 1], 8000).into();
+    if let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) {
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(400)));
+        let req = b"POST /api/v1/system/shutdown HTTP/1.1\r\nHost: 127.0.0.1:8000\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let _ = stream.write_all(req);
+        let mut buf = [0u8; 128];
+        let _ = stream.read(&mut buf);
+    }
+}
+
+fn terminate_stale_backend_on_port_8000() {
+    log::warn!("Trovato backend SbobinAI di una versione precedente su 127.0.0.1:8000: arresto forzato...");
+    request_http_shutdown();
+    std::thread::sleep(Duration::from_millis(350));
+
+    if backend_is_up() {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            let _ = Command::new("powershell")
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { $p = Get-Process -Id $_ -ErrorAction SilentlyContinue; if ($p -and ($p.ProcessName -like 'python*' -or $p.ProcessName -like 'uvicorn*')) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } }",
+                ])
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        #[cfg(unix)]
+        {
+            let _ = Command::new("sh")
+                .args([
+                    "-c",
+                    "for p in $(lsof -tiTCP:8000 -sTCP:LISTEN 2>/dev/null); do comm=$(ps -p $p -o comm= 2>/dev/null); case \"$comm\" in *python*|*Python*|*uvicorn*) kill -TERM $p 2>/dev/null;; esac; done",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+
+    for _ in 0..10 {
+        if !backend_is_up() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
 }
 
@@ -917,13 +1005,19 @@ fn run_backend_bootstrap(
         return;
     }
 
-    if backend_is_up() {
-        log::info!("Backend already listening on 127.0.0.1:8000");
-        let mut s = state.0.lock().unwrap_or_else(|p| p.into_inner());
-        s.status = "ready".into();
-        s.message = "Motore locale SbobinAI pronto".into();
-        s.port_ready = true;
-        return;
+    match probe_backend_health() {
+        BackendHealth::MatchingVersion => {
+            log::info!("Backend v{} already listening on 127.0.0.1:8000", env!("CARGO_PKG_VERSION"));
+            let mut s = state.0.lock().unwrap_or_else(|p| p.into_inner());
+            s.status = "ready".into();
+            s.message = "Motore locale SbobinAI pronto".into();
+            s.port_ready = true;
+            return;
+        }
+        BackendHealth::StaleVersion => {
+            terminate_stale_backend_on_port_8000();
+        }
+        BackendHealth::Down => {}
     }
 
     let backend_dir = match resolve_backend_dir(&app) {
@@ -1000,6 +1094,21 @@ fn run_backend_bootstrap(
         s.message = "Avvio del motore AI locale in corso...".into();
     }
 
+    match probe_backend_health() {
+        BackendHealth::MatchingVersion => {
+            log::info!("Backend v{} già attivo prima dello spawn", env!("CARGO_PKG_VERSION"));
+            let mut s = state.0.lock().unwrap_or_else(|p| p.into_inner());
+            s.status = "ready".into();
+            s.message = "Motore locale SbobinAI pronto".into();
+            s.port_ready = true;
+            return;
+        }
+        BackendHealth::StaleVersion => {
+            terminate_stale_backend_on_port_8000();
+        }
+        BackendHealth::Down => {}
+    }
+
     let path_env = get_full_path_env();
     let mut cmd = silent_command(&python);
     cmd.args(["-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8000"])
@@ -1008,6 +1117,7 @@ fn run_backend_bootstrap(
         .env("PYTHONPATH", &backend_dir)
         .env("PYTHONUTF8", "1")
         .env("PYTHONIOENCODING", "utf-8")
+        .env("SBOBINAI_APP_VERSION", env!("CARGO_PKG_VERSION"))
         .stdin(Stdio::null());
 
     #[cfg(not(debug_assertions))]
@@ -1425,6 +1535,18 @@ async fn uninstall_sbobinai(
 
         #[cfg(target_os = "windows")]
         {
+            if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+                let lad = std::path::PathBuf::from(&local_app_data);
+                safe_remove_dir(&lad.join(r"SbobinAI\cuda_runtime"));
+                safe_remove_dir(&lad.join(r"SbobinAI\cuda_runtime.staging"));
+                safe_remove_dir(&lad.join("SbobinAI"));
+                safe_remove_dir(&lad.join("com.sbobinai.app"));
+                safe_remove_dir(&lad.join("unicopilot"));
+                safe_remove_dir(&lad.join("EBWebView"));
+                safe_remove_dir(&lad.join(r"Programs\SbobinAI"));
+            }
+            safe_remove_dir(&h.join(r"AppData\Local\SbobinAI\cuda_runtime"));
+            safe_remove_dir(&h.join(r"AppData\Local\SbobinAI\cuda_runtime.staging"));
             safe_remove_dir(&h.join(r"AppData\Local\SbobinAI"));
             safe_remove_dir(&h.join(r"AppData\Local\com.sbobinai.app"));
             safe_remove_dir(&h.join(r"AppData\Local\unicopilot"));
@@ -1614,7 +1736,10 @@ async fn uninstall_sbobinai(
                             "Start-Sleep -Seconds 2; \
                              Get-Process SbobinAI -ErrorAction SilentlyContinue | Stop-Process -Force; \
                              Get-Process msedgewebview2 -ErrorAction SilentlyContinue | Where-Object {{ $_.Path -like '*com.sbobinai.app*' }} | Stop-Process -Force; \
-                             {}Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\SbobinAI\" -ErrorAction SilentlyContinue; \
+                             Get-Process python,pythonw -ErrorAction SilentlyContinue | Where-Object {{ $_.Path -like '*SbobinAI*' }} | Stop-Process -Force; \
+                             {}Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\SbobinAI\\cuda_runtime\" -ErrorAction SilentlyContinue; \
+                             Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\SbobinAI\\cuda_runtime.staging\" -ErrorAction SilentlyContinue; \
+                             Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\SbobinAI\" -ErrorAction SilentlyContinue; \
                              Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\com.sbobinai.app\" -ErrorAction SilentlyContinue; \
                              Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\unicopilot\" -ErrorAction SilentlyContinue; \
                              Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\EBWebView\" -ErrorAction SilentlyContinue; \
@@ -1704,6 +1829,7 @@ pub fn run() {
         .manage(WakeLockState::default())
         .invoke_handler(tauri::generate_handler![
             get_backend_status,
+            stop_backend_for_update,
             uninstall_sbobinai,
             acquire_wake_lock,
             release_wake_lock

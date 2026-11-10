@@ -3,7 +3,7 @@ import {
   X, Folder, Cpu, Mic, HardDrive, Check, 
   RotateCcw, Sliders, Trash2, Download, Loader2,
   RefreshCw, CheckCircle2, ShieldCheck, Database, FileAudio, 
-  Layers, AlertTriangle, AlertCircle, Sparkles, Volume2, Shield, Copy
+  Layers, AlertTriangle, AlertCircle, Sparkles, Volume2, Shield, Copy, Zap
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import { useSettings } from '../lib/SettingsContext';
@@ -196,7 +196,8 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
     const isWhisperDl = modelsStatus.whisper?.some((m) => m.status === 'downloading');
     const isLlmDl = modelsStatus.llm?.some((m) => m.status === 'downloading');
     const isEmbDl = modelsStatus.embedding?.some((m) => m.status === 'downloading');
-    const isDownloading = isWhisperDl || isLlmDl || isEmbDl || actionInProgress !== null;
+    const isRuntimeDl = modelsStatus.runtime?.some((m) => m.status === 'downloading');
+    const isDownloading = isWhisperDl || isLlmDl || isEmbDl || isRuntimeDl || actionInProgress !== null;
     if (!isDownloading) return;
 
     let isFetching = false;
@@ -275,7 +276,12 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
   const handleDownloadModel = async (modelId: string) => {
     try {
       setActionInProgress(modelId);
-      showNotification(`Avvio download del modello ${modelId}...`, 'info');
+      showNotification(
+        modelId === 'cuda-runtime'
+          ? 'Avvio download delle librerie NVIDIA CUDA...'
+          : `Avvio download del modello ${modelId}...`,
+        'info'
+      );
 
       // 1. Aggiornamento istantaneo dell'interfaccia: mostra immediatamente la barra di progresso
       setModelsStatus((prev) => {
@@ -296,6 +302,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
           whisper: updateList(prev.whisper) || prev.whisper,
           llm: updateList(prev.llm),
           embedding: updateList(prev.embedding),
+          runtime: updateList(prev.runtime),
         };
       });
 
@@ -1072,14 +1079,22 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                         disk_size_mb: null,
                       };
 
-                      const coreItems = [coreWhisper, coreEmbedding];
+                      const cudaRuntimeItem = modelsStatus?.runtime?.find((m) => m.id === 'cuda-runtime');
+                      const showCudaRuntime = Boolean(!isMac && modelsStatus?.nvidia_gpu_detected && cudaRuntimeItem);
+                      const coreItems =
+                        showCudaRuntime && cudaRuntimeItem
+                          ? [coreWhisper, coreEmbedding, cudaRuntimeItem]
+                          : [coreWhisper, coreEmbedding];
 
                       return coreItems.map((m) => {
                         const isDownloading = m.status === 'downloading' || actionInProgress === m.id;
                         const isCancellingThis = actionInProgress === `cancel-${m.id}`;
+                        const isDeletingThis = actionInProgress === `delete-${m.id}`;
+                        const isConfirmingDelete = confirmDeleteModelId === m.id;
                         const isMic = m.type === 'whisper';
+                        const isCuda = m.type === 'cuda';
                         const sizeDisplay = m.downloaded
-                          ? `${m.disk_size_mb || m.total_mb || '—'} MB`
+                          ? (isCuda && m.system_installed ? 'Sistema' : `${m.disk_size_mb || m.total_mb || '—'} MB`)
                           : m.approx_size;
 
                         return (
@@ -1100,7 +1115,13 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                                     ? 'bg-white/[0.10] text-white border border-white/[0.14]'
                                     : 'bg-white/5 text-white/40 border border-white/10'
                                 )}>
-                                  {isMic ? <Mic size={16} /> : <Database size={16} />}
+                                  {isMic ? (
+                                    <Mic size={16} />
+                                  ) : isCuda ? (
+                                    <Zap size={16} className={m.downloaded ? 'text-emerald-300' : ''} />
+                                  ) : (
+                                    <Database size={16} />
+                                  )}
                                 </div>
 
                                 <div className="min-w-0">
@@ -1118,10 +1139,40 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
 
                               <div className="flex items-center gap-2 flex-shrink-0">
                                 {m.downloaded ? (
-                                  <span className="text-[11px] font-medium text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2.5 py-1 rounded-full flex items-center gap-1.5">
-                                    <Check size={11} strokeWidth={2.5} />
-                                    <span>Pronto</span>
-                                  </span>
+                                  <>
+                                    <span className="text-[11px] font-medium text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2.5 py-1 rounded-full flex items-center gap-1.5">
+                                      <Check size={11} strokeWidth={2.5} />
+                                      <span>{isCuda && m.system_installed ? 'Pronto (Sistema)' : 'Pronto'}</span>
+                                    </span>
+                                    {isCuda && !m.system_installed && (
+                                      <button
+                                        type="button"
+                                        data-delete-model-btn={m.id}
+                                        disabled={actionInProgress !== null}
+                                        onClick={() => {
+                                          if (isConfirmingDelete) {
+                                            handleDeleteModel(m.id);
+                                          } else {
+                                            setConfirmDeleteModelId(m.id);
+                                          }
+                                        }}
+                                        title={isConfirmingDelete ? 'Conferma rimozione librerie CUDA' : 'Elimina librerie CUDA scaricate'}
+                                        className={clsx(
+                                          'flex items-center gap-1 rounded-xl text-xs font-medium border transition-all cursor-pointer disabled:opacity-50',
+                                          isConfirmingDelete
+                                            ? 'px-2.5 py-1 bg-red-500/25 text-red-200 border-red-500/45 hover:bg-red-500/35'
+                                            : 'p-1.5 bg-white/[0.04] hover:bg-red-500/15 text-white/45 hover:text-red-300 border-white/[0.08] hover:border-red-500/30'
+                                        )}
+                                      >
+                                        {isDeletingThis ? (
+                                          <Loader2 size={13} className="animate-spin" />
+                                        ) : (
+                                          <Trash2 size={13} />
+                                        )}
+                                        {isConfirmingDelete && <span>Elimina</span>}
+                                      </button>
+                                    )}
+                                  </>
                                 ) : isDownloading ? (
                                   <button
                                     type="button"
@@ -1531,7 +1582,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       </p>
                     </div>
                     <span className="text-[10px] font-mono font-medium px-2.5 py-1 rounded-full bg-white/[0.08] text-white/70 border border-white/10 flex-shrink-0">
-                      v{updater.currentVersion || '0.0.14'}
+                      v{updater.currentVersion || '0.0.15'}
                     </span>
                   </div>
 
@@ -1770,14 +1821,25 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       )}>
                         {!deleteStorageFolder && <div className="w-1.5 h-1.5 rounded-full bg-black" />}
                       </div>
-                      <div className="space-y-0.5 flex-1">
-                        <span className="text-xs font-semibold text-white block">
-                          Conserva lezioni e registrazioni
-                        </span>
-                        <p className="text-[11px] text-white/50 leading-relaxed">
-                          Rimuove l'app e i modelli IA. I tuoi audio, le trascrizioni e gli appunti rimarranno al sicuro sul disco.
-                        </p>
-                      </div>
+                      {(() => {
+                        const hasLocalCuda = Boolean(
+                          !isMac &&
+                          modelsStatus?.nvidia_gpu_detected &&
+                          modelsStatus?.runtime?.some((m) => m.id === 'cuda-runtime' && m.downloaded && !m.system_installed)
+                        );
+                        return (
+                          <>
+                            <div className="space-y-0.5 flex-1">
+                              <span className="text-xs font-semibold text-white block">
+                                Conserva lezioni e registrazioni
+                              </span>
+                              <p className="text-[11px] text-white/50 leading-relaxed">
+                                Rimuove l'app{hasLocalCuda ? ', i modelli IA e le librerie CUDA scaricate' : ' e i modelli IA'}. I tuoi audio, le trascrizioni e gli appunti rimarranno al sicuro sul disco.
+                              </p>
+                            </div>
+                          </>
+                        );
+                      })()}
                     </div>
 
                     {/* Opzione 2: Pulizia totale */}
@@ -1803,7 +1865,9 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                           Elimina anche la cartella delle lezioni
                         </span>
                         <p className="text-[11px] text-white/50 leading-relaxed">
-                          Rimuove l'app, i modelli IA e cancella definitivamente tutte le lezioni, gli audio e gli appunti.
+                          {!isMac && modelsStatus?.nvidia_gpu_detected && modelsStatus?.runtime?.some((m) => m.id === 'cuda-runtime' && m.downloaded && !m.system_installed)
+                            ? "Rimuove l'app, i modelli IA, le librerie CUDA scaricate e cancella definitivamente tutte le lezioni, gli audio e gli appunti."
+                            : "Rimuove l'app, i modelli IA e cancella definitivamente tutte le lezioni, gli audio e gli appunti."}
                         </p>
                       </div>
                     </div>
@@ -1844,9 +1908,16 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       {deleteStorageFolder ? 'Pulizia totale in corso...' : 'Disinstallazione in corso...'}
                     </h3>
                     <p className="text-xs text-white/50 leading-relaxed">
-                      {deleteStorageFolder
-                        ? 'Eliminazione lezioni, audio, modelli AI, pulizia ambiente Python e cancellazione di ogni traccia.'
-                        : 'Eliminazione dei modelli AI, pulizia dell\'ambiente Python e disinstallazione dell\'applicazione.'}
+                      {(() => {
+                        const hasLocalCuda = Boolean(
+                          !isMac &&
+                          modelsStatus?.nvidia_gpu_detected &&
+                          modelsStatus?.runtime?.some((m) => m.id === 'cuda-runtime' && m.downloaded && !m.system_installed)
+                        );
+                        return deleteStorageFolder
+                          ? `Eliminazione lezioni, audio, modelli AI${hasLocalCuda ? ', librerie CUDA' : ''}, pulizia ambiente Python e cancellazione di ogni traccia.`
+                          : `Eliminazione dei modelli AI${hasLocalCuda ? ' e delle librerie CUDA' : ''}, pulizia dell'ambiente Python e disinstallazione dell'applicazione.`;
+                      })()}
                     </p>
                     <p className="text-[11px] text-white/40 pt-2">
                       L'applicazione si chiuderà automaticamente al termine.

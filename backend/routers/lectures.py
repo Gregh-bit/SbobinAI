@@ -277,10 +277,8 @@ def compute_and_cache_lecture_timestamps(lecture_id: int) -> dict:
                             )
                             raw_segs = list(res.get("segments") or [])
                         else:
-                            from transcriber import _load_faster_whisper
-                            fw_model = _load_faster_whisper(model_path)
-                            segs_gen, _ = fw_model.transcribe(audio_input, language="it", word_timestamps=True)
-                            raw_segs = list(segs_gen)
+                            from transcriber import faster_whisper_word_segments
+                            raw_segs = faster_whisper_word_segments(model_path, audio_input, language="it")
 
                     raw_converted = []
                     for s_idx, seg in enumerate(raw_segs):

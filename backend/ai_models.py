@@ -31,6 +31,8 @@ LLM_DEFAULT_ID = "mlx-community/Qwen3.5-4B-MLX-4bit"
 LLM_ALT_ID = "unsloth/gemma-4-E4B-it-UD-MLX-4bit"
 EMBEDDING_DEFAULT_ID = "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"
 MOCK_WHISPER_ID = "mock_mode"
+CUDA_RUNTIME_ID = "cuda-runtime"
+CUDA_RUNTIME_APPROX_BYTES = 1195 * MB
 
 
 @dataclass(frozen=True)
@@ -184,6 +186,23 @@ MOCK_WHISPER_INFO = {
     "approx_bytes": 0,
     "description": "Nessun download, trascrizione istantanea simulata per test rapido.",
 }
+
+
+def cuda_runtime_info() -> Dict[str, object]:
+    """Descrittore UI del pacchetto opzionale CUDA 12 + cuDNN 9 (solo Windows con GPU NVIDIA)."""
+    return {
+        "id": CUDA_RUNTIME_ID,
+        "name": "Accelerazione GPU NVIDIA (CUDA)",
+        "repos": ["nvidia-cuda-runtime-cu12", "nvidia-cublas-cu12", "nvidia-cudnn-cu12"],
+        "repo_id": CUDA_RUNTIME_ID,
+        "type": "cuda",
+        "is_default": False,
+        "is_system_core": False,
+        "approx_size": human_size(CUDA_RUNTIME_APPROX_BYTES),
+        "approx_bytes": CUDA_RUNTIME_APPROX_BYTES,
+        "description": "Librerie CUDA 12 e cuDNN 9 per trascrivere in tempo reale sulla tua GPU NVIDIA.",
+        "backend": AI_BACKEND,
+    }
 
 
 def resolve(model_id: Optional[str], kind: Optional[str] = None) -> Optional[ModelSpec]:
