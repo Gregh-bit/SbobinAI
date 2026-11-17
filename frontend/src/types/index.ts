@@ -42,6 +42,8 @@ export type WSMessageType =
   | 'chat_response'
   | 'chat_chunk'
   | 'question_detected'
+  | 'question_answering'
+  | 'reconnected'
   | 'paused'
   | 'resumed'
   | 'stopped'
@@ -146,6 +148,7 @@ export interface OralEvaluationResult {
   good_points: string;
   missing_or_errors: string;
   ideal_formulation: string;
+  warning?: string;
 }
 
 export interface ModelInfo {
@@ -192,4 +195,134 @@ export interface ModelsStatusResponse {
   installed_models?: InstalledModelSummary[];
   cache_path?: string;
 }
+
+// ── Persistent Chat & Study Sessions (ChatGPT 2026 Upgrade) ───────────────────
+
+export type ChatStudyMode = 'auto' | 'quiz' | 'socratic' | 'simple' | 'oral' | 'exam';
+
+export interface CitationRef {
+  source_id: string;
+  source_type: 'slide' | 'lecture' | 'material' | string;
+  title: string;
+  page?: number | null;
+  label: string;
+}
+
+export interface ChatScope {
+  lecture_ids: number[];
+  material_ids: string[];
+}
+
+export interface ChatMessageSend {
+  message: string;
+  mode?: ChatStudyMode;
+  scope?: ChatScope;
+}
+
+export interface ChatStudyAction {
+  type: 'quiz_created' | 'oral_question' | 'saved_to_quaderno' | string;
+  quiz_id?: number | null;
+  title?: string | null;
+  num_questions?: number | null;
+  question?: string | null;
+  topic?: string | null;
+  lecture_id?: number | null;
+}
+
+export interface ContextStats {
+  used_tokens: number;
+  max_tokens: number;
+  percentage: number;
+  active_messages_count: number;
+  compacted_messages_count: number;
+  has_compacted_summary: boolean;
+  needs_compaction: boolean;
+}
+
+export interface PersistentChatMessage {
+  id: number;
+  session_id: number;
+  role: 'user' | 'assistant';
+  content: string;
+  thinking: string;
+  mode: ChatStudyMode | string;
+  context_used: string;
+  citations: CitationRef[];
+  action?: ChatStudyAction | null;
+  followups: string[];
+  token_estimate: number;
+  created_at: string;
+}
+
+export interface ChatSession {
+  id: number;
+  subject_id: number;
+  title: string;
+  compacted_summary: string;
+  compacted_up_to_message_id: number;
+  scope: ChatScope;
+  context_stats?: ContextStats | null;
+  message_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChatSessionDetail extends ChatSession {
+  messages: PersistentChatMessage[];
+}
+
+export interface QuizSetQuestion {
+  question: string;
+  options: string[];
+  correct_index: number;
+  explanation: string;
+}
+
+export interface QuizSetOut {
+  id: number;
+  subject_id: number;
+  chat_session_id?: number | null;
+  title: string;
+  source_label: string;
+  questions: QuizSetQuestion[];
+  created_at: string;
+}
+
+export interface MaterialPageOut {
+  filename: string;
+  page: number;
+  page_count: number;
+  kind: 'image' | 'text' | string;
+  image_data_url?: string | null;
+  text: string;
+  title: string;
+}
+
+export type ChatStreamEvent =
+  | {
+      type: 'meta';
+      user_message: PersistentChatMessage;
+      context_used: string;
+      citations: CitationRef[];
+      context_stats: ContextStats;
+    }
+  | {
+      type: 'token';
+      text: string;
+    }
+  | {
+      type: 'action';
+      action: ChatStudyAction;
+    }
+  | {
+      type: 'done';
+      assistant_message: PersistentChatMessage;
+      followups: string[];
+      context_stats: ContextStats;
+      session_title?: string;
+    }
+  | {
+      type: 'error';
+      detail: string;
+    };
 

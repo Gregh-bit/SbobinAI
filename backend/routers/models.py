@@ -156,6 +156,10 @@ def _download_hf_worker(model_id: str, spec: ai_models.ModelSpec, cancel_event: 
         }
 
     class DualProgressTracker(tqdm):
+        def __init__(self, *args, **kwargs):
+            _check_cancel()
+            super().__init__(*args, **kwargs)
+
         def update(self, n=1):
             _check_cancel()
             super().update(n)
@@ -225,6 +229,11 @@ def _download_hf_worker(model_id: str, spec: ai_models.ModelSpec, cancel_event: 
         _finish_cancelled(model_id, spec, total_mb)
 
     except Exception as exc:
+        if cancel_event.is_set():
+            logger.info(f"[Models] Interruzione confermata per {model_id} durante eccezione: {exc}")
+            _finish_cancelled(model_id, spec, total_mb)
+            return
+
         err_msg = str(exc)
         logger.error(f"[Models] Errore durante il download di {model_id}: {err_msg}", exc_info=True)
         try:
@@ -265,28 +274,31 @@ def _download_hf_worker(model_id: str, spec: ai_models.ModelSpec, cancel_event: 
 
 
 def _finish_cancelled(model_id: str, spec: ai_models.ModelSpec, total_mb: float) -> None:
-    """Gestione interruzione: unico punto in cui vengono eliminati i file parziali."""
+    """Gestione interruzione: pulizia file parziali e ripristino immediato a idle."""
     logger.info(f"[Models] Download di {model_id} interrotto: rimozione file parziali.")
     ai_models.set_downloading(model_id, False)
+    with _lock:
+        _download_tracker[model_id] = {
+            "status": "cancelled",
+            "progress": 0,
+            "downloaded_mb": 0.0,
+            "total_mb": total_mb,
+            "stage": "Download interrotto dall'utente.",
+            "error": None,
+        }
     try:
         _delete_repos(spec.all_repo_ids())
     except Exception as exc:
         logger.warning(f"[Models] Pulizia file parziali {model_id}: {exc}")
-    with _lock:
-        _download_tracker[model_id] = {
-            "status": "cancelled",
-            "progress": 0,
-            "downloaded_mb": 0.0,
-            "total_mb": total_mb,
-            "stage": "Download interrotto dall'utente.",
-            "error": "Download interrotto dall'utente.",
-        }
+    finally:
+        with _lock:
+            _download_tracker.pop(model_id, None)
 
 
 def _finish_cuda_cancelled(total_mb: float) -> None:
     model_id = ai_models.CUDA_RUNTIME_ID
+    logger.info("[Models] Download CUDA interrotto: rimozione file parziali.")
     ai_models.set_downloading(model_id, False)
-    safe_rmtree(get_cuda_runtime_dir() + ".staging", retries=2, delay=0.15)
     with _lock:
         _download_tracker[model_id] = {
             "status": "cancelled",
@@ -294,8 +306,15 @@ def _finish_cuda_cancelled(total_mb: float) -> None:
             "downloaded_mb": 0.0,
             "total_mb": total_mb,
             "stage": "Download interrotto dall'utente.",
-            "error": "Download interrotto dall'utente.",
+            "error": None,
         }
+    try:
+        safe_rmtree(get_cuda_runtime_dir() + ".staging", retries=2, delay=0.15)
+    except Exception as exc:
+        logger.warning(f"[Models] Pulizia staging CUDA: {exc}")
+    finally:
+        with _lock:
+            _download_tracker.pop(model_id, None)
 
 
 def _resolve_pypi_win_wheel(pkg: str, major_prefix: str) -> tuple[str, int, str]:
@@ -471,6 +490,11 @@ def _download_cuda_worker(cancel_event: threading.Event) -> None:
         _finish_cuda_cancelled(total_mb)
 
     except Exception as exc:
+        if cancel_event.is_set():
+            logger.info(f"[Models] Interruzione CUDA confermata durante eccezione: {exc}")
+            _finish_cuda_cancelled(total_mb)
+            return
+
         err_msg = str(exc)
         logger.error(f"[Models] Errore download librerie CUDA: {err_msg}", exc_info=True)
         with _lock:
@@ -493,6 +517,30 @@ def _download_cuda_worker(cancel_event: threading.Event) -> None:
 
 # ── Endpoints API ─────────────────────────────────────────────────────────────
 
+def _cancel_other_downloads(current_model_id: str) -> None:
+    """Garantisce l'invariante di un solo download attivo alla volta terminando altri download pendenti."""
+    with _lock:
+        active_others = [
+            (mid, _cancel_events.get(mid), _download_threads.get(mid))
+            for mid in list(_download_threads.keys())
+            if mid != current_model_id
+        ]
+        for mid, ev, _ in active_others:
+            ai_models.set_downloading(mid, False)
+            if ev is not None:
+                ev.set()
+            _download_tracker.pop(mid, None)
+            _cancel_events.pop(mid, None)
+
+    for mid, _, th in active_others:
+        if th is not None and th.is_alive():
+            th.join(timeout=0.5)
+        with _lock:
+            th_curr = _download_threads.get(mid)
+            if th_curr is None or not th_curr.is_alive():
+                _download_threads.pop(mid, None)
+
+
 def _status_item(model_id: str, info: Dict[str, Any], is_dl: bool, size_mb: float) -> Dict[str, Any]:
     approx_mb = round(info.get("approx_bytes", 0) / (1024 * 1024), 1)
     tracker = _download_tracker.get(model_id, {
@@ -503,12 +551,22 @@ def _status_item(model_id: str, info: Dict[str, Any], is_dl: bool, size_mb: floa
         "stage": None,
         "error": None,
     })
-    current_status = tracker["status"]
-    if is_dl and current_status != "downloading":
+    current_status = tracker.get("status", "idle")
+    if current_status == "cancelled":
+        current_status = "idle"
+        progress = 0
+        stage = None
+        error = None
+    elif is_dl and current_status != "downloading":
         current_status = "completed"
         progress = 100
+        stage = tracker.get("stage")
+        error = None
     else:
         progress = tracker.get("progress", 0)
+        stage = tracker.get("stage") if current_status == "downloading" else None
+        error = tracker.get("error") if current_status == "error" else None
+
     return {
         **info,
         "downloaded": is_dl,
@@ -517,8 +575,8 @@ def _status_item(model_id: str, info: Dict[str, Any], is_dl: bool, size_mb: floa
         "progress": progress,
         "downloaded_mb": tracker.get("downloaded_mb", size_mb if is_dl else 0.0),
         "total_mb": tracker.get("total_mb", approx_mb),
-        "stage": tracker.get("stage"),
-        "error": tracker.get("error"),
+        "stage": stage,
+        "error": error,
     }
 
 
@@ -596,7 +654,7 @@ def get_download_status(model_id: Optional[str] = None):
             spec = ai_models.resolve(raw_id)
             resolved_id = spec.id if spec else raw_id
             item = _download_tracker.get(resolved_id)
-            if item is None:
+            if item is None or item.get("status") == "cancelled":
                 if resolved_id == ai_models.CUDA_RUNTIME_ID:
                     is_dl, _sys, size_mb = cuda_runtime_status()
                     if is_dl:
@@ -631,7 +689,11 @@ def get_download_status(model_id: Optional[str] = None):
                     "error": None,
                 }
             return {"model_id": resolved_id, **item}
-        return {mid: dict(data) for mid, data in _download_tracker.items()}
+        return {
+            mid: dict(data)
+            for mid, data in _download_tracker.items()
+            if data.get("status") != "cancelled"
+        }
 
 
 class DownloadRequest(BaseModel):
@@ -644,6 +706,7 @@ def download_model(payload: DownloadRequest):
     """
     Avvia il download in background del modello o componente specificato con monitoraggio dei byte.
     Risponde IMMEDIATAMENTE (in ~50ms) per evitare timeout su WebKit/Tauri.
+    Garantisce l'invariante di un solo download attivo per volta terminando altri download pendenti.
     """
     requested = payload.model_id.strip()
     if requested == ai_models.MOCK_WHISPER_ID:
@@ -655,19 +718,36 @@ def download_model(payload: DownloadRequest):
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="L'accelerazione GPU NVIDIA (CUDA) è disponibile solo su Windows con GPU NVIDIA rilevata.",
             )
+        is_cuda_dl, is_sys_cuda, _ = cuda_runtime_status()
+        if is_cuda_dl:
+            return {
+                "status": "completed",
+                "model": requested,
+                "model_id": requested,
+                "progress": 100,
+                "system_installed": is_sys_cuda,
+                "message": "Librerie CUDA già presenti sul computer.",
+            }
         model_id = ai_models.CUDA_RUNTIME_ID
+
+        # Garantisce l'interruzione di altri download attivi
+        _cancel_other_downloads(model_id)
+
         with _lock:
             thread = _download_threads.get(model_id)
             if thread is not None and thread.is_alive():
-                current = _download_tracker.get(model_id, {})
-                return {
-                    "status": "downloading",
-                    "model": model_id,
-                    "model_id": model_id,
-                    "progress": current.get("progress", 1),
-                    "downloaded_mb": current.get("downloaded_mb", 0.0),
-                    "total_mb": current.get("total_mb", 0.0),
-                }
+                ev = _cancel_events.get(model_id)
+                if ev is None or not ev.is_set():
+                    current = _download_tracker.get(model_id, {})
+                    return {
+                        "status": "downloading",
+                        "model": model_id,
+                        "model_id": model_id,
+                        "progress": current.get("progress", 1),
+                        "downloaded_mb": current.get("downloaded_mb", 0.0),
+                        "total_mb": current.get("total_mb", 0.0),
+                    }
+                thread.join(timeout=0.8)
 
             approx_b = ai_models.CUDA_RUNTIME_APPROX_BYTES
             approx_mb = round(approx_b / (1024 * 1024), 1)
@@ -709,18 +789,31 @@ def download_model(payload: DownloadRequest):
     model_id = spec.id
     repo_id = spec.repo_id
 
+    # Garantisce l'interruzione di altri download attivi per evitare contese di rete o di lock cache
+    _cancel_other_downloads(model_id)
+
     with _lock:
         thread = _download_threads.get(model_id)
         if thread is not None and thread.is_alive():
-            current = _download_tracker.get(model_id, {})
-            return {
-                "status": "downloading",
-                "model": model_id,
-                "model_id": model_id,
-                "progress": current.get("progress", 1),
-                "downloaded_mb": current.get("downloaded_mb", 0.0),
-                "total_mb": current.get("total_mb", 0.0),
-            }
+            ev = _cancel_events.get(model_id)
+            if ev is None or not ev.is_set():
+                current = _download_tracker.get(model_id, {})
+                return {
+                    "status": "downloading",
+                    "model": model_id,
+                    "model_id": model_id,
+                    "progress": current.get("progress", 1),
+                    "downloaded_mb": current.get("downloaded_mb", 0.0),
+                    "total_mb": current.get("total_mb", 0.0),
+                }
+            thread.join(timeout=0.8)
+
+        # Rimuovi eventuali file di lock residui per questo repository
+        try:
+            locks_root = os.path.join(hf_cache_dir(), ".locks")
+            safe_rmtree(os.path.join(locks_root, "models--" + repo_id.replace("/", "--")), retries=1)
+        except Exception:
+            pass
 
         approx_b = spec.variant.approx_bytes or (580 * 1024 * 1024)
         approx_mb = round(approx_b / (1024 * 1024), 1)
@@ -765,7 +858,7 @@ class CancelDownloadRequest(BaseModel):
 def cancel_download(payload: Optional[CancelDownloadRequest] = None):
     """
     Interrompe il download in corso del modello indicato (model_id obbligatorio; "all" = tutti i download
-    in corso). I file parziali vengono rimossi dal worker stesso al termine dell'interruzione.
+    in corso). Risponde rapidamente rilasciando subito lo stato in memoria e avviando la pulizia su disco.
     """
     target = (payload.model_id or "").strip() if payload else ""
     if not target:
@@ -776,21 +869,43 @@ def cancel_download(payload: Optional[CancelDownloadRequest] = None):
 
     with _lock:
         if target == "all":
-            ids = list(_cancel_events.keys())
+            ids = list(set(list(_cancel_events.keys()) + list(_download_threads.keys()) + list(_download_tracker.keys())))
         else:
             spec = ai_models.resolve(target)
             ids = [spec.id if spec else target]
+
+        # 1. Segnala subito a livello applicativo che il modello non è più in download
+        for mid in ids:
+            ai_models.set_downloading(mid, False)
+            if mid in _download_tracker:
+                _download_tracker[mid] = {
+                    "status": "cancelled",
+                    "progress": 0,
+                    "downloaded_mb": 0.0,
+                    "total_mb": _download_tracker[mid].get("total_mb", 0.0),
+                    "stage": "Download interrotto.",
+                    "error": None,
+                }
         events = [(mid, _cancel_events.get(mid), _download_threads.get(mid)) for mid in ids]
 
     cancelled: List[str] = []
     for mid, ev, th in events:
-        if ev is None:
-            continue
-        logger.info(f"[Models] Segnale di interruzione download ricevuto per {mid}.")
-        ev.set()
+        if ev is not None:
+            ev.set()
+        logger.info(f"[Models] Segnale di interruzione download inviato per {mid}.")
         cancelled.append(mid)
         if th is not None and th.is_alive():
-            th.join(timeout=5.0)
+            th.join(timeout=0.6)
+
+    # 2. Rimuove le voci dal tracker per ripristinare immediatamente lo stato idle
+    with _lock:
+        for mid in ids:
+            ai_models.set_downloading(mid, False)
+            _cancel_events.pop(mid, None)
+            _download_tracker.pop(mid, None)
+            th = _download_threads.get(mid)
+            if th is None or not th.is_alive():
+                _download_threads.pop(mid, None)
 
     return {
         "status": "cancelled" if cancelled else "not_downloading",

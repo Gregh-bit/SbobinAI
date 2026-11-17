@@ -1,5 +1,5 @@
 // lib/tauri.ts — Helper sicuri per le API native di Tauri v2 (con fallback browser)
-import { open } from '@tauri-apps/plugin-dialog';
+import { open, save } from '@tauri-apps/plugin-dialog';
 import { isWindows } from './platform';
 
 /** Verifica se l'app è in esecuzione all'interno di Tauri desktop */
@@ -130,5 +130,56 @@ export async function releaseWakeLock(): Promise<boolean> {
 
   return releasedNative;
 }
+
+/**
+ * Salva un file di testo su disco con dialogo nativo in ambiente desktop (Tauri)
+ * o con download blob nel browser.
+ * Restituisce il percorso salvato (o nome file in web), oppure null se l'utente annulla il salvataggio.
+ */
+export async function saveTextFile(
+  defaultFilename: string,
+  content: string,
+  filterName: string = 'Markdown',
+  extension: string = 'md'
+): Promise<string | null> {
+  if (isTauri()) {
+    try {
+      const filePath = await save({
+        defaultPath: defaultFilename,
+        filters: [{ name: filterName, extensions: [extension] }],
+      });
+
+      if (!filePath) {
+        return null;
+      }
+
+      const { invoke } = await import('@tauri-apps/api/core');
+      await invoke('write_text_file', { path: filePath, content });
+      return filePath;
+    } catch (e) {
+      console.error('[Tauri] Errore salvataggio file:', e);
+      return null;
+    }
+  }
+
+  // Fallback Web Browser
+  try {
+    const mimeType = extension === 'txt' ? 'text/plain;charset=utf-8' : 'text/markdown;charset=utf-8';
+    const blob = new Blob([content], { type: mimeType });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = defaultFilename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+    return defaultFilename;
+  } catch (err) {
+    console.error('[Web] Errore download file:', err);
+    return null;
+  }
+}
+
 
 

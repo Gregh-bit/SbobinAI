@@ -309,6 +309,25 @@ def cleanup_orphan_files(db: Session = None) -> Dict[str, Any]:
                 if valid_lecture_ids:
                     lec_str = ", ".join(map(str, valid_lecture_ids))
                     tbl.delete(f"lecture_id > 0 AND lecture_id NOT IN ({lec_str})")
+
+                # Bonifica materiali orfani (lecture_id == 0) per file non più presenti su disco
+                for sid in valid_subject_ids:
+                    folder_name = f"subject_{sid}"
+                    existing_files = set()
+                    for udir in get_all_uploads_directories():
+                        s_dir = os.path.join(udir, folder_name)
+                        if os.path.exists(s_dir):
+                            for f in os.listdir(s_dir):
+                                if not f.endswith(".meta.json"):
+                                    existing_files.add(f)
+                    safe_keep = {f"'{f.replace('\'', '\'\'')}'" for f in existing_files}
+                    safe_keep.add(f"'infocorso-{sid}'")
+                    if safe_keep:
+                        keep_str = ", ".join(safe_keep)
+                        try:
+                            tbl.delete(f"subject_id = {sid} AND lecture_id = 0 AND source_id NOT IN ({keep_str})")
+                        except Exception:
+                            pass
         except Exception as lancedb_clean_err:
             logger.debug(f"[Cleaner] Bonifica vettori orfani LanceDB: {lancedb_clean_err}")
 

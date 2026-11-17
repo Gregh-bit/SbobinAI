@@ -106,12 +106,19 @@ def _register_nvidia_dll_dirs() -> None:
             if os.path.isdir(bin_dir):
                 candidate_dirs.append(bin_dir)
 
-    # 3. CUDA Toolkit di sistema (CUDA_PATH / CUDA_PATH_V12_*)
+    # 3. CUDA Toolkit / cuDNN di sistema (CUDA_PATH, CUDA_PATH_V12_*, CUDNN_PATH)
     for env_key, env_val in os.environ.items():
-        if env_val and (env_key == "CUDA_PATH" or env_key.startswith("CUDA_PATH_V12")):
+        if not env_val:
+            continue
+        if env_key == "CUDA_PATH" or env_key.startswith("CUDA_PATH_V12") or env_key == "CUDNN_PATH":
             bin_dir = os.path.join(env_val, "bin")
             if os.path.isdir(bin_dir):
                 candidate_dirs.append(bin_dir)
+                # cuDNN 9 per Windows spesso mette le DLL in %CUDNN_PATH%\bin\12.x
+                for sub in os.listdir(bin_dir):
+                    sub_path = os.path.join(bin_dir, sub)
+                    if sub.startswith("12.") and os.path.isdir(sub_path):
+                        candidate_dirs.append(sub_path)
 
     added: list[str] = []
     for bin_dir in candidate_dirs:

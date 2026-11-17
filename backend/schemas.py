@@ -5,7 +5,7 @@ Schemi Pydantic per la validazione request/response delle API.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -120,6 +120,166 @@ class MaterialOut(BaseModel):
 class CourseChatRequest(BaseModel):
     query: str
     model_id: Optional[str] = None
+
+
+# ── Citazioni, Sessioni Chat, Quiz & Visualizzazione Materiali ─────────────────
+
+class CitationRef(BaseModel):
+    """Riferimento puntuale a una fonte (slide, pagina, lezione o materiale)."""
+    source_id: str
+    source_type: str  # "slide" | "lecture" | "material"
+    title: str
+    page: Optional[int] = None
+    label: str = ""
+
+
+class ChatScope(BaseModel):
+    """Filtro opzionale per restringere il contesto RAG a specifiche lezioni o materiali."""
+    lecture_ids: list[int] = Field(default_factory=list)
+    material_ids: list[str] = Field(default_factory=list)
+
+
+class ChatStudyAction(BaseModel):
+    """Azione di studio interattiva associata a una risposta dell'assistente."""
+    type: str
+    quiz_id: Optional[int] = None
+    title: Optional[str] = None
+    num_questions: Optional[int] = None
+    question: Optional[str] = None
+    topic: Optional[str] = None
+    lecture_id: Optional[int] = None
+
+
+class ContextStats(BaseModel):
+    """Statistiche sull'occupazione del contesto della sessione chat."""
+    used_tokens: int
+    max_tokens: int
+    percentage: float
+    active_messages_count: int
+    compacted_messages_count: int
+    has_compacted_summary: bool
+    needs_compaction: bool
+
+
+class ChatMessageOut(BaseModel):
+    """Rappresentazione API di un singolo messaggio della sessione chat."""
+    id: int
+    session_id: int
+    role: str
+    content: str
+    thinking: str = ""
+    mode: str = "auto"
+    context_used: str = ""
+    citations: list[CitationRef] = Field(default_factory=list)
+    action: Optional[ChatStudyAction] = None
+    followups: list[str] = Field(default_factory=list)
+    token_estimate: int = 0
+    created_at: datetime
+
+
+class ChatSessionOut(BaseModel):
+    """Metadati principali di una sessione chat persistente."""
+    id: int
+    subject_id: int
+    title: str
+    compacted_summary: str = ""
+    compacted_up_to_message_id: int = 0
+    scope: ChatScope = Field(default_factory=ChatScope)
+    context_stats: Optional[ContextStats] = None
+    message_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+
+class ChatSessionDetailOut(ChatSessionOut):
+    """Dettaglio completo di una sessione chat inclusi i messaggi."""
+    messages: list[ChatMessageOut] = Field(default_factory=list)
+
+
+class ChatSessionCreate(BaseModel):
+    """Payload creazione nuova sessione chat."""
+    title: Optional[str] = "Nuova chat"
+    scope: Optional[ChatScope] = None
+
+
+class ChatSessionUpdate(BaseModel):
+    """Payload aggiornamento titolo o scope della sessione chat."""
+    title: Optional[str] = None
+    scope: Optional[ChatScope] = None
+
+
+class ChatMessageSend(BaseModel):
+    """Payload invio o modifica messaggio chat."""
+    message: str
+    mode: Optional[str] = "auto"
+    scope: Optional[ChatScope] = None
+
+
+ChatStreamRequest = ChatMessageSend
+
+
+class ChatArchiveRequest(BaseModel):
+    """Payload archiviazione sessione chat nel Quaderno."""
+    title: Optional[str] = None
+    mode: Literal["quaderno_and_clear", "quaderno_keep", "quaderno_only"] = "quaderno_and_clear"
+
+
+class ChatArchiveResponse(BaseModel):
+    """Risposta archiviazione sessione chat nel Quaderno."""
+    lecture_id: int
+    title: str
+    session: ChatSessionDetailOut
+
+
+class ChatSaveNoteRequest(BaseModel):
+    """Payload salvataggio di un singolo messaggio come nota."""
+    message_id: int
+    title: Optional[str] = None
+
+
+class LegacyChatMessageIn(BaseModel):
+    """Messaggio legacy da importare in una nuova sessione."""
+    role: str
+    content: str
+    thinking: str = ""
+    context_used: str = ""
+
+
+class LegacyChatImportRequest(BaseModel):
+    """Payload importazione storico chat legacy."""
+    title: Optional[str] = "Chat precedente"
+    messages: list[LegacyChatMessageIn]
+
+
+class QuizSetQuestion(BaseModel):
+    """Singola domanda a risposta multipla di un QuizSet."""
+    question: str
+    options: list[str]
+    correct_index: int
+    explanation: str = ""
+
+
+class QuizSetOut(BaseModel):
+    """Set di quiz di verifica restituito dall'API."""
+    id: int
+    subject_id: int
+    chat_session_id: Optional[int] = None
+    title: str
+    source_label: str = ""
+    questions: list[QuizSetQuestion] = Field(default_factory=list)
+    created_at: datetime
+
+
+class MaterialPageOut(BaseModel):
+    """Contenuto renderizzato (immagine o testo) di una singola pagina/slide."""
+    filename: str
+    page: int
+    page_count: int
+    kind: str
+    image_data_url: Optional[str] = None
+    text: str = ""
+    title: str = ""
+
 
 
 

@@ -1,24 +1,60 @@
 // components/QuizRipassoView.tsx — Sezione Quiz & Ripasso Accademico (Wizard a Schermate + Kill Processo IA)
-import { useState, useRef, useEffect, useMemo } from 'react';
+import { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { motion, AnimatePresence, type Variants } from 'framer-motion';
 import { 
   HelpCircle, Mic, CheckCircle2, XCircle, ArrowRight, 
   RotateCcw, AlertCircle, Loader2, 
   BookOpen, Award, ArrowLeft, RefreshCw,
-  Settings, Cpu, Check, StopCircle, ShieldAlert
+  Settings, Check, StopCircle, Sparkles
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import { api } from '../lib/api';
 import { useSettings } from '../lib/SettingsContext';
-import type { Lecture, ModelsStatusResponse, OralEvaluationResult, QuizQuestion, Subject } from '../types';
+import type {
+  Lecture,
+  ModelsStatusResponse,
+  OralEvaluationResult,
+  QuizQuestion,
+  QuizSetOut,
+  Subject,
+} from '../types';
+
+export interface OralQuestionTarget {
+  question: string;
+  topic?: string;
+  key: number;
+}
 
 interface Props {
   subject: Subject;
   lectures?: Lecture[];
   onOpenSettings?: () => void;
+  initialQuizId?: number | null;
+  onClearInitialQuiz?: () => void;
+  initialOralQuestion?: OralQuestionTarget | null;
+  onClearInitialOralQuestion?: () => void;
 }
 
-export default function QuizRipassoView({ subject, lectures = [], onOpenSettings }: Props) {
+function mapQuizSetToQuestions(quizSet: QuizSetOut): QuizQuestion[] {
+  return quizSet.questions.map((q, idx) => ({
+    id: `saved-${quizSet.id}-${idx}`,
+    question: q.question,
+    options: q.options,
+    correct_index: q.correct_index,
+    explanation: q.explanation,
+    source_lecture: quizSet.source_label || quizSet.title,
+  }));
+}
+
+export default function QuizRipassoView({
+  subject,
+  lectures = [],
+  onOpenSettings,
+  initialQuizId,
+  onClearInitialQuiz,
+  initialOralQuestion,
+  onClearInitialOralQuestion,
+}: Props) {
   const { settings } = useSettings();
 
   // ── 0. Verifica Reale Disponibilità Modello LLM ──────────────────────────────
@@ -79,8 +115,18 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
   const [selectedOpt, setSelectedOpt] = useState<number | null>(null);
   const [score, setScore] = useState(0);
   const [isGeneratingQuiz, setIsGeneratingQuiz] = useState(false);
+  const [isLoadingSavedQuiz, setIsLoadingSavedQuiz] = useState(false);
   const [quizError, setQuizError] = useState<string | null>(null);
   const [isQuizCompleted, setIsQuizCompleted] = useState(false);
+  const [activeQuizMeta, setActiveQuizMeta] = useState<{
+    id?: number;
+    title: string;
+    source_label?: string;
+  } | null>(null);
+
+  // ── Quiz salvati dall'Assistente / Recenti ──────────────────────────────────
+  const [savedQuizSets, setSavedQuizSets] = useState<QuizSetOut[]>([]);
+  const [loadingSavedQuizzes, setLoadingSavedQuizzes] = useState(false);
 
   // ── Stato Orale ────────────────────────────────────────────────────────────
   const [oralQuestion, setOralQuestion] = useState<string>('');
@@ -95,9 +141,110 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const timerIntervalRef = useRef<any>(null);
+  const killNoticeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isMountedRef = useRef(true);
+  const lastOralKeyRef = useRef<number | null>(null);
 
   // Modello LLM configurato
   const llmModelId = settings.llmModel || settings.ollamaModel || undefined;
+
+  const applySavedQuizSet = useCallback((quizSet: QuizSetOut) => {
+    const mapped = mapQuizSetToQuestions(quizSet);
+    setActiveQuizMeta({
+      id: quizSet.id,
+      title: quizSet.title,
+      source_label: quizSet.source_label,
+    });
+    setQuestions(mapped);
+    setCurrentIdx(0);
+    setSelectedOpt(null);
+    setScore(0);
+    setIsQuizCompleted(false);
+    setIsGeneratingQuiz(false);
+    setIsLoadingSavedQuiz(false);
+    setQuizError(mapped.length === 0 ? 'Questo quiz salvato non contiene domande.' : null);
+    setWizardStep(2);
+    setActiveMode('quiz');
+  }, []);
+
+  // Carica elenco quiz salvati per il corso
+  useEffect(() => {
+    let cancelled = false;
+    setLoadingSavedQuizzes(true);
+    api.study
+      .listQuizSets(subject.id)
+      .then((list) => {
+        if (!cancelled) setSavedQuizSets(list);
+      })
+      .catch((err) => {
+        console.warn('[Quiz] Caricamento quiz salvati fallito:', err);
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingSavedQuizzes(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [subject.id]);
+
+  // Deep-link: carica quiz salvato dall'Assistente
+  useEffect(() => {
+    if (initialQuizId == null) return;
+    let cancelled = false;
+
+    setWizardStep(2);
+    setActiveMode('quiz');
+    setIsLoadingSavedQuiz(true);
+    setIsGeneratingQuiz(false);
+    setQuizError(null);
+    setActiveQuizMeta(null);
+    setQuestions([]);
+    setCurrentIdx(0);
+    setSelectedOpt(null);
+    setScore(0);
+    setIsQuizCompleted(false);
+
+    api.study
+      .getQuizSet(initialQuizId)
+      .then((quizSet) => {
+        if (cancelled) return;
+        applySavedQuizSet(quizSet);
+        setSavedQuizSets((prev) =>
+          prev.some((q) => q.id === quizSet.id) ? prev : [quizSet, ...prev]
+        );
+        onClearInitialQuiz?.();
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setIsLoadingSavedQuiz(false);
+        setQuizError(
+          err instanceof Error
+            ? err.message
+            : "Impossibile caricare il quiz salvato dall'Assistente."
+        );
+        onClearInitialQuiz?.();
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [initialQuizId, applySavedQuizSet, onClearInitialQuiz]);
+
+  // Deep-link: avvia simulazione orale con domanda proposta dall'Assistente
+  useEffect(() => {
+    if (!initialOralQuestion || lastOralKeyRef.current === initialOralQuestion.key) return;
+    lastOralKeyRef.current = initialOralQuestion.key;
+
+    setWizardStep(2);
+    setActiveMode('oral');
+    setOralQuestion(initialOralQuestion.question);
+    setOralTopic(initialOralQuestion.topic || subject.name);
+    setOralResult(null);
+    setOralError(null);
+    setIsGeneratingOralQ(false);
+    setIsEvaluatingOral(false);
+    onClearInitialOralQuestion?.();
+  }, [initialOralQuestion, subject.name, onClearInitialOralQuestion]);
 
   // Pre-seleziona tutte le lezioni al primo caricamento
   useEffect(() => {
@@ -111,19 +258,51 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
     return valid.length > 0 ? valid : undefined;
   };
 
+  const cancelVoiceRecording = useCallback(() => {
+    if (timerIntervalRef.current) {
+      clearInterval(timerIntervalRef.current);
+      timerIntervalRef.current = null;
+    }
+    setIsRecordingAnswer(false);
+    if (mediaRecorderRef.current) {
+      try {
+        mediaRecorderRef.current.onstop = null;
+        mediaRecorderRef.current.onerror = null;
+        mediaRecorderRef.current.ondataavailable = null;
+        if (mediaRecorderRef.current.state !== 'inactive') {
+          mediaRecorderRef.current.stop();
+        }
+        mediaRecorderRef.current.stream.getTracks().forEach((t) => t.stop());
+      } catch {}
+      mediaRecorderRef.current = null;
+    }
+    audioChunksRef.current = [];
+  }, []);
+
   // Cleanup globale al dismount
   useEffect(() => {
+    isMountedRef.current = true;
     return () => {
-      if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
+      isMountedRef.current = false;
+      if (killNoticeTimeoutRef.current) {
+        clearTimeout(killNoticeTimeoutRef.current);
+        killNoticeTimeoutRef.current = null;
+      }
+      if (timerIntervalRef.current) {
+        clearInterval(timerIntervalRef.current);
+        timerIntervalRef.current = null;
+      }
       if (mediaRecorderRef.current) {
         try {
           mediaRecorderRef.current.onstop = null;
+          mediaRecorderRef.current.onerror = null;
           mediaRecorderRef.current.ondataavailable = null;
           if (mediaRecorderRef.current.state !== 'inactive') {
             mediaRecorderRef.current.stop();
           }
           mediaRecorderRef.current.stream.getTracks().forEach((t) => t.stop());
         } catch {}
+        mediaRecorderRef.current = null;
       }
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
@@ -151,10 +330,12 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
     // 1. Reset IMMEDIATO e sincrono di tutta la UI per evitare qualsiasi flash di schermate intermedie
     setActiveMode('none');
     setIsGeneratingQuiz(false);
+    setIsLoadingSavedQuiz(false);
     setIsGeneratingOralQ(false);
     setIsEvaluatingOral(false);
     setIsRecordingAnswer(false);
     setIsQuizCompleted(false);
+    setActiveQuizMeta(null);
     setQuestions([]);
     setCurrentIdx(0);
     setSelectedOpt(null);
@@ -165,21 +346,8 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
     setOralError(null);
     setIsKillingProcess(true);
 
-    // 2. Ferma microfono se in ascolto e timer all'istante
-    if (timerIntervalRef.current) {
-      clearInterval(timerIntervalRef.current);
-      timerIntervalRef.current = null;
-    }
-    if (mediaRecorderRef.current) {
-      try {
-        mediaRecorderRef.current.onstop = null;
-        if (mediaRecorderRef.current.state === 'recording') {
-          mediaRecorderRef.current.stop();
-        }
-        mediaRecorderRef.current.stream.getTracks().forEach((t) => t.stop());
-      } catch {}
-      mediaRecorderRef.current = null;
-    }
+    // 2. Ferma microfono se in ascolto e timer all'istante (senza scatenare onstop)
+    cancelVoiceRecording();
 
     // 3. Abort controller immediato sul client
     if (abortControllerRef.current) {
@@ -192,10 +360,17 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
     // 4. Chiamata al backend per stoppare l'inferenza e liberare cache Metal/GPU
     try {
       await api.study.abort(subject.id).catch(() => {});
+      if (!isMountedRef.current) return;
+      if (killNoticeTimeoutRef.current) {
+        clearTimeout(killNoticeTimeoutRef.current);
+      }
       setKillNotice('Processo IA interrotto e cache Metal liberata.');
-      setTimeout(() => setKillNotice(null), 3000);
+      killNoticeTimeoutRef.current = setTimeout(() => {
+        if (isMountedRef.current) setKillNotice(null);
+        killNoticeTimeoutRef.current = null;
+      }, 3000);
     } finally {
-      setIsKillingProcess(false);
+      if (isMountedRef.current) setIsKillingProcess(false);
     }
   };
 
@@ -208,6 +383,8 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
 
   const executeQuizGeneration = async () => {
     setIsGeneratingQuiz(true);
+    setIsLoadingSavedQuiz(false);
+    setActiveQuizMeta(null);
     setQuizError(null);
     const controller = new AbortController();
     abortControllerRef.current = controller;
@@ -390,24 +567,23 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
 
   // ═════════════════════════════════════════════════════════════════════════════
   // SCHERMATA 0: Rilevamento LLM Mancante (SOLO SE NESSUN LLM INSTALLATO)
-  // Non si può procedere al passo 1 senza LLM.
+  // Non blocca l'esecuzione di quiz salvati già generati in precedenza.
   // ═════════════════════════════════════════════════════════════════════════════
-  if (!checkingModels && !hasInstalledLLM) {
+  if (
+    !checkingModels &&
+    !hasInstalledLLM &&
+    activeMode === 'none' &&
+    savedQuizSets.length === 0 &&
+    !isLoadingSavedQuiz &&
+    initialQuizId == null &&
+    !initialOralQuestion
+  ) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center p-6 sm:p-12 select-none relative bg-black/20">
         <div className="max-w-md w-full p-8 rounded-3xl liquid-glass border border-white/[0.12] shadow-[0_24px_60px_rgba(0,0,0,0.6)] text-center space-y-6 animate-scale-in">
-          {/* Glowing Icon */}
-          <div className="w-16 h-16 rounded-3xl bg-amber-500/15 border border-amber-500/30 flex items-center justify-center text-amber-300 mx-auto shadow-[0_0_30px_rgba(245,158,11,0.25)]">
-            <Cpu size={32} strokeWidth={1.75} />
-          </div>
-
           <div className="space-y-2">
-            <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-500/15 border border-amber-500/30 text-[11px] font-mono text-amber-300">
-              <ShieldAlert size={12} />
-              <span>Modello LLM Richiesto</span>
-            </div>
             <h2 className="text-xl font-bold tracking-tight text-white/95">
-              Installa un LLM per il Ripasso
+              Installa un modello per continuare
             </h2>
             <p className="text-xs text-white/50 leading-relaxed max-w-sm mx-auto">
               Per generare quiz universitari e simulare interrogazioni vocali d'esame è necessario aver installato almeno un modello linguistico locale in memoria.
@@ -431,14 +607,10 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
               className="w-full py-3.5 px-5 rounded-2xl bg-white/[0.14] hover:bg-white/[0.22] active:scale-95 text-xs font-semibold text-white border border-white/[0.20] shadow-liquid-md transition-all flex items-center justify-center gap-2 cursor-pointer group"
             >
               <Settings size={15} className="text-amber-300 group-hover:rotate-45 transition-transform" />
-              <span>Apri Impostazioni per Scaricare il Modello</span>
+              <span>Vai alle impostazioni e scarica un modello</span>
               <ArrowRight size={14} className="group-hover:translate-x-1 transition-transform" />
             </button>
           )}
-
-          <p className="text-[11px] text-white/40 font-sans">
-            Il wizard si sbloccherà automaticamente non appena il modello risulterà installato.
-          </p>
         </div>
       </div>
     );
@@ -643,6 +815,64 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
                   </button>
                 </div>
               </div>
+
+              {/* Quiz salvati dall'Assistente / Recenti */}
+              {(loadingSavedQuizzes || savedQuizSets.length > 0) && (
+                <div className="w-full max-w-xl mt-5">
+                  <div className="p-4 rounded-3xl liquid-glass border border-white/[0.09] space-y-3">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Sparkles size={13} className="text-blue-400" />
+                        <span className="text-xs font-semibold text-white/85">
+                          Quiz salvati dall&apos;Assistente / Recenti
+                        </span>
+                      </div>
+                      {savedQuizSets.length > 0 && (
+                        <span className="px-2 py-0.5 rounded-full bg-white/[0.07] text-[10px] font-mono text-white/55">
+                          {savedQuizSets.length}
+                        </span>
+                      )}
+                    </div>
+
+                    {loadingSavedQuizzes ? (
+                      <div className="flex items-center gap-2 text-[11px] text-white/40 py-2">
+                        <Loader2 size={12} className="animate-spin" />
+                        <span>Caricamento quiz salvati...</span>
+                      </div>
+                    ) : (
+                      <div className="space-y-1.5 max-h-40 overflow-y-auto pr-1">
+                        {savedQuizSets.map((qs) => (
+                          <button
+                            key={qs.id}
+                            type="button"
+                            onClick={() => applySavedQuizSet(qs)}
+                            className="w-full p-2.5 px-3 rounded-2xl bg-white/[0.03] hover:bg-white/[0.08] border border-white/[0.06] hover:border-blue-400/30 transition-all flex items-center justify-between gap-3 text-left group cursor-pointer"
+                          >
+                            <div className="min-w-0 flex-1">
+                              <div className="text-xs font-medium text-white/90 truncate group-hover:text-white">
+                                {qs.title || 'Quiz salvato'}
+                              </div>
+                              <div className="text-[10px] font-mono text-white/40 truncate mt-0.5">
+                                {qs.source_label ? `${qs.source_label} · ` : ''}
+                                {qs.questions.length} {qs.questions.length === 1 ? 'domanda' : 'domande'}
+                                {' · '}
+                                {new Date(qs.created_at).toLocaleDateString('it-IT', {
+                                  day: 'numeric',
+                                  month: 'short',
+                                })}
+                              </div>
+                            </div>
+                            <ArrowRight
+                              size={13}
+                              className="text-white/35 group-hover:text-blue-300 group-hover:translate-x-0.5 transition-all flex-shrink-0"
+                            />
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
             </motion.div>
           ) : (
             <motion.div
@@ -745,7 +975,7 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
                         /* Contenuto Attivo Quiz (Espanso nella Card) */
                         <div className="w-full flex flex-col space-y-5 animate-fade-in">
                           {/* Top Navigation Bar con Tasto Esci */}
-                          <div className="flex items-center justify-between pb-3 border-b border-white/[0.08]">
+                          <div className="flex items-center justify-between pb-3 border-b border-white/[0.08] gap-3">
                             <button
                               type="button"
                               onClick={() => {
@@ -753,6 +983,9 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
                                   handleKillAIProcess();
                                 } else {
                                   setActiveMode('none');
+                                  setIsLoadingSavedQuiz(false);
+                                  setActiveQuizMeta(null);
+                                  setQuizError(null);
                                   setQuestions([]);
                                   setCurrentIdx(0);
                                   setSelectedOpt(null);
@@ -766,7 +999,7 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
                               <span>Torna alla Selezione Modalità</span>
                             </button>
 
-                            {!isGeneratingQuiz && questions.length > 0 && !isQuizCompleted && (
+                            {!isGeneratingQuiz && !isLoadingSavedQuiz && questions.length > 0 && !isQuizCompleted && (
                               <div className="flex items-center gap-3 text-xs font-mono text-white/50">
                                 <span>Domanda {currentIdx + 1} di {questions.length}</span>
                                 <span>·</span>
@@ -775,8 +1008,32 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
                             )}
                           </div>
 
-                          {/* STATO 1: Generazione Quiz in corso con Tasto Kill Processo */}
-                          {isGeneratingQuiz ? (
+                          {/* Banner titolo / fonte quando è attivo un quiz salvato */}
+                          {activeQuizMeta && !isLoadingSavedQuiz && !quizError && (
+                            <div className="px-3.5 py-2 rounded-2xl bg-blue-500/[0.08] border border-blue-400/20 flex items-center justify-between gap-2 text-xs">
+                              <div className="flex items-center gap-2 min-w-0">
+                                <Sparkles size={13} className="text-blue-300 flex-shrink-0" />
+                                <span className="font-semibold text-white/90 truncate">
+                                  {activeQuizMeta.title}
+                                </span>
+                              </div>
+                              {activeQuizMeta.source_label && (
+                                <span className="text-[10px] font-mono text-blue-200/80 px-2 py-0.5 rounded-full bg-blue-500/15 border border-blue-400/25 flex-shrink-0 truncate max-w-[200px]">
+                                  {activeQuizMeta.source_label}
+                                </span>
+                              )}
+                            </div>
+                          )}
+
+                          {/* STATO 0: Caricamento Quiz salvato dall'Assistente */}
+                          {isLoadingSavedQuiz ? (
+                            <div className="p-8 rounded-2xl bg-white/[0.02] border border-white/[0.06] text-center space-y-3">
+                              <Loader2 size={26} className="animate-spin text-blue-400 mx-auto" />
+                              <p className="text-xs text-white/60 font-medium">
+                                Caricamento quiz salvato...
+                              </p>
+                            </div>
+                          ) : isGeneratingQuiz ? (
                             <div className="p-6 sm:p-8 rounded-2xl bg-white/[0.02] border border-white/[0.06] text-center space-y-6">
                               <div className="w-16 h-16 rounded-full bg-blue-500/10 border border-blue-500/30 flex items-center justify-center text-blue-400 mx-auto shadow-[0_0_30px_rgba(59,130,246,0.2)]">
                                 <Loader2 size={30} className="animate-spin text-blue-400" />
@@ -825,7 +1082,11 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
                               <div className="flex items-center justify-center gap-3">
                                 <button
                                   type="button"
-                                  onClick={() => setActiveMode('none')}
+                                  onClick={() => {
+                                    setActiveMode('none');
+                                    setQuizError(null);
+                                    setActiveQuizMeta(null);
+                                  }}
                                   className="px-4 py-2 rounded-xl liquid-glass hover:bg-white/[0.10] text-xs font-medium text-white/80 border border-white/[0.12] cursor-pointer"
                                 >
                                   Torna al Menu
@@ -995,7 +1256,7 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
                                 if (isGeneratingOralQ || isEvaluatingOral) {
                                   handleKillAIProcess();
                                 } else {
-                                  handleStopVoiceRecording();
+                                  cancelVoiceRecording();
                                   setActiveMode('none');
                                   setOralQuestion('');
                                   setOralResult(null);
@@ -1135,6 +1396,12 @@ export default function QuizRipassoView({ subject, lectures = [], onOpenSettings
                             {/* Scheda Risultato Valutazione Orale */}
                             {oralResult && (
                               <div className="pt-4 border-t border-white/[0.08] space-y-4 text-left animate-slide-up">
+                                {oralResult.warning && (
+                                  <div className="p-3 rounded-2xl bg-amber-500/10 border border-amber-500/25 text-xs text-amber-200 flex items-start gap-2">
+                                    <AlertCircle size={14} className="text-amber-400 flex-shrink-0 mt-0.5" />
+                                    <span>{oralResult.warning}</span>
+                                  </div>
+                                )}
                                 {/* Riga Voto */}
                                 <div className="flex items-center justify-between p-4 rounded-2xl bg-white/[0.04] border border-white/[0.10]">
                                   <div>

@@ -9,7 +9,7 @@ interface UpdateHandle {
   downloadAndInstall: (cb?: (e: any) => void) => Promise<void>;
 }
 
-// Stato condiviso tra banner e impostazioni
+// Stato condiviso tra impostazioni e boot
 interface State {
   status: UpdaterStatus;
   version: string | null;
@@ -18,9 +18,8 @@ interface State {
   currentVersion: string;
 }
 
-let state: State = { status: 'idle', version: null, progress: 0, error: null, currentVersion: '0.0.15' };
+let state: State = { status: 'idle', version: null, progress: 0, error: null, currentVersion: '0.0.16' };
 let handle: UpdateHandle | null = null;
-let startupDone = false;
 let versionFetched = false;
 const listeners = new Set<() => void>();
 
@@ -131,7 +130,12 @@ export async function checkAndAutoInstall(
   try {
     onProgress?.({ status: 'checking' });
     const { check } = await import('@tauri-apps/plugin-updater');
-    const update = await check();
+
+    // Timeout di 3.5s per evitare blocchi prolungati all'avvio in caso di connessione assente o lenta
+    const checkPromise = check();
+    const timeoutPromise = new Promise<null>((resolve) => setTimeout(() => resolve(null), 3500));
+    const update = await Promise.race([checkPromise, timeoutPromise]);
+
     if (!update) {
       onProgress?.({ status: 'uptodate' });
       return false;
@@ -173,7 +177,7 @@ export async function checkAndAutoInstall(
   }
 }
 
-export function useUpdater(opts: { autoCheck?: boolean } = {}) {
+export function useUpdater() {
   const [, force] = useState(0);
   useEffect(() => {
     void fetchCurrentVersion();
@@ -183,15 +187,6 @@ export function useUpdater(opts: { autoCheck?: boolean } = {}) {
       listeners.delete(l);
     };
   }, []);
-
-  useEffect(() => {
-    if (!opts.autoCheck || startupDone || !isTauri()) return;
-    startupDone = true;
-    const t = setTimeout(() => {
-      void runCheck(true);
-    }, 3000);
-    return () => clearTimeout(t);
-  }, [opts.autoCheck]);
 
   const checkNow = useCallback(() => runCheck(false), []);
   const install = useCallback(() => runInstall(), []);

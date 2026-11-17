@@ -110,6 +110,8 @@ def update_settings(payload: SettingsUpdateRequest):
     with SETTINGS_LOCK:
         current = load_settings()
         current.update(data)
+        # Formato standard unico audio: M4A salva-spazio AAC
+        current["audio_format"] = "m4a"
         # Se un modello Whisper reale è fisicamente presente su disco, models_downloaded deve rimanere True
         _normalize_whisper_state(current)
         saved = save_settings(current)

@@ -58,7 +58,19 @@ _table_lock = threading.Lock()
 TABLE_NAME = "course_chunks"
 
 _SCHEMA = None
-_RESULT_COLUMNS = ["id", "subject_id", "lecture_id", "source_type", "source_id", "title", "text", "created_at"]
+_RESULT_COLUMNS = [
+    "id",
+    "subject_id",
+    "lecture_id",
+    "source_type",
+    "source_id",
+    "title",
+    "text",
+    "page_start",
+    "page_end",
+    "chunk_label",
+    "created_at",
+]
 
 
 def _get_schema():
@@ -71,10 +83,13 @@ def _get_schema():
             pa.field("vector", pa.list_(pa.float32(), EMBEDDING_DIM)),
             pa.field("subject_id", pa.int32()),
             pa.field("lecture_id", pa.int32()),  # 0 se materiale generico
-            pa.field("source_type", pa.string()),  # 'lecture', 'material', 'notes', 'infocorso'
+            pa.field("source_type", pa.string()),  # 'lecture', 'slide', 'material', 'notes', 'infocorso'
             pa.field("source_id", pa.string()),
             pa.field("title", pa.string()),
             pa.field("text", pa.string()),
+            pa.field("page_start", pa.int32()),
+            pa.field("page_end", pa.int32()),
+            pa.field("chunk_label", pa.string()),
             pa.field("created_at", pa.float64()),
         ])
     return _SCHEMA
@@ -124,6 +139,44 @@ def reset_connection() -> None:
         _query_vector_cache.clear()
 
 
+def _migrate_table_schema_if_needed(db_conn: Any, tbl: Any) -> Any:
+    """Aggiunge le colonne di citazione pagina/slide alle tabelle LanceDB esistenti."""
+    col_defaults = {
+        "page_start": ("cast(0 as int)", 0),
+        "page_end": ("cast(0 as int)", 0),
+        "chunk_label": ("cast('' as string)", ""),
+    }
+    try:
+        existing_names = set(tbl.schema.names)
+    except Exception:
+        return tbl
+
+    missing = [col for col in col_defaults if col not in existing_names]
+    if not missing:
+        return tbl
+
+    transforms = {col: col_defaults[col][0] for col in missing}
+    try:
+        tbl.add_columns(transforms)
+        logger.info(f"[RAG] Migrate colonne LanceDB mancanti: {missing}")
+        return tbl
+    except Exception as exc:
+        logger.warning(f"[RAG] add_columns fallito ({exc}); ricreazione tabella con righe preservate.")
+        try:
+            rows = tbl.to_arrow().to_pylist()
+            for row in rows:
+                for col, (_, default_val) in col_defaults.items():
+                    row.setdefault(col, default_val)
+            db_conn.drop_table(TABLE_NAME)
+            new_tbl = db_conn.create_table(TABLE_NAME, schema=_get_schema(), mode="create")
+            if rows:
+                new_tbl.add(rows)
+            return new_tbl
+        except Exception as rec_exc:
+            logger.warning(f"[RAG] Fallback migrazione schema tabella fallito: {rec_exc}")
+            return tbl
+
+
 def get_lancedb_table():
     """
     Ottiene o crea la tabella LanceDB per i chunk del corso.
@@ -157,7 +210,7 @@ def get_lancedb_table():
                 return _db_conn.create_table(TABLE_NAME, schema=_get_schema(), mode="create")
         except Exception as exc:
             logger.debug(f"[RAG] Controllo schema tabella: {exc}")
-        return tbl
+        return _migrate_table_schema_if_needed(_db_conn, tbl)
 
 
 def _load_portable_embedder(model_path: str) -> Any:
@@ -393,6 +446,38 @@ def _embed_or_explain(chunks: List[str], what: str) -> Optional[np.ndarray]:
     return vectors
 
 
+def _build_chunk_record(
+    *,
+    record_id: str,
+    vector: Any,
+    subject_id: int,
+    lecture_id: int,
+    source_type: str,
+    source_id: str,
+    title: str,
+    text: str,
+    created_at: float,
+    page_start: int = 0,
+    page_end: int = 0,
+    chunk_label: str = "",
+) -> Dict[str, Any]:
+    """Costruisce un record LanceDB conforme allo schema corrente."""
+    return {
+        "id": record_id,
+        "vector": vector,
+        "subject_id": int(subject_id),
+        "lecture_id": int(lecture_id),
+        "source_type": source_type,
+        "source_id": source_id,
+        "title": title,
+        "text": text,
+        "page_start": int(page_start),
+        "page_end": int(page_end),
+        "chunk_label": chunk_label,
+        "created_at": created_at,
+    }
+
+
 def index_lecture(
     subject_id: int,
     lecture_id: int,
@@ -412,7 +497,10 @@ def index_lecture(
     if notes:
         full_body += f"Appunti e schema del Quaderno:\n{notes}\n\n"
     if transcript:
-        full_body += f"Trascrizione spiegazione docente:\n{transcript}"
+        from transcript_cleaner import clean_transcript_for_llm
+        cleaned = clean_transcript_for_llm(transcript)
+        if cleaned:
+            full_body += f"Trascrizione spiegazione docente:\n{cleaned}"
 
     chunks = chunk_text(full_body, chunk_size=240, overlap=40)
     if not chunks:
@@ -425,17 +513,17 @@ def index_lecture(
 
         now = time.time()
         records = [
-            {
-                "id": f"lec-{lecture_id}-{idx}-{uuid.uuid4().hex[:6]}",
-                "vector": vectors[idx],
-                "subject_id": int(subject_id),
-                "lecture_id": int(lecture_id),
-                "source_type": "lecture",
-                "source_id": f"lecture_{lecture_id}",
-                "title": title or f"Lezione {lecture_id}",
-                "text": ch,
-                "created_at": now,
-            }
+            _build_chunk_record(
+                record_id=f"lec-{lecture_id}-{idx}-{uuid.uuid4().hex[:6]}",
+                vector=vectors[idx],
+                subject_id=subject_id,
+                lecture_id=lecture_id,
+                source_type="lecture",
+                source_id=f"lecture_{lecture_id}",
+                title=title or f"Lezione {lecture_id}",
+                text=ch,
+                created_at=now,
+            )
             for idx, ch in enumerate(chunks)
         ]
 
@@ -473,17 +561,17 @@ def index_material_document(
 
         now = time.time()
         records = [
-            {
-                "id": f"mat-{subject_id}-{idx}-{uuid.uuid4().hex[:6]}",
-                "vector": vectors[idx],
-                "subject_id": int(subject_id),
-                "lecture_id": 0,
-                "source_type": source_type,
-                "source_id": material_id,
-                "title": title or material_id,
-                "text": ch,
-                "created_at": now,
-            }
+            _build_chunk_record(
+                record_id=f"mat-{subject_id}-{idx}-{uuid.uuid4().hex[:6]}",
+                vector=vectors[idx],
+                subject_id=subject_id,
+                lecture_id=0,
+                source_type=source_type,
+                source_id=material_id,
+                title=title or material_id,
+                text=ch,
+                created_at=now,
+            )
             for idx, ch in enumerate(chunks)
         ]
 
@@ -494,6 +582,69 @@ def index_material_document(
         return len(records)
     except Exception as exc:
         logger.error(f"[RAG] Errore indicizzazione materiale {material_id}: {exc}")
+        return 0
+    finally:
+        clear_metal_cache()
+
+
+def index_material_pages(
+    subject_id: int,
+    source_id: str,
+    title: str,
+    pages: List[Dict[str, Any]],
+    source_type: str = "slide",
+) -> int:
+    """Indicizza un materiale pagina/slide per pagina conservando i riferimenti per le citazioni."""
+    if not pages:
+        return 0
+
+    chunk_items: List[Tuple[str, int, str]] = []
+    for p in pages:
+        page_num = int(p.get("page") or 0)
+        page_text = str(p.get("text") or "").strip()
+        if not page_text:
+            continue
+        label = str(p.get("label") or "").strip() or (f"Pag. {page_num}" if page_num > 0 else "")
+        for ch in chunk_text(page_text, chunk_size=240, overlap=40):
+            chunk_items.append((ch, page_num, label))
+
+    if not chunk_items:
+        return 0
+
+    try:
+        vectors = _embed_or_explain([item[0] for item in chunk_items], f"materiale '{title or source_id}'")
+        if vectors is None:
+            return 0
+
+        now = time.time()
+        records = [
+            _build_chunk_record(
+                record_id=f"mat-{subject_id}-p{page_num}-{idx}-{uuid.uuid4().hex[:6]}",
+                vector=vectors[idx],
+                subject_id=subject_id,
+                lecture_id=0,
+                source_type=source_type,
+                source_id=source_id,
+                title=title or source_id,
+                text=ch,
+                created_at=now,
+                page_start=page_num,
+                page_end=page_num,
+                chunk_label=label,
+            )
+            for idx, (ch, page_num, label) in enumerate(chunk_items)
+        ]
+
+        tbl = get_lancedb_table()
+        tbl.delete(
+            f"subject_id = {int(subject_id)} AND source_id = {_sql_str(source_id)} "
+            f"AND source_type IN ({_sql_str(source_type)}, 'material', 'slide', 'pdf')"
+        )
+        tbl.add(records)
+        logger.info(f"[RAG] Indicizzati {len(records)} chunk per pagina/slide del materiale '{title or source_id}'.")
+        return len(records)
+    except Exception as exc:
+        logger.error(f"[RAG] Errore indicizzazione pagine materiale {source_id}: {exc}")
         return 0
     finally:
         clear_metal_cache()
@@ -563,26 +714,90 @@ def _query_terms(query: str) -> Tuple[List["re.Pattern[str]"], List[str]]:
     return patterns, acronyms
 
 
-def query_context(
+def _build_scope_where(
+    subject_id: int,
+    scope_lecture_ids: Optional[List[int]],
+    scope_material_ids: Optional[List[str]],
+) -> Tuple[str, set[int], set[str]]:
+    """Costruisce il filtro SQL LanceDB e i set di verifica per lo scope opzionale."""
+    base_where = f"subject_id = {int(subject_id)}"
+    lec_id_set = {int(lid) for lid in (scope_lecture_ids or []) if int(lid) > 0}
+    mat_id_set = {str(mid) for mid in (scope_material_ids or []) if str(mid).strip()}
+    if not lec_id_set and not mat_id_set:
+        return base_where, lec_id_set, mat_id_set
+
+    clauses: List[str] = []
+    if lec_id_set:
+        ids_csv = ", ".join(str(lid) for lid in sorted(lec_id_set))
+        clauses.append(f"lecture_id IN ({ids_csv})")
+    if mat_id_set:
+        mids_csv = ", ".join(_sql_str(mid) for mid in sorted(mat_id_set))
+        clauses.append(f"source_id IN ({mids_csv})")
+    return f"{base_where} AND ({' OR '.join(clauses)})", lec_id_set, mat_id_set
+
+
+def _record_in_scope(r: Dict[str, Any], lec_id_set: set[int], mat_id_set: set[str]) -> bool:
+    """Verifica difensiva che un chunk appartenga allo scope selezionato."""
+    if not lec_id_set and not mat_id_set:
+        return True
+    lec_id = int(r.get("lecture_id") or 0)
+    src_id = str(r.get("source_id") or "")
+    return (lec_id in lec_id_set) or (src_id in mat_id_set)
+
+
+def _format_snippet_and_citation(r: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """Formatta uno snippet RAG con metadati di citazione e il relativo dizionario CitationRef."""
+    source_id = str(r.get("source_id") or "")
+    source_type = str(r.get("source_type") or "material")
+    title = str(r.get("title") or "Appunti del corso")
+    text = str(r.get("text") or "")
+    page_start = int(r.get("page_start") or 0)
+    raw_label = str(r.get("chunk_label") or "").strip()
+
+    if page_start > 0:
+        label_or_page = raw_label or f"Pag. {page_start}"
+        snippet = f"[FONTE: {title} | REF: {source_id}#{page_start} | ETICHETTA: {label_or_page}]\n{text}"
+        citation = {
+            "source_id": source_id,
+            "source_type": source_type,
+            "title": title,
+            "page": page_start,
+            "label": label_or_page,
+        }
+    else:
+        snippet = f"[FONTE: {title} ({source_type})]\n{text}"
+        citation = {
+            "source_id": source_id,
+            "source_type": source_type,
+            "title": title,
+            "page": None,
+            "label": raw_label,
+        }
+    return snippet, citation
+
+
+def query_context_structured(
     subject_id: int,
     query: str,
-    top_k: int = 4,
+    top_k: int = 5,
     priority_previous_lecture: bool = False,
-) -> str:
+    scope_lecture_ids: Optional[List[int]] = None,
+    scope_material_ids: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     """
-    Recupera i chunk più pertinenti filtrando RIGIDAMENTE per subject_id tramite Hybrid Search:
-      1. Ricerca Vettoriale semantica (Qwen3-Embedding con query instruction prefix standard).
-      2. Ricerca lessicale con confini di parola su termini significativi e acronimi esatti.
-      3. Fusione Reciprocal Rank Fusion (RRF) dei due ranking.
-      4. Fallback solo lessicale se l'embedding non è ancora scaricato.
+    Recupera i chunk più pertinenti tramite Hybrid Search (vettoriale + lessicale RRF),
+    con supporto per scope opzionale su lezioni/materiali e citazioni strutturate.
+    Restituisce {"context_text": str, "citations": list[dict]}.
     """
     clean_q = query.strip()
     if not clean_q:
-        return ""
+        return {"context_text": "", "citations": []}
 
     try:
         tbl = get_lancedb_table()
-        where = f"subject_id = {int(subject_id)}"
+        where, lec_id_set, mat_id_set = _build_scope_where(subject_id, scope_lecture_ids, scope_material_ids)
+        has_scope = bool(lec_id_set or mat_id_set)
+        pool_limit = top_k * 6 if has_scope else top_k * 4
         records: Dict[str, Dict[str, Any]] = {}
         scores: Dict[str, float] = {}
 
@@ -594,29 +809,33 @@ def query_context(
                     tbl.search(q_vec)
                     .where(where, prefilter=True)
                     .select(_RESULT_COLUMNS + ["_distance"])
-                    .limit(top_k * 4)
+                    .limit(pool_limit)
                     .to_list()
                 )
                 for rank, r in enumerate(vec_matches):
+                    if not _record_in_scope(r, lec_id_set, mat_id_set):
+                        continue
                     rid = str(r.get("id") or uuid.uuid4())
                     records[rid] = r
                     scores[rid] = scores.get(rid, 0.0) + 1.0 / (RRF_K + rank + 1)
             except Exception as e:
                 logger.warning(f"[RAG] Errore vector search LanceDB: {e}")
 
-        # 2. Ricerca lessicale (solo colonne necessarie, solo la materia richiesta)
+        # 2. Ricerca lessicale (colonne di risultato complete, filtrata per materia e scope)
         patterns, acronyms = _query_terms(clean_q)
         if patterns or acronyms:
             try:
                 rows = (
                     tbl.search()
                     .where(where)
-                    .select(["id", "title", "text", "source_type"])
+                    .select(_RESULT_COLUMNS)
                     .limit(None)
                     .to_list()
                 )
                 lexical: List[Tuple[float, str, Dict[str, Any]]] = []
                 for row in rows:
+                    if not _record_in_scope(row, lec_id_set, mat_id_set):
+                        continue
                     txt = str(row.get("text") or "")
                     title = str(row.get("title") or "")
                     score = 0.0
@@ -632,7 +851,7 @@ def query_context(
                     if score > 0:
                         lexical.append((score, str(row.get("id")), row))
                 lexical.sort(key=lambda x: x[0], reverse=True)
-                for rank, (_, rid, row) in enumerate(lexical[: top_k * 4]):
+                for rank, (_, rid, row) in enumerate(lexical[:pool_limit]):
                     if rid not in records:
                         records[rid] = row
                     scores[rid] = scores.get(rid, 0.0) + 1.0 / (RRF_K + rank + 1)
@@ -640,7 +859,7 @@ def query_context(
                 logger.debug(f"[RAG] Keyword scan error: {e}")
 
         if not scores:
-            return ""
+            return {"context_text": "", "citations": []}
 
         # Piccolo boost (scala RRF) per le lezioni se richiesto
         if priority_previous_lecture:
@@ -649,16 +868,46 @@ def query_context(
                     scores[rid] = scores.get(rid, 0.0) + 0.3 / (RRF_K + 1)
 
         ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
-        formatted_chunks = []
+        formatted_chunks: List[str] = []
+        citations: List[Dict[str, Any]] = []
+        seen_citations: set[Tuple[str, str, Optional[int]]] = set()
+
         for rid, _ in ranked:
-            r = records[rid]
-            title = r.get("title") or "Appunti del corso"
-            text = r.get("text") or ""
-            formatted_chunks.append(f"[{title}]:\n{text}")
-        return "\n\n".join(formatted_chunks)
+            snippet, cit = _format_snippet_and_citation(records[rid])
+            formatted_chunks.append(snippet)
+            cit_key = (cit["source_id"], cit["source_type"], cit["page"])
+            if cit_key not in seen_citations:
+                seen_citations.add(cit_key)
+                citations.append(cit)
+
+        return {
+            "context_text": "\n\n".join(formatted_chunks),
+            "citations": citations,
+        }
 
     except Exception as exc:
         logger.warning(f"[RAG] Ricerca contesto non riuscita: {exc}")
-        return ""
+        return {"context_text": "", "citations": []}
     finally:
         clear_metal_cache()
+
+
+def query_context(
+    subject_id: int,
+    query: str,
+    top_k: int = 4,
+    priority_previous_lecture: bool = False,
+) -> str:
+    """
+    Recupera i chunk più pertinenti filtrando RIGIDAMENTE per subject_id tramite Hybrid Search:
+      1. Ricerca Vettoriale semantica (Qwen3-Embedding con query instruction prefix standard).
+      2. Ricerca lessicale con confini di parola su termini significativi e acronimi esatti.
+      3. Fusione Reciprocal Rank Fusion (RRF) dei due ranking.
+      4. Fallback solo lessicale se l'embedding non è ancora scaricato.
+    """
+    return query_context_structured(
+        subject_id=subject_id,
+        query=query,
+        top_k=top_k,
+        priority_previous_lecture=priority_previous_lecture,
+    )["context_text"]

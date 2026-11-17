@@ -15,11 +15,13 @@ from __future__ import annotations
 import asyncio
 import collections
 import concurrent.futures
+import contextlib
 import gc
+import itertools
 import logging
 import re
 import threading
-from typing import Any, Optional, Tuple
+from typing import Any, Iterator, Optional, Tuple
 
 import numpy as np
 
@@ -141,6 +143,106 @@ def _decode_audio_file(path: str, sample_rate: int = 16000) -> np.ndarray:
     return audio
 
 
+FILE_CHUNK_SECONDS = 240.0
+FILE_CHUNK_OVERLAP_SECONDS = 2.0
+
+
+def _int16_to_float32(samples: np.ndarray) -> np.ndarray:
+    """Converte campioni PCM int16 mono in float32 normalizzato in [-1.0, 1.0]."""
+    audio = samples.astype(np.float32)
+    audio *= (1.0 / 32768.0)
+    return audio
+
+
+def _iter_resampled_s16_frames(path: str, sample_rate: int) -> Iterator[np.ndarray]:
+    """Apre un file audio con PyAV e produce frame 1D int16 mono ricampionati in streaming."""
+    import av
+    from av.audio.resampler import AudioResampler
+
+    with av.open(path, mode="r") as container:
+        if not container.streams.audio:
+            return
+        stream = container.streams.audio[0]
+        resampler = AudioResampler(format="s16", layout="mono", rate=sample_rate)
+        for frame in itertools.chain(container.decode(stream), (None,)):
+            for out in resampler.resample(frame):
+                arr = out.to_ndarray().reshape(-1)
+                if arr.size:
+                    yield arr
+
+
+def _iter_decoded_audio_windows(
+    path: str,
+    sample_rate: int = 16000,
+    window_seconds: Optional[float] = None,
+    overlap_seconds: Optional[float] = None,
+) -> Iterator[Tuple[np.ndarray, float, bool]]:
+    """
+    Decodifica in streaming con PyAV a finestre scorrevoli float32 mono senza mai
+    accumulare l'intero file audio in memoria.
+
+    Produce tuple `(window_audio, new_duration_seconds, is_first_chunk)` trattenendo
+    solo la coda di `overlap_seconds` tra finestre adiacenti e liberando subito i buffer int16.
+    """
+    eff_window_s = FILE_CHUNK_SECONDS if window_seconds is None else window_seconds
+    eff_overlap_s = FILE_CHUNK_OVERLAP_SECONDS if overlap_seconds is None else overlap_seconds
+    window_samples = max(1, int(eff_window_s * sample_rate))
+    overlap_samples = max(0, min(int(eff_overlap_s * sample_rate), window_samples - 1))
+
+    pending_parts: list[np.ndarray] = []
+    pending_samples = 0
+    carried_overlap = 0
+    is_first = True
+
+    try:
+        with contextlib.closing(_iter_resampled_s16_frames(path, sample_rate)) as frame_iter:
+            for arr in frame_iter:
+                pending_parts.append(arr)
+                pending_samples += int(arr.size)
+                if pending_samples < window_samples:
+                    continue
+
+                combined = pending_parts[0] if len(pending_parts) == 1 else np.concatenate(pending_parts)
+                pending_parts.clear()
+                pending_samples = 0
+
+                while combined.size >= window_samples:
+                    new_duration = (window_samples - carried_overlap) / float(sample_rate)
+                    tail_start = window_samples - overlap_samples
+                    remainder = (
+                        combined[tail_start:].copy()
+                        if tail_start < combined.size
+                        else np.zeros(0, dtype=np.int16)
+                    )
+                    # Pop prima di yield per evitare che il frame sospeso trattenga l'array float32
+                    window_holder = [_int16_to_float32(combined[:window_samples])]
+                    del combined
+
+                    yield window_holder.pop(), new_duration, is_first
+
+                    is_first = False
+                    carried_overlap = overlap_samples
+                    combined = remainder
+
+                if combined.size:
+                    pending_parts.append(combined)
+                    pending_samples = int(combined.size)
+                else:
+                    del combined
+
+        if pending_samples > carried_overlap:
+            tail = pending_parts[0] if len(pending_parts) == 1 else np.concatenate(pending_parts)
+            pending_parts.clear()
+            pending_samples = 0
+
+            new_duration = (int(tail.size) - carried_overlap) / float(sample_rate)
+            tail_holder = [_int16_to_float32(tail)]
+            del tail
+            yield tail_holder.pop(), new_duration, is_first
+    finally:
+        pending_parts.clear()
+
+
 def _is_cuda_runtime_error(exc: Exception) -> bool:
     msg = str(exc).lower()
     return any(k in msg for k in ("cuda", "cublas", "cudnn", "cufft", "curand", "nvrtc", ".dll"))
@@ -200,6 +302,11 @@ def faster_whisper_word_segments(model_path: str, audio: Any, language: str = "i
         audio,
         language=language,
         word_timestamps=True,
+        vad_filter=True,
+        condition_on_previous_text=False,
+        temperature=(0.0,),
+        compression_ratio_threshold=1.8,
+        no_speech_threshold=0.5,
     )
     return seg_list
 
@@ -269,36 +376,69 @@ class Transcriber:
 
     @staticmethod
     def _clean_transcript(text: str) -> str:
-        """Pulisce allucinazioni tipiche di Whisper, loop di ripetizione e artefatti web."""
+        """Pulisce allucinazioni tipiche di Whisper, formule di chiusura su silenzio, loop e artefatti web."""
         text = text.strip()
         if not text or len(text) <= 1:
             return ""
 
         lower = text.lower().strip(" .!?:;,-\"'")
-        artifacts = [
+        closing_phrases = [
             "grazie a tutti",
             "grazie per la visione",
+            "grazie per l'attenzione",
             "grazie dell'attenzione",
+            "grazie per aver guardato",
+            "grazie per averci seguito",
+            "grazie mille",
+            "grazie di tutto",
+            "grazie a tutti voi",
+            "grazie e arrivederci",
+            "molte grazie",
+            "tante grazie",
+            "sottotitoli a cura di",
+            "sottotitoli creati dalla comunità",
+            "sottotitoli e revisione a cura di",
+            "sottotitoli di",
+            "sottotitoli",
             "iscriviti al canale",
+            "iscrivetevi al canale",
             "lascia un like",
+            "lasciate un like",
             "alla prossima",
+            "arrivederci",
+            "buona giornata",
+            "buona visione",
+            "buon ascolto",
+            "thank you for watching",
+            "thanks for watching",
             "see you next time",
             "next video",
             "in the next video",
-            "thank you for watching",
-            "sottotitoli a cura di",
-            "sottotitoli creati dalla comunità",
-            "sottotitoli di",
             "sigla",
             "www.",
             ".com",
             ".org",
             "visione di",
         ]
-        for h in artifacts:
-            if h in lower and (len(text.split()) <= 6 or lower.count(h) >= 2):
+
+        # 1. Se il testo consiste SOLO in formule di chiusura / saluti di fine video (anche combinate o con punteggiatura)
+        stripped_test = lower
+        for formula in sorted(closing_phrases, key=len, reverse=True):
+            stripped_test = stripped_test.replace(formula, " ")
+        remaining = re.sub(r"[\s\.,!?:;\-\"']+", "", stripped_test)
+        if not remaining:
+            logger.info(f"[Transcriber Filter] Scartata formula di chiusura isolata/ripetuta: '{text}'")
+            return ""
+
+        # 2. Se una formula di chiusura compare ripetuta in loop (2 o più volte)
+        for formula in closing_phrases:
+            if len(formula) >= 5 and lower.count(formula) >= 2:
+                logger.info(f"[Transcriber Filter] Scartata formula ripetuta in loop ('{formula}'): '{text}'")
                 return ""
-            if lower == h:
+
+        # 3. Se contiene una formula di chiusura ed è molto breve (frammento orfano)
+        for formula in closing_phrases:
+            if formula in lower and len(text.split()) <= 6:
                 return ""
 
         # Rileva allucinazioni da spelling di lettere singole
@@ -318,21 +458,23 @@ class Transcriber:
         if not words:
             return ""
 
-        # 1. Rileva loop di ripetizione di parole (es. "aria, aria, aria...")
+        # 4. Rileva loop di ripetizione di parole (es. "aria, aria, aria...")
         if len(words) >= 4:
             unique_ratio = len(set(words)) / len(words)
             if unique_ratio < 0.45:
                 logger.info(f"[Transcriber Filter] Scartata ripetizione ({unique_ratio:.2f}): '{text[:45]}...'")
                 return ""
 
-        # 2. Rileva loop di n-gram ripetuti
-        for n in (2, 3, 4):
-            if len(words) >= n * 3:
+        # 5. Rileva loop di n-gram ripetuti
+        for n in (1, 2, 3, 4):
+            if len(words) >= n * 2:
                 ngrams = [" ".join(words[i:i+n]) for i in range(len(words) - n + 1)]
                 counts = collections.Counter(ngrams)
-                if counts and counts.most_common(1)[0][1] >= 3:
-                    logger.info(f"[Transcriber Filter] Scartato n-gram ripetuto: '{text[:45]}...'")
-                    return ""
+                if counts:
+                    most_common_phrase, count = counts.most_common(1)[0]
+                    if count >= 3 or (count >= 2 and (count * n) >= len(words) * 0.5):
+                        logger.info(f"[Transcriber Filter] Scartato n-gram ripetuto ({most_common_phrase} x{count}): '{text[:45]}...'")
+                        return ""
 
         return text
 
@@ -428,6 +570,140 @@ class Transcriber:
         release_transcriber_memory()
 
 
+_BOUNDARY_PUNCT_STRIP = " .,!?:;\"'()[]{}«»…—–-"
+_OVERLAP_SEARCH_WORDS = 10
+_MIN_OVERLAP_WORDS = 2
+
+
+def _normalize_boundary_word(word: str) -> str:
+    """Normalizza una parola ai margini di una finestra rimuovendo punteggiatura e maiuscole."""
+    return word.strip(_BOUNDARY_PUNCT_STRIP).lower()
+
+
+def _append_with_overlap_dedup(existing_text: str, next_text: str) -> str:
+    """
+    Unisce `next_text` ad `existing_text` rimuovendo eventuali parole duplicate al confine
+    (confronto case-insensitive senza punteggiatura entro le ultime/prime 10 parole, minimo 2).
+    """
+    next_clean = (next_text or "").strip()
+    if not next_clean:
+        return (existing_text or "").strip()
+    existing_clean = (existing_text or "").strip()
+    if not existing_clean:
+        return next_clean
+
+    existing_norms = [
+        norm for w in existing_clean.split() if (norm := _normalize_boundary_word(w))
+    ]
+    if not existing_norms:
+        return next_clean
+
+    next_raw = next_clean.split()
+    next_indexed = [
+        (idx, norm) for idx, w in enumerate(next_raw) if (norm := _normalize_boundary_word(w))
+    ]
+    if not next_indexed:
+        return existing_clean
+
+    tail = existing_norms[-_OVERLAP_SEARCH_WORDS:]
+    head_pairs = next_indexed[:_OVERLAP_SEARCH_WORDS]
+    head_norms = [norm for _, norm in head_pairs]
+
+    max_k = min(len(tail), len(head_norms))
+    drop_raw_until = 0
+    for k in range(max_k, _MIN_OVERLAP_WORDS - 1, -1):
+        if tail[-k:] == head_norms[:k]:
+            drop_raw_until = head_pairs[k - 1][0] + 1
+            break
+
+    remaining_words = next_raw[drop_raw_until:]
+    if not remaining_words or not any(_normalize_boundary_word(w) for w in remaining_words):
+        return existing_clean
+    return f"{existing_clean} {' '.join(remaining_words)}"
+
+
+def _merge_chunk_transcripts(chunks: list[str]) -> str:
+    """Concatena le trascrizioni di più finestre eliminando le sovrapposizioni ai bordi."""
+    merged = ""
+    for chunk_text in chunks:
+        merged = _append_with_overlap_dedup(merged, chunk_text)
+    return merged
+
+
+def _is_digital_silence(audio: np.ndarray) -> bool:
+    """Rileva finestre di silenzio digitale puro per prevenire allucinazioni di Whisper."""
+    return audio.size == 0 or float(np.max(np.abs(audio))) < 1e-4
+
+
+_FILE_BOILERPLATE_RE = re.compile(
+    r"(?:sottotitoli\s+(?:creati|a\s+cura)\s+(?:dalla\s+comunità(?:\s+amara\.org)?|di\s+[^\n.!?]+)|"
+    r"grazie\s+per\s+(?:la\s+visione|l['’]ascolto|aver\s+guardato)|"
+    r"iscriviti\s+al\s+canale|lascia\s+un\s+like|thank\s+you\s+for\s+watching|see\s+you\s+next\s+time)[.!?]*",
+    re.IGNORECASE,
+)
+_FILE_LOOP_PHRASE_RE = re.compile(
+    r"\b([A-Za-zÀ-ÿ0-9'’]+(?:\s+[A-Za-zÀ-ÿ0-9'’]+){1,5})\b(?:\s*[,;.]?\s+\1\b){2,}",
+    re.IGNORECASE,
+)
+_FILE_LOOP_WORD_RE = re.compile(
+    r"\b([A-Za-zÀ-ÿ]{2,24})\b(?:\s*[,;.]?\s+\1\b){4,}",
+    re.IGNORECASE,
+)
+
+
+def _clean_file_window_text(text: str) -> str:
+    """Rimuove allucinazioni boilerplate/loop da finestre file senza scartare risposte brevi valide (es. 'A')."""
+    s = (text or "").strip()
+    if not s:
+        return ""
+    words = [w for w in s.split() if w.strip(".,!?:;\"'()[]{}")]
+    # Testo di una sola parola/lettera valido (es. risposta "A" / "Sì" / "42"): scarta solo URL amara.org/www.
+    if len(words) <= 1:
+        low = s.lower()
+        if "amara.org" in low or "www." in low:
+            return ""
+        return s if any(c.isalnum() for c in s) else ""
+
+    cleaned = _FILE_BOILERPLATE_RE.sub(" ", s)
+    cleaned = _FILE_LOOP_PHRASE_RE.sub(r"\1", cleaned)
+    cleaned = _FILE_LOOP_WORD_RE.sub(r"\1", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip(" ,;-")
+    if not any(c.isalnum() for c in cleaned):
+        return ""
+    return cleaned
+
+
+def _transcribe_file_window(
+    model_path: str,
+    audio: np.ndarray,
+    *,
+    language: str,
+    initial_prompt: Optional[str],
+) -> str:
+    """Trascrive una singola finestra audio su MLX o faster-whisper (con fallback CUDA -> CPU)."""
+    if USE_MLX:
+        import mlx_whisper
+        result = mlx_whisper.transcribe(
+            audio,
+            path_or_hf_repo=model_path,
+            language=language,
+            initial_prompt=initial_prompt,
+            temperature=(0.0,),
+            condition_on_previous_text=False,
+            fp16=True,
+        )
+        raw_text = (result.get("text") or "").strip()
+        return _clean_file_window_text(raw_text)
+    text, _ = _faster_whisper_run(
+        model_path,
+        audio,
+        live=False,
+        initial_prompt=initial_prompt,
+        language=language,
+    )
+    return _clean_file_window_text(text)
+
+
 def transcribe_file(audio_path: str, language: str = "it", initial_prompt: Optional[str] = None) -> Tuple[str, float]:
     """
     Trascrive un file audio completo (wav/mp3/m4a/...), BLOCCANTE e thread-safe.
@@ -440,35 +716,58 @@ def transcribe_file(audio_path: str, language: str = "it", initial_prompt: Optio
         raise RuntimeError(MODEL_NOT_DOWNLOADED_MSG)
 
     with _transcription_lock:
+        merged_text = ""
+        prev_was_gap = False
+        total_duration = 0.0
+        chunk_count = 0
         try:
-            # Decodifica sempre con PyAV in np.ndarray float32 mono 16kHz (nessun ffmpeg CLI esterno richiesto)
-            audio = _decode_audio_file(audio_path)
-            if audio.size < 1600:
-                return "", audio.size / 16000.0
-
-            if USE_MLX:
-                import mlx_whisper
-                result = mlx_whisper.transcribe(
-                    audio,
-                    path_or_hf_repo=model_path,
-                    language=language,
-                    initial_prompt=initial_prompt,
-                    temperature=(0.0,),
-                    condition_on_previous_text=False,
-                    fp16=True,
-                )
-                text = (result.get("text") or "").strip()
-                segments = result.get("segments") or []
-                duration = float(segments[-1].get("end", 0.0)) if segments else (audio.size / 16000.0)
-            else:
-                text, duration = _faster_whisper_run(model_path, audio, live=False,
-                                                     initial_prompt=initial_prompt, language=language)
-            del audio
+            # Decodifica sempre con PyAV in streaming a finestre (nessun ffmpeg CLI esterno richiesto)
+            for chunk, chunk_new_duration, is_first in _iter_decoded_audio_windows(audio_path):
+                chunk_count += 1
+                total_duration += chunk_new_duration
+                try:
+                    if is_first and chunk_new_duration < 0.1:
+                        prev_was_gap = True
+                        continue
+                    if _is_digital_silence(chunk):
+                        logger.debug(
+                            f"[Transcriber File] Finestra {chunk_count} silenzio digitale, skip Whisper."
+                        )
+                        prev_was_gap = True
+                        continue
+                    if not is_first:
+                        logger.info(
+                            f"[Transcriber File] Trascrizione finestra {chunk_count} "
+                            f"(durata accumulata: {total_duration:.1f}s)..."
+                        )
+                    chunk_text = _transcribe_file_window(
+                        model_path,
+                        chunk,
+                        language=language,
+                        initial_prompt=initial_prompt,
+                    )
+                    if chunk_text:
+                        if prev_was_gap or not merged_text:
+                            merged_text = f"{merged_text} {chunk_text}".strip() if merged_text else chunk_text
+                        else:
+                            merged_text = _append_with_overlap_dedup(merged_text, chunk_text)
+                        prev_was_gap = False
+                    else:
+                        prev_was_gap = True
+                finally:
+                    del chunk
+                    release_metal_cache()
         except Exception as exc:
             raise RuntimeError(f"Trascrizione del file audio non riuscita: {exc}") from exc
-        finally:
-            release_metal_cache()
-    return text, duration
+
+    if total_duration < 0.1:
+        return "", total_duration
+    if chunk_count > 1:
+        logger.info(
+            f"[Transcriber File] Trascrizione multi-finestra completata: "
+            f"{chunk_count} finestre, {total_duration:.1f}s totali."
+        )
+    return merged_text, total_duration
 
 
 def is_speech_spectral(audio_np: np.ndarray, sample_rate: int = 16000) -> bool:
@@ -485,7 +784,7 @@ def is_speech_spectral(audio_np: np.ndarray, sample_rate: int = 16000) -> bool:
 
     energy = float(np.dot(audio_np, audio_np))
     rms = float(np.sqrt(energy / total_samples))
-    if rms < 0.0004:
+    if rms < 0.001:
         return False
 
     # Zero Crossing Rate (ZCR)

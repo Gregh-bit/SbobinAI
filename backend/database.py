@@ -1,7 +1,7 @@
 """
 database.py — SbobinAI
 Gestisce l'inizializzazione del database SQLite tramite SQLAlchemy.
-Tabelle: subjects, lectures, bookmarks
+Tabelle: subjects, lectures, bookmarks, chat_sessions, chat_messages, quiz_sets
 """
 from __future__ import annotations
 
@@ -92,6 +92,8 @@ class Subject(Base):
     created_at: datetime = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     lectures = relationship("Lecture", back_populates="subject", cascade="all, delete-orphan")
+    chat_sessions = relationship("ChatSession", back_populates="subject", cascade="all, delete-orphan")
+    quiz_sets = relationship("QuizSet", back_populates="subject", cascade="all, delete-orphan")
 
 
 class Lecture(Base):
@@ -131,26 +133,116 @@ class Bookmark(Base):
     lecture = relationship("Lecture", back_populates="bookmarks")
 
 
+class ChatSession(Base):
+    """Sessione di chat persistente legata a una materia."""
+    __tablename__ = "chat_sessions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    subject_id = Column(Integer, ForeignKey("subjects.id", ondelete="CASCADE"), nullable=False, index=True)
+    title = Column(String, default="Nuova chat")
+    compacted_summary = Column(Text, default="")
+    compacted_up_to_message_id = Column(Integer, default=0)
+    scope_json = Column(Text, default="{}")
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    subject = relationship("Subject", back_populates="chat_sessions")
+    messages = relationship(
+        "ChatMessage",
+        back_populates="session",
+        cascade="all, delete-orphan",
+        order_by="ChatMessage.id",
+    )
+    quiz_sets = relationship("QuizSet", back_populates="chat_session")
+
+
+class ChatMessage(Base):
+    """Singolo messaggio (utente o assistente) in una sessione di chat."""
+    __tablename__ = "chat_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    role = Column(String, nullable=False)
+    content = Column(Text, nullable=False)
+    thinking = Column(Text, default="")
+    mode = Column(String, default="auto")
+    context_used = Column(Text, default="")
+    citations_json = Column(Text, default="[]")
+    action_json = Column(Text, default="")
+    followups_json = Column(Text, default="[]")
+    token_estimate = Column(Integer, default=0)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    session = relationship("ChatSession", back_populates="messages")
+
+
+class QuizSet(Base):
+    """Set di quiz di verifica generato per una materia o sessione chat."""
+    __tablename__ = "quiz_sets"
+
+    id = Column(Integer, primary_key=True, index=True)
+    subject_id = Column(Integer, ForeignKey("subjects.id", ondelete="CASCADE"), nullable=False, index=True)
+    chat_session_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="SET NULL"), nullable=True)
+    title = Column(String, nullable=False)
+    source_label = Column(String, default="")
+    questions_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    subject = relationship("Subject", back_populates="quiz_sets")
+    chat_session = relationship("ChatSession", back_populates="quiz_sets")
+
+
 # ── Init DB ────────────────────────────────────────────────────────────────────
+
+def _ensure_table_columns(conn, table_name: str, migrations: list[tuple[str, str]]) -> None:
+    """Aggiunge eventuali colonne mancanti a una tabella SQLite esistente."""
+    existing = {row[1] for row in conn.execute(text(f"PRAGMA table_info({table_name})"))}
+    for col, ddl in migrations:
+        if col not in existing:
+            try:
+                conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {col} {ddl}"))
+                conn.commit()
+            except Exception:
+                pass
+
 
 def init_db() -> None:
     """Crea tutte le tabelle se non esistono."""
     Base.metadata.create_all(bind=engine)
     # Migrazioni leggere per DB creati da versioni precedenti (es. unicopilot.db)
-    migrations = [
-        ("detected_questions", "TEXT"),
-        ("source_type", "VARCHAR(50) DEFAULT 'recorded'"),
-        ("in_quaderno", "BOOLEAN DEFAULT 1"),
-    ]
+    table_migrations = {
+        "lectures": [
+            ("detected_questions", "TEXT"),
+            ("source_type", "VARCHAR(50) DEFAULT 'recorded'"),
+            ("in_quaderno", "BOOLEAN DEFAULT 1"),
+        ],
+        "chat_sessions": [
+            ("title", "VARCHAR DEFAULT 'Nuova chat'"),
+            ("compacted_summary", "TEXT DEFAULT ''"),
+            ("compacted_up_to_message_id", "INTEGER DEFAULT 0"),
+            ("scope_json", "TEXT DEFAULT '{}'"),
+        ],
+        "chat_messages": [
+            ("thinking", "TEXT DEFAULT ''"),
+            ("mode", "VARCHAR DEFAULT 'auto'"),
+            ("context_used", "TEXT DEFAULT ''"),
+            ("citations_json", "TEXT DEFAULT '[]'"),
+            ("action_json", "TEXT DEFAULT ''"),
+            ("followups_json", "TEXT DEFAULT '[]'"),
+            ("token_estimate", "INTEGER DEFAULT 0"),
+        ],
+        "quiz_sets": [
+            ("chat_session_id", "INTEGER"),
+            ("source_label", "VARCHAR DEFAULT ''"),
+        ],
+    }
     with engine.connect() as conn:
-        existing = {row[1] for row in conn.execute(text("PRAGMA table_info(lectures)"))}
-        for col, ddl in migrations:
-            if col not in existing:
-                try:
-                    conn.execute(text(f"ALTER TABLE lectures ADD COLUMN {col} {ddl}"))
-                    conn.commit()
-                except Exception:
-                    pass
+        for table_name, migrations in table_migrations.items():
+            _ensure_table_columns(conn, table_name, migrations)
     print(f"[DB] Database inizializzato -> {DB_PATH}")
 
 

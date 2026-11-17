@@ -48,6 +48,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPExcept
 from fastapi.websockets import WebSocketState
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from database import Lecture, SessionLocal, get_db, init_db
@@ -57,6 +58,7 @@ from routers.lectures import router as lectures_router, bookmark_router
 from routers.settings import router as settings_router
 from routers.models import router as models_router
 from routers.study import router as study_router
+from routers.chats import router as chats_router
 from schemas import CourseChatRequest
 from config import load_settings
 
@@ -124,6 +126,7 @@ app.include_router(bookmark_router, prefix="/api/v1")
 app.include_router(settings_router, prefix="/api/v1")
 app.include_router(models_router, prefix="/api/v1")
 app.include_router(study_router, prefix="/api/v1")
+app.include_router(chats_router, prefix="/api/v1")
 
 
 @app.get("/health", tags=["System"])
@@ -134,7 +137,7 @@ async def health_check():
         "status": "ok",
         "service": "SbobinAI",
         "version": "0.1.0",
-        "app_version": os.environ.get("SBOBINAI_APP_VERSION") or "0.0.15",
+        "app_version": os.environ.get("SBOBINAI_APP_VERSION") or "0.0.16",
     }
 
 
@@ -152,6 +155,24 @@ async def system_shutdown():
 
     threading.Timer(0.15, _terminate).start()
     return {"status": "shutting_down"}
+
+
+class SaveFilePayload(BaseModel):
+    path: str
+    content: str
+
+
+@app.post("/api/v1/utils/save-file", tags=["System"])
+def save_file_to_disk(payload: SaveFilePayload):
+    try:
+        parent = os.path.dirname(os.path.abspath(payload.path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(payload.path, "w", encoding="utf-8") as f:
+            f.write(payload.content)
+        return {"success": True, "path": payload.path}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 def extract_professor_questions(text: str) -> list[str]:
@@ -244,19 +265,25 @@ async def _safe_send_json(ws: WebSocket, payload: dict) -> bool:
 async def _generate_flash_answer_task(session: LiveSession, question: str, question_id: str, ws: WebSocket):
     """Genera la risposta flash in 3 punti elenco con l'LLM locale e aggiorna il WebSocket."""
     try:
-        from rag import query_context
-        from llm_engine import generate_flash_answer
+        from rag import query_context, unload_embedding_model
+        from llm_engine import generate_flash_answer, clear_metal_cache
 
-        # 1. Recupera gli ultimi 3 minuti del buffer live
-        live_context = session.get_recent_context(minutes=3)
+        # 1. Recupera gli ultimi 3 minuti del buffer live (puliti dai riempitivi orali)
+        from transcript_cleaner import clean_transcript_for_llm
+        raw_live = session.get_recent_context(minutes=3)
+        live_context = clean_transcript_for_llm(raw_live)
         # 2. Interroga LanceDB per la materia corrente (priorità a lezioni precedenti e materiali)
-        rag_context = await asyncio.to_thread(
-            query_context,
-            subject_id=session.subject_id,
-            query=question,
-            top_k=3,
-            priority_previous_lecture=True,
-        )
+        try:
+            rag_context = await asyncio.to_thread(
+                query_context,
+                subject_id=session.subject_id,
+                query=question,
+                top_k=3,
+                priority_previous_lecture=True,
+            )
+        finally:
+            unload_embedding_model()
+            clear_metal_cache()
         combined = f"Ultime spiegazioni live:\n{live_context}\n\nMateriali e lezioni precedenti:\n{rag_context}"
 
         settings = load_settings()
@@ -295,6 +322,83 @@ async def _generate_flash_answer_task(session: LiveSession, question: str, quest
         logger.warning(f"[Flash Answer] Errore generazione risposta flash: {exc}")
 
 
+async def _handle_live_chat_stream(
+    session: LiveSession,
+    ws: WebSocket,
+    query: str,
+    context_minutes: int,
+    subject_id: int,
+) -> None:
+    """
+    Streaming asincrono in background per la chat live RAG.
+    Non blocca l'event loop né il socket e gestisce ogni errore in modo sicuro.
+    """
+    from rag import query_context, unload_embedding_model
+    from llm_engine import stream_chat_response, clear_metal_cache
+    from transcript_cleaner import clean_transcript_for_llm
+
+    live_context = ""
+    try:
+        raw_live = session.get_recent_context(minutes=context_minutes)
+        live_context = clean_transcript_for_llm(raw_live)
+        try:
+            rag_context = await asyncio.to_thread(query_context, subject_id=subject_id, query=query, top_k=3)
+        finally:
+            await asyncio.to_thread(unload_embedding_model)
+            clear_metal_cache()
+        combined_context = (
+            f"Ultime spiegazioni live (ultimi {context_minutes} minuti):\n{live_context}\n\n"
+            f"Materiali e nozioni del corso:\n{rag_context}"
+        )
+
+        settings = load_settings()
+        llm_model = settings.get("llm_model")
+
+        full_answer = ""
+        try:
+            async for token in stream_chat_response(query=query, context=combined_context, model_id=llm_model):
+                full_answer += token
+                sent = await _safe_send_json(ws, {
+                    "type": "chat_chunk",
+                    "payload": {
+                        "chunk": token,
+                        "query": query,
+                    }
+                })
+                if not sent:
+                    return
+        except Exception as c_err:
+            logger.error(f"[WS Chat] Errore streaming: {c_err}")
+            err_msg = f"Non è stato possibile completare la risposta ({c_err})."
+            full_answer = (full_answer + f"\n\n{err_msg}").strip() if full_answer else err_msg
+            await _safe_send_json(ws, {
+                "type": "chat_chunk",
+                "payload": {
+                    "chunk": f"\n\n{err_msg}",
+                    "query": query,
+                }
+            })
+
+        await _safe_send_json(ws, {
+            "type": "chat_response",
+            "payload": {
+                "answer": full_answer,
+                "query": query,
+                "context_used": (live_context[:400] + "...") if len(live_context) > 400 else live_context,
+            }
+        })
+    except Exception as exc:
+        logger.error(f"[WS Chat] Errore non gestito in _handle_live_chat_stream: {exc}")
+        await _safe_send_json(ws, {
+            "type": "chat_response",
+            "payload": {
+                "answer": f"Si è verificato un errore durante l'elaborazione della risposta: {exc}",
+                "query": query,
+                "context_used": (live_context[:400] + "...") if len(live_context) > 400 else live_context,
+            }
+        })
+
+
 async def _post_lecture_summary_and_index(subject_id: int, lecture_id: int, full_transcript: str):
     """
     Funzione post-lezione eseguita a fine registrazione:
@@ -305,7 +409,16 @@ async def _post_lecture_summary_and_index(subject_id: int, lecture_id: int, full
     """
     from database import Bookmark
     from rag import query_context, index_lecture, unload_embedding_model
-    from llm_engine import generate_lecture_chapter, clear_metal_cache, unload_whisper, unload_llm
+    from llm_engine import (
+        cancel_epoch,
+        clear_metal_cache,
+        generate_lecture_chapter,
+        is_cancelled,
+        unload_llm,
+        unload_whisper,
+    )
+
+    start_epoch = cancel_epoch()
 
     # Libera preventivamente la memoria da Whisper (solo se nessun'altra lezione live lo sta usando)
     if not has_active_sessions():
@@ -317,17 +430,27 @@ async def _post_lecture_summary_and_index(subject_id: int, lecture_id: int, full
         if not lecture:
             return
 
+        if is_cancelled(start_epoch):
+            raise InterruptedError("Generazione capitolo interrotta dall'utente.")
+
         # Riferimenti da lezioni passate citati o correlati (Embedding model)
-        past_refs = await asyncio.to_thread(
-            query_context,
-            subject_id=subject_id,
-            query=full_transcript[:1500],
-            top_k=3,
-            priority_previous_lecture=True,
-        )
-        # Rilascia modello embedding prima di caricare l'LLM pesante per evitare swap su 8GB
-        unload_embedding_model()
-        clear_metal_cache()
+        from transcript_cleaner import clean_transcript_for_llm
+        cleaned_for_query = clean_transcript_for_llm(full_transcript)
+        try:
+            past_refs = await asyncio.to_thread(
+                query_context,
+                subject_id=subject_id,
+                query=cleaned_for_query[:1500],
+                top_k=3,
+                priority_previous_lecture=True,
+            )
+        finally:
+            # Rilascia modello embedding prima di caricare l'LLM pesante per evitare swap su 8GB
+            unload_embedding_model()
+            clear_metal_cache()
+
+        if is_cancelled(start_epoch):
+            raise InterruptedError("Generazione capitolo interrotta dall'utente.")
 
         # Segnalibri della lezione
         bookmarks = db_sess.query(Bookmark).filter(Bookmark.lecture_id == lecture_id).all()
@@ -359,19 +482,23 @@ async def _post_lecture_summary_and_index(subject_id: int, lecture_id: int, full
         clear_metal_cache()
 
         # Auto-indicizzazione su LanceDB
-        await asyncio.to_thread(
-            index_lecture,
-            subject_id=subject_id,
-            lecture_id=lecture_id,
-            title=lecture.title,
-            transcript=full_transcript,
-            notes=chapter,
-        )
-        # Rilascia embedding post-indicizzazione
-        unload_embedding_model()
-        clear_metal_cache()
+        try:
+            await asyncio.to_thread(
+                index_lecture,
+                subject_id=subject_id,
+                lecture_id=lecture_id,
+                title=lecture.title,
+                transcript=full_transcript,
+                notes=chapter,
+            )
+        finally:
+            # Rilascia embedding post-indicizzazione
+            unload_embedding_model()
+            clear_metal_cache()
         logger.info(f"[Post-Lezione] Lezione {lecture_id} indicizzata con successo su LanceDB.")
     except InterruptedError:
+        unload_llm()
+        clear_metal_cache()
         logger.info(f"[Post-Lezione] Generazione capitolo per lezione {lecture_id} interrotta dall'utente.")
     except Exception as exc:
         logger.error(f"[Post-Lezione] Errore elaborazione riassunto/indicizzazione: {exc}")
@@ -388,6 +515,9 @@ async def _post_lecture_summary_and_index(subject_id: int, lecture_id: int, full
             )
         except Exception as idx_exc:
             logger.warning(f"[Post-Lezione] Indicizzazione di ripiego non riuscita: {idx_exc}")
+        finally:
+            unload_embedding_model()
+            clear_metal_cache()
     finally:
         db_sess.close()
         clear_metal_cache()
@@ -509,12 +639,12 @@ async def _transcription_worker(session: LiveSession, ws: WebSocket):
 
 
 async def _announce_questions(session: LiveSession, text: str, ws: WebSocket) -> None:
-    """Rileva le domande del docente nel testo, le notifica al client e avvia le risposte flash."""
+    """Rileva le domande del docente nel testo, le notifica al client senza avvio automatico LLM."""
     for q in extract_professor_questions(text):
         q_obj = session.add_question(
             q,
             confidence=0.95,
-            suggested_answer="Generazione risposta flash in corso...",
+            suggested_answer="",
         )
         logger.info(f"TRIGGER_RAG: [Domanda del prof rilevata] {q}")
         await _safe_send_json(ws, {
@@ -523,13 +653,10 @@ async def _announce_questions(session: LiveSession, text: str, ws: WebSocket) ->
                 "id": q_obj["id"],
                 "question": q_obj["question"],
                 "confidence": q_obj["confidence"],
-                "suggested_answer": q_obj["suggestedAnswer"],
+                "suggested_answer": "",
                 "trigger": "TRIGGER_RAG",
             }
         })
-
-        # Avvia risposta flash istantanea
-        _spawn(_generate_flash_answer_task(session, q, q_obj["id"], ws))
 
 
 async def _post_lecture_pipeline(
@@ -582,6 +709,23 @@ async def _post_lecture_pipeline(
             logger.warning(f"[WS Pipeline] Errore riassunto/RAG per lezione {lecture_id}: {exc}")
 
 
+DISCONNECT_GRACE_PERIOD_SECONDS: float = 600.0  # 10 minuti di timeout per riconnessione client
+
+
+async def _disconnect_grace_finalizer(sess: LiveSession, sid: int, timeout: float = DISCONNECT_GRACE_PERIOD_SECONDS):
+    """Finalizza la sessione solo se nessun client si riconnette entro il timeout di grazia."""
+    try:
+        await asyncio.sleep(timeout)
+        if sess.is_active and not sess.finalized:
+            logger.info(
+                f"[WS] Timeout di grazia ({timeout}s) scaduto per lezione {sess.lecture_id} "
+                f"(materia {sid}) senza riconnessione: finalizzazione sessione..."
+            )
+            await _finalize_session(sess, sid)
+    except asyncio.CancelledError:
+        logger.info(f"[WS] Timer di grazia annullato per lezione {sess.lecture_id} (riconnessione avvenuta)")
+
+
 async def _finalize_session(session: LiveSession, subject_id: int) -> Tuple[float, Optional[str]]:
     """
     Chiude una sessione live in modo idempotente e reattivo:
@@ -593,6 +737,11 @@ async def _finalize_session(session: LiveSession, subject_id: int) -> Tuple[floa
     if session.finalized:
         return session.elapsed_seconds(), None
     session.finalized = True
+
+    grace_task = getattr(session, "_disconnect_grace_task", None)
+    if grace_task and grace_task is not asyncio.current_task() and not grace_task.done():
+        grace_task.cancel()
+    session._disconnect_grace_task = None
 
     duration = session.elapsed_seconds()
     session.is_active = False
@@ -670,8 +819,11 @@ async def _finalize_session(session: LiveSession, subject_id: int) -> Tuple[floa
                     with SessionLocal() as s_db:
                         lec = s_db.query(Lecture).filter(Lecture.id == session.lecture_id).first()
                         if lec:
-                            lec.raw_transcript = session.get_full_transcript()
-                            s_db.commit()
+                            new_text = session.get_full_transcript().strip()
+                            existing_text = (lec.raw_transcript or "").strip()
+                            if new_text and (not existing_text or len(new_text) >= len(existing_text)):
+                                lec.raw_transcript = new_text
+                                s_db.commit()
                 except Exception as exc:
                     logger.warning(f"[WS] Errore aggiornamento trascrizione finale DB: {exc}")
 
@@ -770,21 +922,81 @@ async def live_lecture_ws(
             if not isinstance(payload, dict):
                 payload = {}
 
-            # ── START ──────────────────────────────────────────────────────────
-            if msg_type == "start":
+            # ── START / RECONNECT ──────────────────────────────────────────────
+            if msg_type in ("start", "reconnect"):
                 title = str(payload.get("title") or "Nuova Lezione")[:255]
-                lecture_id = payload.get("lecture_id")
+                raw_lecture_id = payload.get("lecture_id")
+                req_lecture_id: Optional[int] = None
+                if raw_lecture_id is not None:
+                    try:
+                        req_lecture_id = int(raw_lecture_id)
+                    except (TypeError, ValueError):
+                        await send_error("lecture_id non valido")
+                        continue
 
-                # Una sessione già aperta (su questo socket o su un socket precedente rimasto appeso)
-                # viene prima salvata e chiusa all'esterno del blocco DB per evitare lock contention SQLite.
-                if session is not None:
+                # Controlla se c'è già una sessione attiva per subject_id
+                stale = get_session(subject_id)
+                if (
+                    stale is not None
+                    and stale.is_active
+                    and not stale.finalized
+                    and (
+                        (req_lecture_id is not None and stale.lecture_id == req_lecture_id)
+                        or (msg_type == "reconnect" and req_lecture_id is None)
+                    )
+                ):
+                    # RICONNETTI!
+                    logger.info(
+                        f"[WS] Riconnessione su sessione attiva per materia {subject_id}, "
+                        f"lezione {stale.lecture_id} (msg_type={msg_type})"
+                    )
+                    # Annulla l'eventuale timer di grazia di disconnessione
+                    grace_task = getattr(stale, "_disconnect_grace_task", None)
+                    if grace_task and not grace_task.done():
+                        grace_task.cancel()
+                    stale._disconnect_grace_task = None
+                    stale._client_disconnected_at = None
+
+                    session = stale
+
+                    # Associa il worker di trascrizione al nuovo websocket
+                    if session.transcription_task and not session.transcription_task.done():
+                        session.transcription_task.cancel()
+                    session.transcription_task = asyncio.create_task(
+                        _transcription_worker(session, websocket)
+                    )
+
+                    await _safe_send_json(websocket, {
+                        "type": "reconnected",
+                        "payload": {
+                            "lecture_id": session.lecture_id,
+                            "session_started_at": session.started_at,
+                            "is_paused": session.is_paused,
+                            "elapsed": session.elapsed_seconds(),
+                            "chunks": session.full_transcript,
+                            "detected_questions": session.detected_questions,
+                        }
+                    })
+                    continue
+
+                if msg_type == "reconnect":
+                    await send_error("Nessuna sessione attiva trovata per la riconnessione.")
+                    continue
+
+                # Per "start" con lezione diversa o nuova: finalizza eventuali sessioni precedenti
+                if session is not None and session is not stale:
                     await _finalize_session(session, subject_id)
                     session = None
-                stale = get_session(subject_id)
                 if stale is not None:
-                    logger.warning(f"[WS] Sessione precedente ancora attiva per materia {subject_id}: la salvo e la chiudo.")
+                    logger.warning(
+                        f"[WS] Sessione precedente ancora attiva per materia {subject_id} (lezione {stale.lecture_id}): la salvo e la chiudo."
+                    )
+                    grace_task = getattr(stale, "_disconnect_grace_task", None)
+                    if grace_task and not grace_task.done():
+                        grace_task.cancel()
                     await _finalize_session(stale, subject_id)
 
+                lecture_id = req_lecture_id
                 from database import Lecture as LectureModel, Subject
                 with SessionLocal() as db:
                     subject = db.query(Subject).filter(Subject.id == subject_id).first()
@@ -794,11 +1006,6 @@ async def live_lecture_ws(
                     whisper_keywords = subject.whisper_prompt_keywords
 
                     if lecture_id is not None:
-                        try:
-                            lecture_id = int(lecture_id)
-                        except (TypeError, ValueError):
-                            await send_error("lecture_id non valido")
-                            continue
                         owned = (
                             db.query(LectureModel)
                             .filter(LectureModel.id == lecture_id, LectureModel.subject_id == subject_id)
@@ -906,45 +1113,7 @@ async def live_lecture_ws(
                 if not query:
                     continue
                 context_minutes = _as_int(payload.get("context_minutes", 5), default=5, lo=1, hi=15)
-
-                from rag import query_context
-                from llm_engine import stream_chat_response
-
-                live_context = session.get_recent_context(minutes=context_minutes)
-                rag_context = await asyncio.to_thread(query_context, subject_id=subject_id, query=query, top_k=3)
-                combined_context = (
-                    f"Ultime spiegazioni live (ultimi {context_minutes} minuti):\n{live_context}\n\n"
-                    f"Materiali e nozioni del corso:\n{rag_context}"
-                )
-
-                settings = load_settings()
-                llm_model = settings.get("llm_model")
-
-                full_answer = ""
-                try:
-                    async for token in stream_chat_response(query=query, context=combined_context, model_id=llm_model):
-                        full_answer += token
-                        await _safe_send_json(websocket, {
-                            "type": "chat_chunk",
-                            "payload": {
-                                "chunk": token,
-                                "query": query,
-                            }
-                        })
-                except (WebSocketDisconnect, RuntimeError):
-                    raise
-                except Exception as c_err:
-                    logger.error(f"[WS Chat] Errore streaming: {c_err}")
-                    full_answer = f"Errore durante l'elaborazione della risposta: {c_err}"
-
-                await _safe_send_json(websocket, {
-                    "type": "chat_response",
-                    "payload": {
-                        "answer": full_answer,
-                        "query": query,
-                        "context_used": (live_context[:400] + "...") if len(live_context) > 400 else live_context,
-                    }
-                })
+                _spawn(_handle_live_chat_stream(session, websocket, query, context_minutes, subject_id))
 
             # ── DELETE QUESTION (elimina domanda non pertinente in live) ───────
             elif msg_type == "delete_question":
@@ -954,47 +1123,85 @@ async def live_lecture_ws(
                         removed = session.delete_question(str(q_id))
                         logger.info(f"[WS] Domanda rilevata {q_id} rimossa dalla sessione live (success={removed})")
 
-            # ── PAUSE (Consolidamento istantaneo + Stop motori + Deep sleep) ───
+            # ── ANSWER QUESTION (richiesta esplicita utente risposta domanda) ──
+            elif msg_type == "answer_question":
+                if session:
+                    q_id = str(payload.get("question_id") or "")
+                    q_text = str(payload.get("question") or "")
+                    if not q_text and q_id:
+                        for item in session.detected_questions:
+                            if str(item.get("id")) == q_id:
+                                q_text = item.get("question", "")
+                                break
+                    if q_text and q_id:
+                        logger.info(f"[WS] Richiesta esplicita utente risposta domanda: '{q_text[:30]}...'")
+                        await _safe_send_json(websocket, {
+                            "type": "question_answering",
+                            "payload": {"id": q_id, "question": q_text}
+                        })
+                        _spawn(_generate_flash_answer_task(session, q_text, q_id, websocket))
+
+            # ── PAUSE (Consolidamento non bloccante + Stop motori + Deep sleep) ─
             elif msg_type == "pause":
-                if session and not session.is_paused:
-                    logger.info(f"[WS] Richiesta PAUSA per lezione {session.lecture_id}: consolidamento immediato buffer residuo...")
-                    # 1. Chiude microfono e estrae l'ultimo chunk vocale accumulato (anche se breve)
-                    last_audio = session.pause()
+                if session:
+                    if not session.is_paused:
+                        logger.info(f"[WS] Richiesta PAUSA per lezione {session.lecture_id}: consolidamento non bloccante...")
+                        # 1. Chiude microfono ed estrae l'ultimo chunk vocale accumulato (anche se breve)
+                        last_audio = session.pause()
 
-                    # 2. Consolidamento istantaneo (Ultimo sforzo del Large)
-                    if last_audio and len(last_audio) >= 1600:
-                        try:
-                            refined_text = await session.transcriber.transcribe(last_audio)
-                            if refined_text:
-                                session.push_transcript(refined_text)
-                                await _safe_send_json(websocket, {
-                                    "type": "transcript_chunk",
-                                    "payload": {
-                                        "text": refined_text,
-                                        "elapsed": session.elapsed_seconds(),
-                                    }
-                                })
-                                # Rilevamento domande sull'ultimo parlato prima della pausa
-                                await _announce_questions(session, refined_text, websocket)
-                        except Exception as p_err:
-                            logger.error(f"[WS Pause] Errore trascrizione ultimo pezzo: {p_err}")
+                        # Invia SUBITO paused prima di trascrivere l'ultimo audio!
+                        await _safe_send_json(websocket, {"type": "paused"})
 
-                    # 3. Stop motori (Calore Zero) & Svuotamento cache (Deep Sleep)
-                    session.transcriber.release_metal_cache()
-                    logger.info("[WS] Pausa completata: microfono chiuso, modelli a riposo, cache liberata")
-                    await _safe_send_json(websocket, {"type": "paused"})
+                        # 2. Consolidamento asincrono in background via _spawn (NON blocca il loop WS)
+                        async def _process_pause_last_audio(audio_chunk: bytes, current_session: LiveSession, ws: WebSocket):
+                            try:
+                                if audio_chunk and len(audio_chunk) >= 1600:
+                                    refined_text = await current_session.transcriber.transcribe(audio_chunk)
+                                    if refined_text:
+                                        current_session.push_transcript(refined_text)
+                                        await _safe_send_json(ws, {
+                                            "type": "transcript_chunk",
+                                            "payload": {
+                                                "text": refined_text,
+                                                "elapsed": current_session.elapsed_seconds(),
+                                            }
+                                        })
+                                        # Rilevamento domande sull'ultimo parlato prima della pausa
+                                        await _announce_questions(current_session, refined_text, ws)
+                            except Exception as p_err:
+                                logger.error(f"[WS Pause] Errore trascrizione ultimo pezzo: {p_err}")
+                            finally:
+                                try:
+                                    current_session.transcriber.release_metal_cache()
+                                except Exception:
+                                    pass
+
+                        if last_audio and len(last_audio) >= 1600:
+                            _spawn(_process_pause_last_audio(last_audio, session, websocket))
+                        else:
+                            try:
+                                session.transcriber.release_metal_cache()
+                            except Exception:
+                                pass
+                    else:
+                        # Se session.is_paused è già True, invia comunque {"type": "paused"} come ACK
+                        await _safe_send_json(websocket, {"type": "paused"})
 
             # ── RESUME (Ripresa registrazione da pausa) ────────────────────────
             elif msg_type == "resume":
-                if session and session.is_paused:
-                    session.resume()
-                    logger.info(f"[WS] Registrazione RIPRESA per lezione {session.lecture_id}: microfono e modelli riattivati.")
+                if session:
+                    if session.is_paused:
+                        session.resume()
+                        logger.info(f"[WS] Registrazione RIPRESA per lezione {session.lecture_id}: microfono e modelli riattivati.")
                     await _safe_send_json(websocket, {"type": "resumed"})
 
             # ── STOP ───────────────────────────────────────────────────────────
             elif msg_type == "stop":
                 if not session:
                     continue
+                grace_task = getattr(session, "_disconnect_grace_task", None)
+                if grace_task and not grace_task.done():
+                    grace_task.cancel()
                 duration, audio_path = await asyncio.shield(_finalize_session(session, subject_id))
                 total_chunks = len(session.full_transcript)
                 session = None
@@ -1021,10 +1228,23 @@ async def live_lecture_ws(
             pass
     finally:
         _ws_locks.pop(websocket, None)
-        # Qualsiasi uscita (disconnessione, errore, crash) salva la lezione e libera il microfono
-        # shield: anche se questo handler viene cancellato (shutdown, client sparito) il salvataggio termina
-        if session is not None and not session.finalized:
-            await asyncio.shield(_spawn(_finalize_session(session, subject_id)))
+        # Se la disconnessione avviene senza 'stop' esplicito, metti in pausa e avvia timer di grazia
+        if session is not None and not session.finalized and session.is_active:
+            try:
+                session.pause()
+            except Exception as e:
+                logger.warning(f"[WS] Errore pausa sessione disconnessa: {e}")
+            session._client_disconnected_at = time.time()
+            old_grace = getattr(session, "_disconnect_grace_task", None)
+            if old_grace and not old_grace.done():
+                old_grace.cancel()
+            session._disconnect_grace_task = _spawn(
+                _disconnect_grace_finalizer(session, subject_id, DISCONNECT_GRACE_PERIOD_SECONDS)
+            )
+            logger.info(
+                f"[WS] Client disconnesso per lezione {session.lecture_id}: "
+                f"sessione in pausa, timer di grazia ({DISCONNECT_GRACE_PERIOD_SECONDS}s) avviato."
+            )
 
 
 # ── REST: Generazione Capitolo Quaderno su richiesta ──────────────────────────
@@ -1048,14 +1268,24 @@ async def generate_summary_for_lecture(
     if not lecture:
         raise HTTPException(status_code=404, detail="Lezione non trovata.")
 
-    transcript = lecture.raw_transcript or lecture.processed_notes or ""
+    has_raw = bool(lecture.raw_transcript and lecture.raw_transcript.strip())
+    transcript = lecture.raw_transcript if has_raw else (lecture.processed_notes or "")
     if not transcript.strip():
         raise HTTPException(status_code=400, detail="Nessun testo disponibile per generare il capitolo.")
 
     from rag import query_context, index_lecture, unload_embedding_model
-    from llm_engine import generate_lecture_chapter, clear_metal_cache, unload_whisper, unload_llm
+    from llm_engine import (
+        cancel_epoch,
+        clear_metal_cache,
+        generate_lecture_chapter,
+        is_cancelled,
+        unload_llm,
+        unload_whisper,
+    )
     from config import load_settings
     from database import Bookmark
+
+    start_epoch = cancel_epoch()
 
     # Unload coordinato di Whisper prima del riassunto (non durante una lezione live)
     if not has_active_sessions():
@@ -1070,26 +1300,34 @@ async def generate_summary_for_lecture(
         if bms else "Nessun segnalibro specifico inserito."
     )
 
-    past_refs = await asyncio.to_thread(
-        query_context,
-        subject_id=lecture.subject_id,
-        query=transcript[:1500],
-        top_k=3,
-        priority_previous_lecture=True,
-    )
-    # Scarica embedding prima di allocare l'LLM pesante per non superare gli 8GB di memoria
-    unload_embedding_model()
-    clear_metal_cache()
+    from transcript_cleaner import clean_transcript_for_llm
+    cleaned_for_query = clean_transcript_for_llm(transcript) if has_raw else transcript
+    try:
+        past_refs = await asyncio.to_thread(
+            query_context,
+            subject_id=lecture.subject_id,
+            query=cleaned_for_query[:1500],
+            top_k=3,
+            priority_previous_lecture=True,
+        )
+    finally:
+        # Scarica embedding prima di allocare l'LLM pesante per non superare gli 8GB di memoria
+        unload_embedding_model()
+        clear_metal_cache()
 
     try:
+        if is_cancelled(start_epoch):
+            raise InterruptedError("Generazione interrotta dall'utente.")
         chapter = await generate_lecture_chapter(
             title=lecture.title,
             transcript=transcript,
             past_references=past_refs,
             bookmarks_summary=bm_summary,
             model_id=llm_model,
+            clean_transcript=has_raw,
         )
     except InterruptedError:
+        unload_llm()
         clear_metal_cache()
         logger.info(f"[Lectures] Generazione sintesi per lezione {lecture_id} interrotta. Nessun salvataggio.")
         return {
@@ -1100,11 +1338,14 @@ async def generate_summary_for_lecture(
         }
     except Exception as exc:
         # Le note esistenti NON vengono sovrascritte con un messaggio d'errore
+        unload_llm()
         clear_metal_cache()
         logger.error(f"[Lectures] Generazione sintesi per lezione {lecture_id} fallita: {exc}")
         raise HTTPException(status_code=500, detail=f"Generazione del capitolo non riuscita: {exc}")
 
     if not chapter:
+        unload_llm()
+        clear_metal_cache()
         raise HTTPException(status_code=500, detail="Il modello non ha prodotto alcun capitolo.")
 
     lecture.processed_notes = chapter
@@ -1115,22 +1356,190 @@ async def generate_summary_for_lecture(
     clear_metal_cache()
 
     # Indicizzazione automatica in LanceDB solo se completata con successo
-    await asyncio.to_thread(
-        index_lecture,
-        subject_id=lecture.subject_id,
-        lecture_id=lecture.id,
-        title=lecture.title,
-        transcript=transcript,
-        notes=chapter,
-    )
-    unload_embedding_model()
-    clear_metal_cache()
+    try:
+        await asyncio.to_thread(
+            index_lecture,
+            subject_id=lecture.subject_id,
+            lecture_id=lecture.id,
+            title=lecture.title,
+            transcript=transcript,
+            notes=chapter,
+        )
+    finally:
+        unload_embedding_model()
+        clear_metal_cache()
 
     return {
         "status": "success",
         "lecture_id": lecture_id,
         "processed_notes": chapter,
     }
+
+
+@app.post("/api/v1/lectures/{lecture_id}/generate-summary-stream", tags=["Lectures"])
+async def generate_summary_stream_for_lecture(
+    lecture_id: int,
+    payload: Optional[GenerateSummaryRequest] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Genera il capitolo completo per il Quaderno di studio inviando eventi di progresso in streaming NDJSON.
+    Mantiene aperta la connessione TCP inviando battiti di keep-alive per evitare timeout o disconnessioni socket su Windows/macOS.
+    """
+    lecture = db.query(Lecture).filter(Lecture.id == lecture_id).first()
+    if not lecture:
+        raise HTTPException(status_code=404, detail="Lezione non trovata.")
+
+    has_raw = bool(lecture.raw_transcript and lecture.raw_transcript.strip())
+    transcript = lecture.raw_transcript if has_raw else (lecture.processed_notes or "")
+    if not transcript.strip():
+        raise HTTPException(status_code=400, detail="Nessun testo disponibile per generare il capitolo.")
+
+    from rag import query_context, index_lecture, unload_embedding_model
+    from llm_engine import (
+        cancel_epoch,
+        clear_metal_cache,
+        generate_lecture_chapter,
+        is_cancelled,
+        unload_llm,
+        unload_whisper,
+    )
+    from config import load_settings
+    from database import Bookmark
+
+    start_epoch = cancel_epoch()
+    if not has_active_sessions():
+        await asyncio.to_thread(unload_whisper)
+
+    settings = load_settings()
+    llm_model = (payload.model_id if payload else None) or settings.get("llm_model")
+
+    bms = db.query(Bookmark).filter(Bookmark.lecture_id == lecture_id).all()
+    bm_summary = (
+        "\n".join([f"- Segnalibro a {b.timestamp_seconds:.1f}s: {b.note}" for b in bms])
+        if bms else "Nessun segnalibro specifico inserito."
+    )
+
+    from transcript_cleaner import clean_transcript_for_llm
+    cleaned_for_query = clean_transcript_for_llm(transcript) if has_raw else transcript
+    try:
+        past_refs = await asyncio.to_thread(
+            query_context,
+            subject_id=lecture.subject_id,
+            query=cleaned_for_query[:1500],
+            top_k=3,
+            priority_previous_lecture=True,
+        )
+    finally:
+        unload_embedding_model()
+        clear_metal_cache()
+
+    queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def _on_progress(event_dict: Dict[str, Any]) -> None:
+        try:
+            line = json.dumps(event_dict, ensure_ascii=False) + "\n"
+            loop.call_soon_threadsafe(queue.put_nowait, line)
+        except Exception:
+            pass
+
+    async def _worker():
+        try:
+            if is_cancelled(start_epoch):
+                raise InterruptedError("Generazione interrotta dall'utente.")
+            chapter = await generate_lecture_chapter(
+                title=lecture.title,
+                transcript=transcript,
+                past_references=past_refs,
+                bookmarks_summary=bm_summary,
+                model_id=llm_model,
+                clean_transcript=has_raw,
+                progress_callback=_on_progress,
+            )
+            if not chapter:
+                unload_llm()
+                clear_metal_cache()
+                _on_progress({"stage": "error", "message": "Il modello non ha prodotto alcun capitolo."})
+                return
+
+            lecture.processed_notes = chapter
+            db.commit()
+
+            unload_llm()
+            clear_metal_cache()
+
+            try:
+                await asyncio.to_thread(
+                    index_lecture,
+                    subject_id=lecture.subject_id,
+                    lecture_id=lecture.id,
+                    title=lecture.title,
+                    transcript=transcript,
+                    notes=chapter,
+                )
+            finally:
+                unload_embedding_model()
+                clear_metal_cache()
+
+            _on_progress({
+                "stage": "done",
+                "status": "success",
+                "lecture_id": lecture_id,
+                "processed_notes": chapter,
+                "progress": 100,
+            })
+        except InterruptedError:
+            unload_llm()
+            clear_metal_cache()
+            _on_progress({
+                "stage": "cancelled",
+                "status": "cancelled",
+                "lecture_id": lecture_id,
+                "processed_notes": lecture.processed_notes or "",
+                "message": "Generazione annullata dall'utente.",
+            })
+        except Exception as exc:
+            unload_llm()
+            clear_metal_cache()
+            logger.error(f"[Lectures Stream] Errore capitolo lezione {lecture_id}: {exc}")
+            _on_progress({
+                "stage": "error",
+                "status": "error",
+                "message": f"Generazione non riuscita: {exc}",
+            })
+        finally:
+            try:
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+            except Exception:
+                pass
+
+    worker_task = asyncio.create_task(_worker())
+
+    async def _event_generator():
+        try:
+            while True:
+                try:
+                    # Timeout a 2.0s per inviare battito keep-alive anti-drop su Windows
+                    item = await asyncio.wait_for(queue.get(), timeout=2.0)
+                    if item is None:
+                        break
+                    yield item.encode("utf-8")
+                except asyncio.TimeoutError:
+                    # Commento keep-alive NDJSON standard
+                    yield b": keep-alive\n"
+        except asyncio.CancelledError:
+            worker_task.cancel()
+            raise
+
+    return StreamingResponse(
+        _event_generator(),
+        media_type="application/x-ndjson",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/api/v1/lectures/{lecture_id}/questions/{question_id}/answer", tags=["Lectures"])
@@ -1183,8 +1592,10 @@ async def answer_lecture_question_endpoint(
     if not target_q:
         raise HTTPException(status_code=404, detail="Domanda non trovata.")
 
+    from transcript_cleaner import clean_transcript_for_llm
     q_text = target_q.get("question", "")
-    context = lecture.processed_notes or lecture.raw_transcript or lecture.title or ""
+    raw_fallback = clean_transcript_for_llm(lecture.raw_transcript) if lecture.raw_transcript else ""
+    context = (lecture.processed_notes or raw_fallback or lecture.title or "")[:12000]
 
     answer = await generate_flash_answer(question=q_text, context=context, model_id=llm_model)
 
@@ -1355,42 +1766,73 @@ async def course_chat_endpoint(
 @app.post("/api/v1/subjects/{subject_id}/reindex", tags=["Subjects"])
 def reindex_subject_knowledge(subject_id: int, db: Session = Depends(get_db)):
     """Indicizza tutte le lezioni e i materiali della materia in LanceDB."""
-    from rag import index_lecture, index_material_document
+    from pathlib import Path
+    import llm_engine
+    from rag import index_lecture, index_material_document, index_material_pages, unload_embedding_model
     from database import Subject, Lecture
-    from routers.subjects import list_materials
+    from routers.subjects import list_materials, _extract_pdf_pages, _extract_pptx_pages, _resolve_material_file
 
     subject = db.query(Subject).filter(Subject.id == subject_id).first()
     if not subject:
         raise HTTPException(status_code=404, detail="Materia non trovata.")
 
-    lectures = db.query(Lecture).filter(Lecture.subject_id == subject_id).all()
-    count_chunks = 0
-    for lec in lectures:
-        if lec.raw_transcript or lec.processed_notes:
-            n = index_lecture(
-                subject_id=subject_id,
-                lecture_id=lec.id,
-                title=lec.title,
-                transcript=lec.raw_transcript or "",
-                notes=lec.processed_notes,
-            )
-            count_chunks += n
+    llm_engine.unload_llm()
+    try:
+        lectures = db.query(Lecture).filter(Lecture.subject_id == subject_id).all()
+        count_chunks = 0
+        for lec in lectures:
+            if lec.raw_transcript or lec.processed_notes:
+                n = index_lecture(
+                    subject_id=subject_id,
+                    lecture_id=lec.id,
+                    title=lec.title,
+                    transcript=lec.raw_transcript or "",
+                    notes=lec.processed_notes,
+                )
+                count_chunks += n
 
-    materials = list_materials(subject_id=subject_id, db=db)
-    for m in materials:
-        # Le voci "lecture" sono già indicizzate sopra con index_lecture: re-indicizzarle come
-        # materiale duplicherebbe i vettori (che sopravvivrebbero all'eliminazione della lezione)
-        if m.content and m.type != "lecture":
-            n = index_material_document(
-                subject_id=subject_id,
-                material_id=m.id,
-                title=m.name,
-                content=m.content,
-                source_type=m.type,
-            )
-            count_chunks += n
+        materials = list_materials(subject_id=subject_id, db=db)
+        for m in materials:
+            # Le voci "lecture" sono già indicizzate sopra con index_lecture: re-indicizzarle come
+            # materiale duplicherebbe i vettori (che sopravvivrebbero all'eliminazione della lezione)
+            if m.type == "lecture":
+                continue
 
-    return {"status": "success", "subject_id": subject_id, "indexed_chunks": count_chunks}
+            ext = Path(m.name).suffix.lower() if m.name else ""
+            if not m.isAutoImported and ext in (".pdf", ".pptx"):
+                try:
+                    _, resolved = _resolve_material_file(subject_id, m.id, db)
+                    pages = _extract_pdf_pages(resolved) if ext == ".pdf" else _extract_pptx_pages(resolved)
+                    if pages:
+                        n = index_material_pages(
+                            subject_id=subject_id,
+                            source_id=m.id,
+                            title=m.name,
+                            pages=pages,
+                            source_type="slide",
+                        )
+                        count_chunks += n
+                        continue
+                except Exception as exc:
+                    logger.warning(f"[Reindex] Estrazione pagine fallita per '{m.name}', fallback a testo: {exc}")
+
+            if m.content:
+                n = index_material_document(
+                    subject_id=subject_id,
+                    material_id=m.id,
+                    title=m.name,
+                    content=m.content,
+                    source_type=m.type,
+                )
+                count_chunks += n
+
+        return {"status": "success", "subject_id": subject_id, "indexed_chunks": count_chunks}
+    finally:
+        try:
+            unload_embedding_model()
+        except Exception:
+            pass
+        llm_engine.clear_metal_cache()
 
 
 # ── REST: Arresto di Emergenza IA & Raffreddamento Mac (Zero Calore) ───────────

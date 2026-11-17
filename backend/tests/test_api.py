@@ -169,13 +169,13 @@ def test_settings_get_does_not_rewrite_file(client):
 
 
 def test_settings_audio_format_toggle(client):
-    """Verifica che il formato di salvataggio audio sia modificabile e persistito."""
+    """Verifica che audio_format resti normalizzato sullo standard unico m4a."""
     r = client.patch("/api/v1/settings/", json={"audio_format": "wav"})
     assert r.status_code == 200
-    assert r.json()["audio_format"] == "wav"
+    assert r.json()["audio_format"] == "m4a"
 
     cur = client.get("/api/v1/settings/").json()
-    assert cur["audio_format"] == "wav"
+    assert cur["audio_format"] == "m4a"
 
     r2 = client.patch("/api/v1/settings/", json={"audio_format": "m4a"})
     assert r2.status_code == 200
@@ -265,6 +265,37 @@ def test_generate_summary_uses_requested_model_and_keeps_notes_on_error(client, 
     r = client.post(f"/api/v1/lectures/{lec['id']}/generate-summary")
     assert r.status_code == 500
     assert client.get(f"/api/v1/lectures/{lec['id']}").json()["processed_notes"] == "# Capitolo"
+
+
+def test_generate_summary_stream_success_and_progress(client, subject, no_rag, monkeypatch):
+    import json
+    import llm_engine
+    lec = client.post(
+        "/api/v1/lectures/",
+        json={
+            "subject_id": subject["id"],
+            "title": "Lezione Stream Test",
+            "date": "2026-11-14",
+            "raw_transcript": "Trascrizione test di prova per capitolo in streaming.",
+        },
+    ).json()
+
+    for name in ("clear_metal_cache", "unload_whisper", "unload_llm"):
+        monkeypatch.setattr(llm_engine, name, lambda *a, **kw: None)
+
+    async def mock_chapter(**kw):
+        cb = kw.get("progress_callback")
+        if cb:
+            cb({"stage": "chunk", "progress": 50, "message": "Blocco 1"})
+        return "# Capitolo Stream"
+
+    monkeypatch.setattr(llm_engine, "generate_lecture_chapter", mock_chapter)
+    r = client.post(f"/api/v1/lectures/{lec['id']}/generate-summary-stream")
+    assert r.status_code == 200
+    lines = [json.loads(line) for line in r.text.strip().split("\n") if line.strip() and not line.startswith(":")]
+    assert any(line.get("stage") == "chunk" and line.get("progress") == 50 for line in lines)
+    assert any(line.get("stage") == "done" and line.get("processed_notes") == "# Capitolo Stream" for line in lines)
+    assert client.get(f"/api/v1/lectures/{lec['id']}").json()["processed_notes"] == "# Capitolo Stream"
 
 
 def test_course_chat_tolerates_null_suggested_answers(client, subject, no_rag, monkeypatch):

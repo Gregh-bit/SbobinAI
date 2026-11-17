@@ -5,6 +5,7 @@ import { api } from './api';
 export interface AppSettings {
   setupComplete: boolean;
   modelsDownloaded: boolean;
+  llmDownloaded?: boolean;
   autoUpdate: boolean;
   storagePath: string;
   whisperModel: string;
@@ -26,6 +27,7 @@ interface SettingsContextType {
 const DEFAULT_SETTINGS: AppSettings = {
   setupComplete: false,
   modelsDownloaded: false,
+  llmDownloaded: false,
   autoUpdate: true,
   storagePath: '~/Documents/SbobinAI',
   whisperModel: 'large-v3-turbo-q4',
@@ -101,16 +103,23 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         }
       }
 
+      const hasRealWhisper = Boolean(
+        modelsData &&
+        typeof modelsData === 'object' &&
+        modelsData.whisper?.some((m: any) => m.id !== 'mock_mode' && m.downloaded)
+      );
+
+      const hasRealLLM = Boolean(
+        modelsData &&
+        typeof modelsData === 'object' &&
+        modelsData.llm?.some((m: any) => m.downloaded)
+      );
+
       if (modelsData && typeof modelsData === 'object') {
-        const hasRealWhisper = modelsData.whisper?.some(
-          (m: any) => m.id !== 'mock_mode' && m.downloaded
-        );
-        const hasAnyInstalled = (modelsData.installed_count && modelsData.installed_count > 0) || Boolean(hasRealWhisper);
-        patch.modelsDownloaded = Boolean(hasRealWhisper);
-        if (hasRealWhisper || hasAnyInstalled) {
+        patch.modelsDownloaded = hasRealWhisper;
+        patch.llmDownloaded = hasRealLLM;
+        if (hasRealWhisper) {
           patch.setupComplete = true;
-        }
-        if (hasAnyInstalled) {
           if (!patch.whisperModel || patch.whisperModel === 'mock_mode' || patch.whisperModel === 'dual-tier-whisper') {
             patch.whisperModel = 'large-v3-turbo-q4';
           }
@@ -118,12 +127,23 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       }
 
       setSettings((prev) => {
-        // Non retrocedere mai a setupComplete=false se in locale era già true o se i modelli sono su disco
-        const nextSetupComplete = (patch.setupComplete ?? prev.setupComplete) || prev.setupComplete;
+        // Se il backend indica setup non completato e non c'è nessun Whisper su disco
+        // (es. reinstallazione dopo residui WebView/localStorage), forza il Wizard.
+        const backendExplicitlyIncomplete =
+          settingsData !== null &&
+          typeof settingsData === 'object' &&
+          settingsData.setup_complete !== true &&
+          modelsData !== null &&
+          !hasRealWhisper;
+
+        const nextSetupComplete = backendExplicitlyIncomplete
+          ? false
+          : (patch.setupComplete ?? prev.setupComplete) || prev.setupComplete;
+
         const merged = { ...prev, ...patch, setupComplete: nextSetupComplete };
-        // Se il setup risulta completato ma il backend aveva setup_complete=false, sincronizzalo al backend
-        if (nextSetupComplete && settingsData && settingsData.setup_complete !== true) {
-          void api.settings.update({ setup_complete: true, models_downloaded: merged.modelsDownloaded }).catch(() => null);
+        // Sincronizza al backend solo se il modello Whisper reale esiste davvero su disco
+        if (nextSetupComplete && settingsData && settingsData.setup_complete !== true && hasRealWhisper) {
+          void api.settings.update({ setup_complete: true, models_downloaded: true }).catch(() => null);
         }
         return merged;
       });

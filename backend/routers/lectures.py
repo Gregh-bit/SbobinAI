@@ -6,6 +6,7 @@ from typing import List
 import os
 import json
 import threading
+import re
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi.responses import FileResponse
@@ -14,6 +15,7 @@ from sqlalchemy.orm import Session
 from database import Bookmark, Lecture, Subject, get_db
 from schemas import BookmarkCreate, BookmarkOut, LectureCreate, LectureOut, LectureUpdate
 from rag import delete_lecture_vectors
+from transcript_cleaner import clean_transcript_for_llm
 
 router = APIRouter(prefix="/lectures", tags=["Lectures"])
 
@@ -132,6 +134,8 @@ def get_lecture_audio(lecture_id: int, db: Session = Depends(get_db)):
 def _normalize_karaoke_lines(raw_data) -> List[dict]:
     """Converte i dati grezzi nella struttura standard Apple Music (millisecondi)."""
     lines = []
+    if isinstance(raw_data, dict):
+        raw_data = raw_data.get("lines") or raw_data.get("segments") or []
     if not isinstance(raw_data, list):
         return []
 
@@ -195,6 +199,99 @@ def _normalize_karaoke_lines(raw_data) -> List[dict]:
     return lines
 
 
+_HALLUCINATION_FORMULAS = [
+    "grazie a tutti",
+    "grazie per la visione",
+    "grazie per l'attenzione",
+    "grazie dell'attenzione",
+    "grazie per l'ascolto",
+    "grazie dell'ascolto",
+    "grazie per aver guardato",
+    "grazie per averci seguito",
+    "grazie di tutto",
+    "grazie mille",
+    "sottotitoli a cura di",
+    "sottotitoli",
+    "iscriviti al canale",
+    "iscrivetevi al canale",
+    "amara.org",
+    "alla prossima puntata",
+    "al prossimo video",
+    "buona visione",
+    "sigla iniziale",
+    "sigla finale",
+]
+
+
+def _validate_timestamp_lines(lines: list, raw_transcript: str | None) -> tuple[bool, str]:
+    """
+    Valida la coerenza e l'integrità dei segmenti karaoke rispetto a lecture.raw_transcript.
+    Rileva cache corrotte, formule allucinatorie Whisper ("grazie a tutti", "sottotitoli", ecc.),
+    loop di ripetizione consecutivi o discrepanze lessicali rispetto alla vera trascrizione.
+    Restituisce (True, "ok") se valido, oppure (False, motivo_del_fallimento).
+    """
+    if not lines or not isinstance(lines, list):
+        return False, "lista linee vuota o non valida"
+
+    line_texts = [
+        " ".join(w.get("text", "") for w in line.get("words", [])).strip()
+        for line in lines
+        if isinstance(line, dict)
+    ]
+    line_texts = [lt for lt in line_texts if lt]
+    if not line_texts:
+        return False, "nessun testo estratto dalle linee"
+
+    cache_full_text = " ".join(line_texts).strip()
+    cache_lower = cache_full_text.lower().replace("’", "'")
+    raw_text = (raw_transcript or "").strip()
+    raw_lower = raw_text.lower().replace("’", "'")
+
+    cache_words = [w for w in re.findall(r"\b\w+\b", cache_lower) if w]
+    raw_words = [w for w in re.findall(r"\b\w+\b", raw_lower) if w]
+    raw_word_count = len(raw_words)
+
+    # 1. Controllo formule allucinatorie tipiche di Whisper se NON presenti nel testo reale raw_transcript
+    for needle in _HALLUCINATION_FORMULAS:
+        needle_norm = needle.lower().replace("’", "'")
+        if needle_norm in cache_lower and needle_norm not in raw_lower:
+            return False, f"formula allucinatoria '{needle}' non presente in raw_transcript"
+
+    # 2. Se raw_transcript ha testo valido (>= 15 parole)
+    if raw_word_count >= 15:
+        # A. Rapporto parole cache vs raw_transcript (< 30%)
+        if len(cache_words) < 0.3 * raw_word_count:
+            return False, f"cache ha troppo poche parole ({len(cache_words)}) rispetto a raw_transcript ({raw_word_count})"
+
+        # B. Ripetizioni consecutive identiche (>= 2)
+        norm_raw_compact = " ".join(re.sub(r"[^\w\s]", " ", raw_lower).split())
+        for idx in range(1, len(line_texts)):
+            prev = " ".join(re.sub(r"[^\w\s]", " ", line_texts[idx - 1].lower()).split())
+            curr = " ".join(re.sub(r"[^\w\s]", " ", line_texts[idx].lower()).split())
+            if prev and curr and prev == curr and len(curr) >= 3:
+                double_curr = f"{curr} {curr}"
+                if double_curr not in norm_raw_compact or (idx >= 2 and curr == " ".join(re.sub(r"[^\w\s]", " ", line_texts[idx - 2].lower()).split())):
+                    return False, f"ripetizione consecutiva identica rilevata: '{line_texts[idx]}'"
+
+        # C. Sovrapposizione lessicale rispetto alle parole della vera trascrizione
+        raw_words_set = set(w for w in raw_words if len(w) >= 3)
+        if raw_words_set:
+            cache_sig_words = [w for w in cache_words if len(w) >= 3]
+            if cache_sig_words:
+                overlap = sum(1 for w in cache_sig_words if w in raw_words_set) / len(cache_sig_words)
+                if overlap < 0.35:
+                    return False, f"sovrapposizione lessicale troppo bassa ({overlap:.1%}) rispetto a raw_transcript"
+    else:
+        # Se raw_transcript ha < 15 parole, controlla comunque ripetizioni identiche consecutive (>= 2)
+        for idx in range(1, len(line_texts)):
+            prev = " ".join(re.sub(r"[^\w\s]", " ", line_texts[idx - 1].lower()).split())
+            curr = " ".join(re.sub(r"[^\w\s]", " ", line_texts[idx].lower()).split())
+            if prev and curr and prev == curr and len(curr) >= 3:
+                return False, f"ripetizione consecutiva identica rilevata in testo breve: '{line_texts[idx]}'"
+
+    return True, "ok"
+
+
 def compute_proportional_timestamps(lecture) -> dict:
     """
     Allineamento proporzionale su raw_transcript e duration_seconds.
@@ -204,11 +301,14 @@ def compute_proportional_timestamps(lecture) -> dict:
     if not raw_text:
         return {"lines": [], "segments": [], "cached": False}
 
-    duration_ms = int(round(float(lecture.duration_seconds or 30.0) * 1000))
-    words = [w for w in raw_text.split() if w]
+    cleaned_text = clean_transcript_for_llm(raw_text).strip()
+    words = [w for w in cleaned_text.split() if w]
+    if not words:
+        words = [w for w in raw_text.split() if w]
     if not words:
         return {"lines": [], "segments": [], "cached": False}
 
+    duration_ms = int(round(float(lecture.duration_seconds or 30.0) * 1000))
     time_per_word = max(250, duration_ms // max(1, len(words)))
     lines = []
     seg_size = 7
@@ -245,64 +345,141 @@ def compute_and_cache_lecture_timestamps(lecture_id: int) -> dict:
         audio_path = lecture.audio_path
         cache_path = (audio_path + ".timestamps.json") if audio_path else None
 
-        # 1. Controlla cache su disco esistente
+        # 1. Controlla cache su disco esistente con validazione rigorosa
         if cache_path and os.path.isfile(cache_path):
+            cache_is_corrupt = False
+            lines = []
             try:
                 with open(cache_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     lines = _normalize_karaoke_lines(data)
+                is_valid, reason = _validate_timestamp_lines(lines, lecture.raw_transcript)
+                if not is_valid:
+                    cache_is_corrupt = True
+                    print(
+                        f"[Timestamps] Cache su disco corrotta per lezione {lecture_id} ({reason}). "
+                        "Rimuovo file e ricalcolo con allineamento proporzionale su raw_transcript."
+                    )
+                else:
                     return {"lines": lines, "segments": lines, "cached": True}
-            except Exception:
-                pass
+            except Exception as exc:
+                cache_is_corrupt = True
+                print(f"[Timestamps] Errore lettura cache su disco per lezione {lecture_id}: {exc}")
 
-        # 2. Se abbiamo il file audio e Whisper è disponibile, calcola con Whisper
+            if cache_is_corrupt:
+                try:
+                    os.remove(cache_path)
+                except Exception:
+                    pass
+                clean_result = compute_proportional_timestamps(lecture)
+                clean_lines = clean_result.get("lines", [])
+                if cache_path and clean_lines:
+                    try:
+                        with open(cache_path, "w", encoding="utf-8") as f:
+                            json.dump(clean_lines, f, ensure_ascii=False)
+                    except Exception:
+                        pass
+                return clean_result
+
+        # 2. Se abbiamo il file audio e Whisper è disponibile, calcola con Whisper in streaming a finestre
         if audio_path and os.path.isfile(audio_path):
             try:
                 import ai_models
-                from transcriber import _WHISPER_SPEC, USE_MLX, release_metal_cache, _transcription_lock, _decode_audio_file
+                from transcriber import (
+                    _WHISPER_SPEC,
+                    USE_MLX,
+                    release_metal_cache,
+                    _transcription_lock,
+                    _iter_decoded_audio_windows,
+                    _is_digital_silence,
+                )
                 model_path = ai_models.local_model_path(_WHISPER_SPEC)
                 if model_path:
-                    with _transcription_lock:
-                        audio_input = _decode_audio_file(audio_path)
-                        if USE_MLX:
-                            import mlx_whisper
-                            res = mlx_whisper.transcribe(
-                                audio_input,
-                                path_or_hf_repo=model_path,
-                                word_timestamps=True,
-                                language="it",
-                                temperature=(0.0,),
-                                condition_on_previous_text=False,
-                                fp16=True,
-                            )
-                            raw_segs = list(res.get("segments") or [])
-                        else:
-                            from transcriber import faster_whisper_word_segments
-                            raw_segs = faster_whisper_word_segments(model_path, audio_input, language="it")
-
                     raw_converted = []
-                    for s_idx, seg in enumerate(raw_segs):
-                        w_list = []
-                        words_src = seg.words if hasattr(seg, "words") else seg.get("words", [])
-                        for w in words_src:
-                            w_word = getattr(w, "word", None) if hasattr(w, "word") else w.get("word", "")
-                            w_start = getattr(w, "start", 0.0) if hasattr(w, "start") else w.get("start", 0.0)
-                            w_end = getattr(w, "end", 0.0) if hasattr(w, "end") else w.get("end", 0.0)
-                            w_list.append({
-                                "text": str(w_word).strip(),
-                                "start": round(float(w_start), 3),
-                                "end": round(float(w_end), 3),
-                            })
-                        seg_start = getattr(seg, "start", 0.0) if hasattr(seg, "start") else seg.get("start", 0.0)
-                        seg_end = getattr(seg, "end", 0.0) if hasattr(seg, "end") else seg.get("end", 0.0)
-                        raw_converted.append({
-                            "id": s_idx,
-                            "start": round(float(seg_start), 3),
-                            "end": round(float(seg_end), 3),
-                            "words": w_list,
-                        })
+                    seg_counter = 0
+                    cumulative_sec = 0.0
+                    with _transcription_lock:
+                        for chunk_audio, new_dur_sec, is_first in _iter_decoded_audio_windows(audio_path):
+                            new_end_sec = cumulative_sec + new_dur_sec
+                            chunk_dur = chunk_audio.size / 16000.0
+                            window_start_sec = max(0.0, new_end_sec - chunk_dur)
+                            cutoff_sec = 0.0 if is_first else cumulative_sec
+                            try:
+                                if _is_digital_silence(chunk_audio):
+                                    continue
+                                if USE_MLX:
+                                    import mlx_whisper
+                                    res = mlx_whisper.transcribe(
+                                        chunk_audio,
+                                        path_or_hf_repo=model_path,
+                                        word_timestamps=True,
+                                        language="it",
+                                        temperature=(0.0,),
+                                        condition_on_previous_text=False,
+                                        fp16=True,
+                                    )
+                                    raw_segs = list(res.get("segments") or [])
+                                else:
+                                    from transcriber import faster_whisper_word_segments
+                                    raw_segs = faster_whisper_word_segments(model_path, chunk_audio, language="it")
+
+                                for seg in raw_segs:
+                                    words_src = (seg.words if hasattr(seg, "words") else seg.get("words")) or []
+                                    raw_s = getattr(seg, "start", None) if hasattr(seg, "start") else seg.get("start")
+                                    raw_e = getattr(seg, "end", None) if hasattr(seg, "end") else seg.get("end")
+                                    if raw_s is None and words_src:
+                                        w0 = words_src[0]
+                                        raw_s = getattr(w0, "start", 0.0) if hasattr(w0, "start") else w0.get("start", 0.0)
+                                    if raw_e is None and words_src:
+                                        wl = words_src[-1]
+                                        raw_e = getattr(wl, "end", 0.0) if hasattr(wl, "end") else wl.get("end", 0.0)
+                                    seg_start = float(raw_s or 0.0) + window_start_sec
+                                    seg_end = float(raw_e or 0.0) + window_start_sec
+                                    if seg_end <= cutoff_sec + 0.02:
+                                        continue
+                                    w_list = []
+                                    for w in words_src:
+                                        w_word = getattr(w, "word", None) if hasattr(w, "word") else w.get("word", "")
+                                        w_start = float(getattr(w, "start", 0.0) if hasattr(w, "start") else w.get("start", 0.0)) + window_start_sec
+                                        w_end = float(getattr(w, "end", 0.0) if hasattr(w, "end") else w.get("end", 0.0)) + window_start_sec
+                                        if w_end <= cutoff_sec + 0.02:
+                                            continue
+                                        w_list.append({
+                                            "text": str(w_word).strip(),
+                                            "start": round(max(cutoff_sec, w_start), 3),
+                                            "end": round(w_end, 3),
+                                        })
+                                    if w_list:
+                                        raw_converted.append({
+                                            "id": seg_counter,
+                                            "start": round(max(cutoff_sec, seg_start), 3),
+                                            "end": round(seg_end, 3),
+                                            "words": w_list,
+                                        })
+                                        seg_counter += 1
+                            finally:
+                                cumulative_sec = new_end_sec
+                                del chunk_audio
+                                release_metal_cache()
 
                     lines = _normalize_karaoke_lines(raw_converted)
+
+                    # Validazione rigorosa segmenti Whisper estratti
+                    is_valid, reason = _validate_timestamp_lines(lines, lecture.raw_transcript)
+                    if not is_valid and bool((lecture.raw_transcript or "").strip()):
+                        print(
+                            f"[Timestamps] Segmenti Whisper scartati per lezione {lecture_id} ({reason}). "
+                            "Uso allineamento proporzionale basato su vera trascrizione raw_transcript."
+                        )
+                        clean_result = compute_proportional_timestamps(lecture)
+                        clean_lines = clean_result.get("lines", [])
+                        if cache_path and clean_lines:
+                            try:
+                                with open(cache_path, "w", encoding="utf-8") as f:
+                                    json.dump(clean_lines, f, ensure_ascii=False)
+                            except Exception:
+                                pass
+                        return clean_result
 
                     # Salva in cache su disco
                     if cache_path and lines:
@@ -353,8 +530,8 @@ def get_lecture_timestamps(
     """
     Restituisce la trascrizione sincronizzata parola per parola nel formato standard Apple Music.
     Tempi espressi rigorosamente in millisecondi (lineStart, lineEnd, words[{text, start, end}]).
-    Se il file cache non esiste, restituisce subito la stima proporzionale e schedula il calcolo
-    completo con Whisper in background, evitando di bloccare la chiamata HTTP per minuti.
+    Se il file cache non esiste o è corrotto, restituisce subito la stima proporzionale pulita
+    e schedula il calcolo completo con Whisper in background se disponibile, evitando blocchi.
     """
     lecture = db.query(Lecture).filter(Lecture.id == lecture_id).first()
     if not lecture:
@@ -363,25 +540,43 @@ def get_lecture_timestamps(
     audio_path = lecture.audio_path
     cache_path = (audio_path + ".timestamps.json") if audio_path else None
 
-    # Se esiste la cache su disco, restituiscila subito
+    # Se esiste la cache su disco, validala prima di restituirla
     if cache_path and os.path.isfile(cache_path):
         try:
             with open(cache_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 lines = _normalize_karaoke_lines(data)
-                return {"lines": lines, "segments": lines, "cached": True}
+                is_valid, reason = _validate_timestamp_lines(lines, lecture.raw_transcript)
+                if is_valid:
+                    return {"lines": lines, "segments": lines, "cached": True}
+                else:
+                    print(f"[Timestamps] Cache su disco non valida per lezione {lecture_id} ({reason}): eliminazione...")
+                    try:
+                        os.remove(cache_path)
+                    except Exception:
+                        pass
         except Exception:
-            pass
+            try:
+                os.remove(cache_path)
+            except Exception:
+                pass
 
-    # Schedula il calcolo pesante con Whisper in background se non già in corso
+    # Schedula il calcolo con Whisper in background se audio disponibile e non già in corso
     if audio_path and os.path.isfile(audio_path):
         with _pending_lock:
             if lecture_id not in _pending_timestamp_tasks:
                 _pending_timestamp_tasks.add(lecture_id)
                 background_tasks.add_task(_bg_compute_timestamps, lecture_id)
 
-    # Restituisce immediatamente la stima proporzionale
-    return compute_proportional_timestamps(lecture)
+    # Restituisce immediatamente la stima proporzionale pulita e salvala se cache assente
+    result = compute_proportional_timestamps(lecture)
+    if cache_path and result.get("lines"):
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(result["lines"], f, ensure_ascii=False)
+        except Exception:
+            pass
+    return result
 
 
 @router.delete("/{lecture_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -436,7 +631,29 @@ def delete_lecture(lecture_id: int, db: Session = Depends(get_db)):
     # 3. Eliminazione segnalibri associati
     db.query(Bookmark).filter(Bookmark.lecture_id == lecture_id).delete()
 
-    # 4. Eliminazione da SQLite
+    # 4. Pulizia a cascata dello scope in tutte le sessioni di chat della materia
+    try:
+        from database import ChatSession
+        sessions = db.query(ChatSession).filter(ChatSession.subject_id == subject_id).all()
+        for s in sessions:
+            if not s.scope_json:
+                continue
+            try:
+                s_scope = json.loads(s.scope_json)
+                if isinstance(s_scope, dict):
+                    lecs = s_scope.get("lecture_ids") or []
+                    if lecture_id in lecs:
+                        s_scope["lecture_ids"] = [lid for lid in lecs if lid != lecture_id]
+                        s.scope_json = json.dumps(s_scope, ensure_ascii=False)
+            except Exception:
+                pass
+    except Exception as e:
+        import logging
+        logging.getLogger("sbobinai.lectures").warning(
+            f"Errore pulizia scope chat per lezione {lecture_id}: {e}"
+        )
+
+    # 5. Eliminazione da SQLite
     db.delete(lecture)
     db.commit()
 

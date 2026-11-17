@@ -33,6 +33,8 @@ export default {
           '"SF Pro Display"',
           '"SF Pro Text"',
           '"SF Pro"',
+          '"Segoe UI"',
+          'Roboto',
           'system-ui',
           'sans-serif',
         ],
@@ -63,6 +65,7 @@ export default {
         'scale-in': 'scaleIn 0.2s cubic-bezier(0.16, 1, 0.3, 1) forwards',
         'pulse-subtle': 'pulseSubtle 2.5s ease-in-out infinite',
         'wave': 'wave 1.2s ease-in-out infinite',
+        'chat-shimmer': 'chatShimmer 1.65s linear infinite',
       },
       keyframes: {
         fadeIn: {
@@ -88,6 +91,10 @@ export default {
         wave: {
           '0%, 100%': { height: '6px' },
           '50%': { height: '18px' },
+        },
+        chatShimmer: {
+          '0%': { backgroundPosition: '100% 0' },
+          '100%': { backgroundPosition: '-100% 0' },
         },
       },
     },

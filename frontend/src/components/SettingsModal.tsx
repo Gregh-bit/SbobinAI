@@ -26,7 +26,7 @@ const defaultLlms: ModelInfo[] = [
     id: 'mlx-community/Qwen3.5-4B-MLX-4bit',
     name: 'Qwen 3.5 4B',
     type: 'llm',
-    approx_size: '~2.8 GB',
+    approx_size: '~3.0 GB',
     description: 'Compatto e veloce. Genera capitoli, sintesi ed evidenzia i concetti chiave.',
     downloaded: false,
     status: 'idle',
@@ -36,18 +36,18 @@ const defaultLlms: ModelInfo[] = [
     id: 'mlx-community/Qwen3.5-2B-MLX-4bit',
     name: 'Qwen 3.5 2B (Leggero)',
     type: 'llm',
-    approx_size: '~1.4 GB',
-    description: 'Versione ultraleggera a basso consumo di memoria RAM. Ideale per computer con risorse contenute.',
+    approx_size: '~1.6 GB',
+    description: 'Versione ultraleggera e velocissima a basso consumo di memoria.',
     downloaded: false,
     status: 'idle',
     disk_size_mb: null,
   },
   {
-    id: 'mlx-community/Qwen3.5-8B-MLX-4bit',
-    name: 'Qwen 3.5 8B (Avanzato)',
+    id: 'unsloth/gemma-4-E4B-it-UD-MLX-4bit',
+    name: 'Gemma 4 E4B',
     type: 'llm',
-    approx_size: '~5.5 GB',
-    description: 'Modello ad alta capacità di ragionamento per computer con 16 GB o più di RAM.',
+    approx_size: '~6.1 GB',
+    description: 'Modello alternativo per spiegazioni approfondite e risposte dettagliate.',
     downloaded: false,
     status: 'idle',
     disk_size_mb: null,
@@ -284,19 +284,32 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       );
 
       // 1. Aggiornamento istantaneo dell'interfaccia: mostra immediatamente la barra di progresso
+      // e resetta a idle qualsiasi altro modello che fosse rimasto in 'downloading'
       setModelsStatus((prev) => {
         if (!prev) return prev;
         const updateList = (list?: ModelInfo[]) =>
-          list?.map((m) =>
-            m.id === modelId
-              ? {
-                  ...m,
-                  status: 'downloading' as const,
-                  progress: 1,
-                  stage: 'Avvio download e connessione...',
-                }
-              : m
-          );
+          list?.map((m) => {
+            if (m.id === modelId) {
+              return {
+                ...m,
+                status: 'downloading' as const,
+                progress: 1,
+                stage: 'Avvio download e connessione...',
+                error: null,
+              };
+            }
+            if (m.status === 'downloading') {
+              return {
+                ...m,
+                status: 'idle' as const,
+                progress: 0,
+                stage: null,
+                downloaded_mb: 0,
+                error: null,
+              };
+            }
+            return m;
+          });
         return {
           ...prev,
           whisper: updateList(prev.whisper) || prev.whisper,
@@ -317,15 +330,42 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
     }
   };
 
-  // Interrompi download in corso
+  // Interrompi download in corso con reset ottimistico istantaneo
   const handleCancelDownload = async (modelId: string) => {
     try {
       setActionInProgress(`cancel-${modelId}`);
+
+      // 1. Reset ottimistico istantaneo: rimuove subito la barra di progresso e la rotella
+      setModelsStatus((prev) => {
+        if (!prev) return prev;
+        const resetItem = (list?: ModelInfo[]) =>
+          list?.map((m) =>
+            m.id === modelId
+              ? {
+                  ...m,
+                  status: 'idle' as const,
+                  progress: 0,
+                  stage: null,
+                  downloaded_mb: 0,
+                  error: null,
+                }
+              : m
+          );
+        return {
+          ...prev,
+          whisper: resetItem(prev.whisper) || prev.whisper,
+          llm: resetItem(prev.llm),
+          embedding: resetItem(prev.embedding),
+          runtime: resetItem(prev.runtime),
+        };
+      });
+
       const res = await api.models.cancelDownload(modelId);
       showNotification(`Download interrotto e file rimossi (${res.freed_mb} MB liberati).`, 'info');
-      await fetchModelsStatus();
+      await fetchModelsStatus(true);
     } catch (err: any) {
       showNotification(`Errore interruzione download: ${err?.message || err}`, 'error');
+      await fetchModelsStatus(true);
     } finally {
       setActionInProgress(null);
     }
@@ -427,19 +467,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
   const handleUninstallApp = async () => {
     setIsUninstalling(true);
     try {
-      if (isTauri()) {
-        const { invoke } = await import('@tauri-apps/api/core');
-        await invoke('uninstall_sbobinai', { 
-          keepStoragePath: storagePath,
-          deleteStorageFolder: deleteStorageFolder,
-        });
-      } else {
-        try {
-          await api.models.deleteAll();
-        } catch {}
-      }
-
-      // Pulisce le chiavi di configurazione locali dell'app
+      // Pulisce le chiavi locali PRIMA dell'uscita del processo WebView2 per evitare residui su disco
       try {
         if (deleteStorageFolder) {
           localStorage.clear();
@@ -450,6 +478,18 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
         sessionStorage.clear();
       } catch (e) {
         console.warn('Errore pulizia storage locale:', e);
+      }
+
+      if (isTauri()) {
+        const { invoke } = await import('@tauri-apps/api/core');
+        await invoke('uninstall_sbobinai', { 
+          keepStoragePath: storagePath,
+          deleteStorageFolder: deleteStorageFolder,
+        });
+      } else {
+        try {
+          await api.models.deleteAll();
+        } catch {}
       }
     } catch (err: any) {
       console.error('Errore durante la disinstallazione:', err);
@@ -1148,7 +1188,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                                       <button
                                         type="button"
                                         data-delete-model-btn={m.id}
-                                        disabled={actionInProgress !== null}
+                                        disabled={actionInProgress !== null && actionInProgress !== `delete-${m.id}`}
                                         onClick={() => {
                                           if (isConfirmingDelete) {
                                             handleDeleteModel(m.id);
@@ -1187,7 +1227,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                                   <button
                                     type="button"
                                     onClick={() => handleDownloadModel(m.id)}
-                                    disabled={actionInProgress !== null}
+                                    disabled={actionInProgress === m.id || actionInProgress === `cancel-${m.id}`}
                                     className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl text-xs font-medium bg-blue-500 hover:bg-blue-600 text-white shadow-liquid-sm transition-all cursor-pointer disabled:opacity-50"
                                   >
                                     <Download size={12} />
@@ -1224,7 +1264,8 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                                 <button
                                   type="button"
                                   onClick={() => handleDownloadModel(m.id)}
-                                  className="px-2 py-0.5 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-200 text-[10px] font-medium shrink-0 cursor-pointer"
+                                  disabled={actionInProgress === m.id || actionInProgress === `cancel-${m.id}`}
+                                  className="px-2 py-0.5 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-200 text-[10px] font-medium shrink-0 cursor-pointer disabled:opacity-50"
                                 >
                                   Riprova
                                 </button>
@@ -1356,7 +1397,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                                   <button
                                     type="button"
                                     onClick={() => handleDownloadModel(m.id)}
-                                    disabled={actionInProgress !== null}
+                                    disabled={actionInProgress === m.id || actionInProgress === `cancel-${m.id}`}
                                     className="flex items-center gap-1.5 px-3 py-1 rounded-xl text-xs font-medium bg-white/[0.10] hover:bg-white/[0.18] text-white border border-white/12 transition-all cursor-pointer shadow-liquid-sm disabled:opacity-50"
                                   >
                                     <Download size={12} />
@@ -1393,7 +1434,8 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                                 <button
                                   type="button"
                                   onClick={() => handleDownloadModel(m.id)}
-                                  className="px-2 py-0.5 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-200 text-[10px] font-medium shrink-0 cursor-pointer"
+                                  disabled={actionInProgress === m.id || actionInProgress === `cancel-${m.id}`}
+                                  className="px-2 py-0.5 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-200 text-[10px] font-medium shrink-0 cursor-pointer disabled:opacity-50"
                                 >
                                   Riprova
                                 </button>
@@ -1582,7 +1624,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       </p>
                     </div>
                     <span className="text-[10px] font-mono font-medium px-2.5 py-1 rounded-full bg-white/[0.08] text-white/70 border border-white/10 flex-shrink-0">
-                      v{updater.currentVersion || '0.0.15'}
+                      v{updater.currentVersion || '0.0.16'}
                     </span>
                   </div>
 

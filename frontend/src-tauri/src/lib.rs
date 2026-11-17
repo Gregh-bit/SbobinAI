@@ -628,6 +628,7 @@ fn extract_embedded_backend(target_dir: &Path) -> Result<(), String> {
     write_embedded!("transcriber.py", include_str!("../../../backend/transcriber.py"));
     write_embedded!("ai_models.py", include_str!("../../../backend/ai_models.py"));
     write_embedded!("llm_engine.py", include_str!("../../../backend/llm_engine.py"));
+    write_embedded!("transcript_cleaner.py", include_str!("../../../backend/transcript_cleaner.py"));
     write_embedded!("rag.py", include_str!("../../../backend/rag.py"));
     write_embedded!("cleaner.py", include_str!("../../../backend/cleaner.py"));
     write_embedded!("platform_utils.py", include_str!("../../../backend/platform_utils.py"));
@@ -636,6 +637,7 @@ fn extract_embedded_backend(target_dir: &Path) -> Result<(), String> {
     write_embedded!("requirements-windows.txt", include_str!("../../../backend/requirements-windows.txt"));
 
     write_embedded!("routers/__init__.py", include_str!("../../../backend/routers/__init__.py"));
+    write_embedded!("routers/chats.py", include_str!("../../../backend/routers/chats.py"));
     write_embedded!("routers/lectures.py", include_str!("../../../backend/routers/lectures.py"));
     write_embedded!("routers/models.py", include_str!("../../../backend/routers/models.py"));
     write_embedded!("routers/settings.py", include_str!("../../../backend/routers/settings.py"));
@@ -1274,6 +1276,11 @@ fn kill_backend(app: &tauri::AppHandle) {
 }
 
 #[tauri::command]
+fn write_text_file(path: String, content: String) -> Result<(), String> {
+    std::fs::write(&path, content.as_bytes()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn uninstall_sbobinai(
     app: tauri::AppHandle,
     keep_storage_path: Option<String>,
@@ -1735,14 +1742,18 @@ async fn uninstall_sbobinai(
                         &format!(
                             "Start-Sleep -Seconds 2; \
                              Get-Process SbobinAI -ErrorAction SilentlyContinue | Stop-Process -Force; \
-                             Get-Process msedgewebview2 -ErrorAction SilentlyContinue | Where-Object {{ $_.Path -like '*com.sbobinai.app*' }} | Stop-Process -Force; \
+                             Get-CimInstance Win32_Process -Filter \"Name='msedgewebview2.exe'\" -ErrorAction SilentlyContinue | Where-Object {{ $_.CommandLine -like '*com.sbobinai.app*' -or $_.CommandLine -like '*EBWebView*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }}; \
                              Get-Process python,pythonw -ErrorAction SilentlyContinue | Where-Object {{ $_.Path -like '*SbobinAI*' }} | Stop-Process -Force; \
-                             {}Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\SbobinAI\\cuda_runtime\" -ErrorAction SilentlyContinue; \
-                             Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\SbobinAI\\cuda_runtime.staging\" -ErrorAction SilentlyContinue; \
-                             Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\SbobinAI\" -ErrorAction SilentlyContinue; \
-                             Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\com.sbobinai.app\" -ErrorAction SilentlyContinue; \
+                             {}for ($i = 0; $i -lt 5; $i++) {{ \
+                               Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\SbobinAI\\cuda_runtime\" -ErrorAction SilentlyContinue; \
+                               Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\SbobinAI\\cuda_runtime.staging\" -ErrorAction SilentlyContinue; \
+                               Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\SbobinAI\" -ErrorAction SilentlyContinue; \
+                               Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\com.sbobinai.app\" -ErrorAction SilentlyContinue; \
+                               Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\EBWebView\" -ErrorAction SilentlyContinue; \
+                               if (-not (Test-Path \"$env:LOCALAPPDATA\\com.sbobinai.app\") -and -not (Test-Path \"$env:LOCALAPPDATA\\SbobinAI\")) {{ break }}; \
+                               Start-Sleep -Milliseconds 400; \
+                             }}; \
                              Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\unicopilot\" -ErrorAction SilentlyContinue; \
-                             Remove-Item -Recurse -Force \"$env:LOCALAPPDATA\\EBWebView\" -ErrorAction SilentlyContinue; \
                              Remove-Item -Recurse -Force \"$env:APPDATA\\com.sbobinai.app\" -ErrorAction SilentlyContinue; \
                              Remove-Item -Recurse -Force \"$env:APPDATA\\SbobinAI\" -ErrorAction SilentlyContinue; \
                              Remove-Item -Recurse -Force \"$env:APPDATA\\unicopilot\" -ErrorAction SilentlyContinue; \
@@ -1832,7 +1843,8 @@ pub fn run() {
             stop_backend_for_update,
             uninstall_sbobinai,
             acquire_wake_lock,
-            release_wake_lock
+            release_wake_lock,
+            write_text_file
         ])
         .setup(move |app| {
             #[cfg(target_os = "macos")]

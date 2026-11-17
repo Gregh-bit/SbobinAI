@@ -101,7 +101,8 @@ def test_ws_mock_session_start_chunk_bookmark_stop(client, subject, post_calls):
     assert post_calls and post_calls[0]["lecture_id"] == lecture_id
 
 
-def test_ws_disconnect_without_stop_saves_and_releases(client, subject, post_calls):
+def test_ws_disconnect_without_stop_saves_and_releases(client, subject, post_calls, monkeypatch):
+    monkeypatch.setattr(main, "DISCONNECT_GRACE_PERIOD_SECONDS", 0.1)
     with client.websocket_connect(f"/ws/live-lecture/{subject['id']}") as ws:
         ws.send_text(json.dumps({"type": "start", "payload": {"model": "mock_mode"}}))
         lecture_id = _recv_until(ws, "started")["payload"]["lecture_id"]

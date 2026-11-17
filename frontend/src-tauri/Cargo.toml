@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.0.15"
+version = "0.0.16"
 description = "SbobinAI - trascrizione e studio delle lezioni"
 authors = ["SbobinAI"]
 license = ""

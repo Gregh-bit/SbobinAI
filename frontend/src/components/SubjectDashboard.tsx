@@ -47,6 +47,19 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
   const [liveError, setLiveError] = useState<string | null>(null);
   const [activeRecordingLecture, setActiveRecordingLecture] = useState<Lecture | null>(null);
 
+  // Stato per handoff cross-tab (Citazioni -> Materiali, Quiz/Orale -> QuizRipassoView)
+  const [materialTarget, setMaterialTarget] = useState<{
+    sourceId: string;
+    page?: number;
+    key: number;
+  } | null>(null);
+  const [pendingQuizId, setPendingQuizId] = useState<number | null>(null);
+  const [pendingOralQuestion, setPendingOralQuestion] = useState<{
+    question: string;
+    topic?: string;
+    key: number;
+  } | null>(null);
+
   // Guardie contro risposte asincrone obsolete (dismount o richieste superate)
   const isMountedRef = useRef(true);
   const loadSeqRef = useRef(0);
@@ -77,6 +90,9 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
   }, [subject.id]);
 
   useEffect(() => {
+    setMaterialTarget(null);
+    setPendingQuizId(null);
+    setPendingOralQuestion(null);
     loadLectures(true);
     return () => {
       if (notesPollRef.current) {
@@ -85,6 +101,29 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
       }
     };
   }, [loadLectures]);
+
+  const handleOpenCitation = useCallback((sourceId: string, page?: number) => {
+    setMaterialTarget({ sourceId, page: page ?? 1, key: Date.now() });
+    setActiveTab('materiali');
+  }, []);
+
+  const handleOpenQuiz = useCallback((quizId: number) => {
+    setPendingQuizId(quizId);
+    setActiveTab('quiz');
+  }, []);
+
+  const handleOpenOralQuestion = useCallback((question: string, topic?: string) => {
+    setPendingOralQuestion({ question, topic, key: Date.now() });
+    setActiveTab('quiz');
+  }, []);
+
+  const handleLectureCreatedFromAssistant = useCallback(() => {
+    void loadLectures(false);
+  }, [loadLectures]);
+
+  const handleClearMaterialTarget = useCallback(() => setMaterialTarget(null), []);
+  const handleClearPendingQuiz = useCallback(() => setPendingQuizId(null), []);
+  const handleClearPendingOralQuestion = useCallback(() => setPendingOralQuestion(null), []);
 
   // Notifica al genitore lo stato di registrazione (blocca il cambio corso nella Sidebar)
   useEffect(() => {
@@ -243,96 +282,124 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
         </div>
 
         {/* Center: Apple-style Liquid Glass Segmented Control — Centrato in modo responsive */}
-        {!activeRecordingLecture && (
-          <div 
-            data-tauri-drag-region="false"
-            className="flex-shrink-0 w-full max-w-[440px] animate-fade-in"
-          >
-            <SegmentedControl
-              options={TABS}
-              value={activeTab}
-              onChange={setActiveTab}
-              layoutId="subject-dashboard-active-tab"
-              fullWidth
-              size="md"
-            />
-          </div>
-        )}
+        <div 
+          data-tauri-drag-region="false"
+          className="flex-shrink-0 w-full max-w-[440px] flex justify-center items-center h-full"
+        >
+          <AnimatePresence mode="wait">
+            {!activeRecordingLecture ? (
+              <motion.div
+                key="segmented-tabs"
+                initial={{ opacity: 0, scale: 0.96 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.96 }}
+                transition={{ duration: 0.2 }}
+                className="w-full"
+              >
+                <SegmentedControl
+                  options={TABS}
+                  value={activeTab}
+                  onChange={setActiveTab}
+                  layoutId="subject-dashboard-active-tab"
+                  fullWidth
+                  size="md"
+                />
+              </motion.div>
+            ) : (
+              <motion.div
+                key="recording-indicator"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.2 }}
+                className="text-xs font-medium text-white/50 tracking-wide select-none"
+              >
+                Registrazione in corso
+              </motion.div>
+            )}
+          </AnimatePresence>
+        </div>
 
         {/* Right: Dynamic Recording Controller — iOS Dynamic Island morphing capsule */}
-        <div data-tauri-drag-region="false" className={clsx('flex items-center justify-end z-30', activeRecordingLecture ? 'flex-1' : 'flex-1 min-w-0')}>
+        <div data-tauri-drag-region="false" className="flex-1 min-w-0 flex items-center justify-end z-30">
           <motion.div
             layout
             transition={{
               type: 'spring',
-              stiffness: 360,
-              damping: 26,
+              stiffness: 420,
+              damping: 32,
               mass: 0.8,
             }}
             className={clsx(
-              'relative h-8 rounded-full overflow-hidden flex items-center select-none shadow-liquid-sm transition-colors duration-200',
+              'relative h-9 rounded-full flex items-center select-none transition-colors duration-200',
               !activeRecordingLecture
-                ? 'w-8 min-w-[32px] justify-center liquid-glass-pill border border-white/[0.22] hover:border-white/[0.38] hover:bg-white/[0.12] cursor-pointer'
-                : 'w-auto liquid-capsule border border-white/[0.18] shadow-liquid-lg'
+                ? 'bg-white/[0.08] hover:bg-white/[0.14] border border-white/20 hover:border-white/30 cursor-pointer shadow-liquid-sm'
+                : 'bg-zinc-950/90 backdrop-blur-2xl border border-white/15 shadow-liquid-lg'
             )}
             onClick={!activeRecordingLecture && !startingLive ? handleStartLive : undefined}
-            whileHover={!activeRecordingLecture ? { scale: 1.06 } : undefined}
-            whileTap={!activeRecordingLecture ? { scale: 0.94 } : undefined}
+            whileHover={!activeRecordingLecture ? { scale: 1.05 } : undefined}
+            whileTap={!activeRecordingLecture ? { scale: 0.95 } : undefined}
           >
             <AnimatePresence mode="popLayout" initial={false}>
               {!activeRecordingLecture ? (
                 <motion.div
                   key="mic-bubble"
-                  layout="position"
-                  initial={{ opacity: 0, scale: 0.5 }}
+                  initial={{ opacity: 0, scale: 0.8 }}
                   animate={{ opacity: 1, scale: 1 }}
-                  exit={{ opacity: 0, scale: 0.5 }}
-                  transition={{ duration: 0.15 }}
-                  className="w-8 h-8 flex items-center justify-center flex-shrink-0"
+                  exit={{ opacity: 0, scale: 0.8 }}
+                  transition={{ duration: 0.18, ease: 'easeOut' }}
+                  className="w-9 h-9 flex items-center justify-center flex-shrink-0"
                   title="Registra Lezione"
                 >
                   {startingLive ? (
-                    <Loader2 size={13} className="animate-spin text-white/60" />
+                    <Loader2 size={15} className="animate-spin text-white/60" />
                   ) : (
-                    <Mic size={14} strokeWidth={2} className="text-red-400" />
+                    <Mic size={15} strokeWidth={2} className="text-red-400" />
                   )}
                 </motion.div>
               ) : (
                 <motion.div
                   key="player-expanded"
-                  layout="position"
-                  initial={{ opacity: 0, filter: 'blur(4px)' }}
-                  animate={{ opacity: 1, filter: 'blur(0px)' }}
-                  exit={{ opacity: 0, filter: 'blur(4px)' }}
-                  transition={{ duration: 0.22, delay: 0.06 }}
-                  className="flex items-center gap-2 p-1 pl-3 pr-1.5 whitespace-nowrap"
+                  initial={{ opacity: 0, scale: 0.95 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.92 }}
+                  transition={{ duration: 0.18, ease: 'easeOut' }}
+                  className="flex items-center gap-1.5 px-1.5 py-1 whitespace-nowrap"
                 >
                   {/* Waveform indicator + Timer */}
-                  <div className="flex items-center gap-2 font-mono text-[11px] text-white/80 pr-2 border-r border-white/[0.12]">
-                    <div className="flex items-center gap-0.5 h-3">
+                  <div className="h-7 flex items-center gap-2 pl-2 pr-2 border-r border-white/10">
+                    <div className="flex items-center gap-0.5 h-3.5">
                       <span
                         className={clsx(
-                          'w-0.5 bg-red-400 rounded-full transition-opacity',
-                          liveSession.isConnected && !liveSession.isPaused && liveSession.elapsed > 0 ? 'animate-wave' : 'opacity-40'
+                          'w-0.5 bg-red-400 rounded-full transition-all',
+                          liveSession.isConnected && !liveSession.isPaused && liveSession.elapsed > 0
+                            ? 'animate-wave'
+                            : 'h-2 opacity-40'
                         )}
                         style={{ height: '8px', animationDelay: '0ms' }}
                       />
                       <span
                         className={clsx(
-                          'w-0.5 bg-red-400 rounded-full transition-opacity',
-                          liveSession.isConnected && !liveSession.isPaused && liveSession.elapsed > 0 ? 'animate-wave' : 'opacity-40'
+                          'w-0.5 bg-red-400 rounded-full transition-all',
+                          liveSession.isConnected && !liveSession.isPaused && liveSession.elapsed > 0
+                            ? 'animate-wave'
+                            : 'h-3.5 opacity-40'
                         )}
-                        style={{ height: '12px', animationDelay: '200ms' }}
+                        style={{ height: '14px', animationDelay: '180ms' }}
                       />
                       <span
                         className={clsx(
-                          'w-0.5 bg-red-400 rounded-full transition-opacity',
-                          liveSession.isConnected && !liveSession.isPaused && liveSession.elapsed > 0 ? 'animate-wave' : 'opacity-40'
+                          'w-0.5 bg-red-400 rounded-full transition-all',
+                          liveSession.isConnected && !liveSession.isPaused && liveSession.elapsed > 0
+                            ? 'animate-wave'
+                            : 'h-2 opacity-40'
                         )}
-                        style={{ height: '7px', animationDelay: '400ms' }}
+                        style={{ height: '8px', animationDelay: '360ms' }}
                       />
                     </div>
-                    <span className="font-semibold tracking-tight tabular-nums">{formatElapsed(liveSession.elapsed)}</span>
+                    <span className="text-[12px] font-mono font-semibold text-white/95 tracking-wide tabular-nums">
+                      {formatElapsed(liveSession.elapsed)}
+                    </span>
                   </div>
 
                   {/* Quick Bookmark (⌘⇧B / Ctrl+Shift+B) Button */}
@@ -344,17 +411,16 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
                     }}
                     title={`Segnalibro Esame (${shortcutLabel('B', true)})`}
                     className={clsx(
-                      'flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium transition-all border cursor-pointer',
+                      'h-7 flex items-center gap-1.5 px-2.5 rounded-full text-[11.5px] font-medium transition-all border cursor-pointer select-none',
                       liveSession.lastBookmarkPinned && Date.now() - liveSession.lastBookmarkPinned < 2000
                         ? 'bg-amber-500/25 border-amber-500/50 text-amber-200 scale-105'
-                        : 'bg-white/[0.08] hover:bg-white/[0.16] border-white/[0.10] text-white/90'
+                        : 'bg-white/[0.08] hover:bg-white/[0.14] border-white/[0.10] text-zinc-200 hover:text-white'
                     )}
                   >
                     <Bookmark size={11} strokeWidth={2} className="text-amber-400 fill-amber-400/20" />
                     <span>Segnalibro</span>
-                    <span className="text-[9px] font-mono text-white/40 ml-0.5">{shortcutLabel('B', true)}</span>
                     {liveSession.bookmarks.length > 0 && (
-                      <span className="text-[9px] font-mono bg-amber-400/25 text-amber-300 px-1 rounded-full">
+                      <span className="text-[10px] font-mono bg-amber-400/25 text-amber-300 px-1.5 rounded-full">
                         {liveSession.bookmarks.length}
                       </span>
                     )}
@@ -369,26 +435,26 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
                     }}
                     title={liveSession.isPaused ? 'Riprendi Registrazione' : 'Metti in Pausa (Calore Zero)'}
                     className={clsx(
-                      "h-6.5 px-2.5 rounded-full flex items-center gap-1.5 border transition-all cursor-pointer text-[11px] font-medium shadow-sm",
+                      'h-7 px-2.5 rounded-full flex items-center gap-1.5 border transition-all cursor-pointer text-[11.5px] font-medium shadow-sm select-none',
                       liveSession.isPaused
-                        ? "bg-amber-500/25 border-amber-500/40 text-amber-200 hover:bg-amber-500/35 shadow-liquid-sm animate-pulse"
-                        : "bg-white/[0.08] hover:bg-white/[0.16] border-white/[0.10] text-white/90"
+                        ? 'bg-amber-500/25 border-amber-500/40 text-amber-200 hover:bg-amber-500/35 shadow-liquid-sm animate-pulse'
+                        : 'bg-white/[0.08] hover:bg-white/[0.14] border-white/[0.10] text-zinc-200 hover:text-white'
                     )}
                   >
                     {liveSession.isPaused ? (
                       <>
-                        <Play size={10} strokeWidth={2.5} className="ml-0.5 fill-current" />
-                        <span>In Pausa</span>
+                        <Play size={11} strokeWidth={2.5} className="ml-0.5 fill-current" />
+                        <span>Riprendi</span>
                       </>
                     ) : (
                       <>
-                        <Pause size={10} strokeWidth={2.5} />
+                        <Pause size={11} strokeWidth={2.5} />
                         <span>Pausa</span>
                       </>
                     )}
                   </button>
 
-                  {/* Termina e Rielabora */}
+                  {/* Termina */}
                   <button
                     type="button"
                     onClick={(e) => {
@@ -396,14 +462,15 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
                       liveSession.handleStop();
                     }}
                     disabled={liveSession.isStopping}
-                    className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-white/[0.18] hover:bg-white/[0.28] text-white text-[11px] font-semibold border border-white/[0.22] shadow-liquid-sm transition-all cursor-pointer disabled:opacity-60 disabled:cursor-wait"
+                    title="Termina e salva la registrazione"
+                    className="h-7 flex items-center gap-1.5 px-3 rounded-full bg-red-500/20 hover:bg-red-500/30 text-red-200 hover:text-white text-[11.5px] font-medium border border-red-500/30 shadow-liquid-sm transition-all cursor-pointer disabled:opacity-60 disabled:cursor-wait select-none"
                   >
                     {liveSession.isStopping ? (
-                      <Loader2 size={10} className="animate-spin" />
+                      <Loader2 size={11} className="animate-spin text-red-300" />
                     ) : (
-                      <Square size={9} strokeWidth={2.5} className="fill-white" />
+                      <Square size={10} strokeWidth={2.5} className="fill-current text-red-400" />
                     )}
-                    <span>{liveSession.isStopping ? 'Salvataggio...' : 'Termina e Rielabora'}</span>
+                    <span>{liveSession.isStopping ? 'Salvataggio...' : 'Termina'}</span>
                   </button>
                 </motion.div>
               )}
@@ -450,23 +517,25 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
       )}
 
       {/* ── Banner stato connessione registrazione live ── */}
-      {activeRecordingLecture && !liveSession.isStopping && (liveSession.connectionError || !liveSession.isConnected) && (
+      {activeRecordingLecture && !liveSession.isStopping && (liveSession.connectionError || !liveSession.isConnected || liveSession.isReconnecting) && (
         <div
           className={clsx(
-            'px-6 py-2 border-b flex items-center gap-2.5 text-xs flex-shrink-0',
+            'px-6 py-2 border-b flex items-center gap-2.5 text-xs flex-shrink-0 animate-fade-in',
             liveSession.connectionError
               ? 'bg-red-500/10 border-red-500/20 text-red-200/90'
-              : 'bg-white/[0.04] border-white/[0.08] text-white/60'
+              : 'bg-amber-500/10 border-amber-500/20 text-amber-200/90'
           )}
         >
           {liveSession.connectionError ? (
             <AlertTriangle size={14} className="text-red-400 flex-shrink-0" />
           ) : (
-            <Loader2 size={13} className="animate-spin text-white/50 flex-shrink-0" />
+            <Loader2 size={13} className="animate-spin text-amber-400 flex-shrink-0" />
           )}
           <span className="truncate">
             {liveSession.connectionError
               ? `Registrazione non attiva: ${liveSession.connectionError}`
+              : liveSession.isReconnecting
+              ? 'Riconnessione al motore di registrazione in corso...'
               : 'Connessione al motore di registrazione in corso...'}
           </span>
         </div>
@@ -477,11 +546,14 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
         {activeRecordingLecture ? (
           <Suspense fallback={<div className="flex-1 flex items-center justify-center w-full h-full"><Loader2 size={24} className="animate-spin text-white/30" /></div>}>
             <LiveRecordingWorkspace
+              subjectId={subject.id}
               chunks={liveSession.chunks}
               isPaused={liveSession.isPaused}
               audioStatus={liveSession.audioStatus}
               detectedQuestions={liveSession.detectedQuestions}
               onDeleteQuestion={liveSession.handleDeleteQuestion}
+              onAnswerQuestion={liveSession.handleAnswerQuestion}
+              answeringQuestionIds={liveSession.answeringQuestionIds}
               chatMessages={liveSession.chatMessages}
               chatInput={liveSession.chatInput}
               setChatInput={liveSession.setChatInput}
@@ -526,6 +598,8 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
                   <MaterialiView 
                     subject={subject} 
                     key={subject.id}
+                    initialTarget={materialTarget}
+                    onClearInitialTarget={handleClearMaterialTarget}
                     onDeleteLecturePermanently={handleDeleteLecture}
                     onRestoreLectureToQuaderno={handleRestoreToQuaderno}
                     onLectureCreated={(newLecture) => {
@@ -545,12 +619,24 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
                     subject={subject}
                     lectures={lectures}
                     onOpenSettings={onOpenSettings}
+                    initialQuizId={pendingQuizId}
+                    onClearInitialQuiz={handleClearPendingQuiz}
+                    initialOralQuestion={pendingOralQuestion}
+                    onClearInitialOralQuestion={handleClearPendingOralQuestion}
                   />
                 </Suspense>
               )}
               {activeTab === 'assistente' && (
                 <Suspense fallback={<div className="flex-1 flex items-center justify-center"><Loader2 size={24} className="animate-spin text-white/30" /></div>}>
-                  <AssistenteCorsoView key={subject.id} subject={subject} />
+                  <AssistenteCorsoView
+                    key={subject.id}
+                    subject={subject}
+                    lectures={lectures}
+                    onOpenCitation={handleOpenCitation}
+                    onOpenQuiz={handleOpenQuiz}
+                    onOpenOralQuestion={handleOpenOralQuestion}
+                    onLectureCreated={handleLectureCreatedFromAssistant}
+                  />
                 </Suspense>
               )}
             </motion.div>

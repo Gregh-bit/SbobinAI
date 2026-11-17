@@ -75,6 +75,8 @@ class LiveSession:
 
         # Task asincrono per lo streaming della trascrizione
         self.transcription_task: Optional[asyncio.Task] = None
+        self._client_disconnected_at: Optional[float] = None
+        self._disconnect_grace_task: Optional[asyncio.Task] = None
 
     def add_question(self, question_text: str, confidence: float = 0.95, suggested_answer: str = "") -> dict:
         """Registra una domanda docente rilevata, evitando duplicati."""
@@ -88,7 +90,7 @@ class LiveSession:
             "id": f"q-{len(self.detected_questions) + 1}-{int(time.time())}",
             "question": question_text,
             "confidence": confidence,
-            "suggestedAnswer": suggested_answer or "Domanda rilevata dal docente durante la lezione.",
+            "suggestedAnswer": suggested_answer,
             "sourceLecture": "Questa lezione",
             "timestamp": int(time.time() * 1000),
         }
@@ -110,6 +112,9 @@ class LiveSession:
         if not text or not text.strip():
             return
         clean_text = text.strip()
+        if self.full_transcript and clean_text.lower() == self.full_transcript[-1].lower():
+            logger.debug(f"[LiveSession] Scartato chunk duplicato consecutivo: '{clean_text}'")
+            return
         now = self.elapsed_seconds()
         chunk = TranscriptChunk(text=clean_text, timestamp=now)
         self._buffer.append(chunk)

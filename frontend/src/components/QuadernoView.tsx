@@ -12,6 +12,7 @@ import { clsx } from 'clsx';
 import type { Lecture, Subject, DetectedQuestion, Bookmark, KaraokeLine } from '../types';
 import { api } from '../lib/api';
 import { useSettings } from '../lib/SettingsContext';
+import { saveTextFile } from '../lib/tauri';
 import MaterialiFinderModal from './MaterialiFinderModal';
 import SegmentedControl from './SegmentedControl';
 import MarkdownContent from './MarkdownContent';
@@ -216,9 +217,11 @@ export default function QuadernoView({
   const [editNotes, setEditNotes] = useState('');
   const [editTab, setEditTab] = useState<'editor' | 'preview'>('editor');
   const [isSavingEdit, setIsSavingEdit] = useState(false);
-  const [isGeneratingSummary, setIsGeneratingSummary] = useState(false);
+  const [generatingLectureId, setGeneratingLectureId] = useState<number | null>(null);
+  const [summaryProgress, setSummaryProgress] = useState<{ stage: string; message: string; progress: number } | null>(null);
   const [summaryError, setSummaryError] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const initialNotesRef = useRef<string | null>(null);
 
   const isPlaceholderAnswer = (ans?: string) => {
     if (!ans || !ans.trim()) return true;
@@ -228,7 +231,10 @@ export default function QuadernoView({
       lower.includes('modello llm non installato') ||
       lower.includes('non ancora scaricato') ||
       lower.includes('domanda rilevata dal docente') ||
-      lower.includes('risposta non disponibile')
+      lower.includes('domanda rilevata') ||
+      lower.includes('risposta non disponibile') ||
+      lower.includes('generazione risposta flash') ||
+      lower.includes('parlato del docente')
     );
   };
 
@@ -266,35 +272,67 @@ export default function QuadernoView({
 
   const handleGenerateSummary = async () => {
     if (!selectedLecture) return;
+    const targetLectureId = selectedLecture.id;
+    initialNotesRef.current = selectedLecture.processed_notes || null;
     const controller = new AbortController();
     abortControllerRef.current = controller;
-    setIsGeneratingSummary(true);
+    setGeneratingLectureId(targetLectureId);
+    setSummaryProgress({ stage: 'start', message: 'Inizializzazione motore IA e analisi trascrizione...', progress: 5 });
     setSummaryError(null);
     try {
-      const updated = await api.lectures.generateSummary(selectedLecture.id, { signal: controller.signal });
+      const updated = await api.lectures.generateSummaryStream(
+        targetLectureId,
+        (ev) => {
+          if (ev.message || typeof ev.progress === 'number') {
+            setSummaryProgress({
+              stage: ev.stage || 'progress',
+              message: ev.message || 'Elaborazione capitolo in corso...',
+              progress: typeof ev.progress === 'number' ? ev.progress : 40,
+            });
+          }
+        },
+        { signal: controller.signal }
+      );
       if (updated?.status === 'cancelled') {
         return;
       }
       if (updated?.processed_notes) {
-        await onUpdateLecture(selectedLecture.id, {
+        await onUpdateLecture(targetLectureId, {
           processed_notes: updated.processed_notes,
         });
       }
     } catch (err: any) {
-      if (err?.name === 'AbortError') {
+      const isAborted =
+        err?.name === 'AbortError' ||
+        controller.signal.aborted ||
+        abortControllerRef.current === null ||
+        String(err?.message || '').toLowerCase().includes('abort');
+
+      if (isAborted) {
         return;
       }
-      setSummaryError(err?.message || 'Errore durante la generazione della sintesi in locale');
+
+      const rawMsg = String(err?.message || '');
+      if (rawMsg.includes('Failed to fetch') || rawMsg.includes('NetworkError') || rawMsg.includes('Load failed')) {
+        setSummaryError('Il motore di intelligenza artificiale locale non risponde. Verifica nelle Impostazioni che il modello sia installato e riprova.');
+      } else {
+        setSummaryError(rawMsg || 'Errore durante la generazione della sintesi in locale');
+      }
     } finally {
-      setIsGeneratingSummary(false);
-      abortControllerRef.current = null;
+      setGeneratingLectureId((curr) => (curr === targetLectureId ? null : curr));
+      setSummaryProgress(null);
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+      }
     }
   };
 
   const handleCancelSummary = async (e?: React.MouseEvent) => {
     e?.preventDefault();
     e?.stopPropagation();
-    setIsGeneratingSummary(false);
+    setGeneratingLectureId(null);
+    setSummaryProgress(null);
+    setSummaryError(null);
     if (abortControllerRef.current) {
       try {
         abortControllerRef.current.abort();
@@ -323,6 +361,19 @@ export default function QuadernoView({
 
   const selectedLecture = lectures.find((l) => l.id === selectedLectureId) || filteredLectures[0] || null;
 
+  // Indica se la sintesi è in corso ESCLUSIVAMENTE per la lezione attualmente visualizzata
+  const isGeneratingSummary = Boolean(selectedLecture && generatingLectureId === selectedLecture.id);
+
+  // Se la sintesi è stata completata in background (arriva tramite polling o dal backend), sblocca l'interfaccia
+  useEffect(() => {
+    if (generatingLectureId && selectedLecture?.id === generatingLectureId && selectedLecture?.processed_notes && selectedLecture.processed_notes.trim().length > 0) {
+      if (!initialNotesRef.current || selectedLecture.processed_notes !== initialNotesRef.current) {
+        setGeneratingLectureId(null);
+        setSummaryProgress(null);
+      }
+    }
+  }, [generatingLectureId, selectedLecture?.id, selectedLecture?.processed_notes]);
+
   // Domande del prof salvate per questa specifica lezione
   const parsedQuestions = useMemo<DetectedQuestion[]>(() => {
     if (!selectedLecture?.detected_questions) return [];
@@ -334,8 +385,10 @@ export default function QuadernoView({
     }
   }, [selectedLecture?.detected_questions]);
 
-  // Carica i segnalibri quando cambia la lezione selezionata
+  // Carica i segnalibri e pulisce gli errori quando cambia la lezione selezionata
   useEffect(() => {
+    setSummaryError(null);
+    initialNotesRef.current = null;
     // Ignora risposte arrivate dopo il cambio di lezione
     let alive = true;
     if (selectedLecture?.id) {
@@ -391,7 +444,7 @@ export default function QuadernoView({
         if (isMounted) setLoadingKaraoke(false);
       });
     return () => { isMounted = false; };
-  }, [selectedLecture?.id]);
+  }, [selectedLecture?.id, selectedLecture?.raw_transcript]);
 
   const handleSeekAudio = (seconds: number) => {
     if (!selectedLecture?.audio_path || !audioRef.current) return;
@@ -409,9 +462,12 @@ export default function QuadernoView({
     }
   };
 
-  const handleCopyTranscript = () => {
-    if (!selectedLecture?.raw_transcript) return;
-    navigator.clipboard.writeText(selectedLecture.raw_transcript);
+  const handleCopyTranscript = (textToCopy?: string) => {
+    const text = typeof textToCopy === 'string' && textToCopy.trim().length > 0
+      ? textToCopy
+      : selectedLecture?.raw_transcript;
+    if (!text) return;
+    navigator.clipboard.writeText(text);
     setCopiedTranscript(true);
     setTimeout(() => setCopiedTranscript(false), 2000);
   };
@@ -449,23 +505,22 @@ export default function QuadernoView({
     setCurrentTime(newTime);
   };
 
-  // ── Funzioni di Esportazione Markdown ───────────────────────────────────────
-  const downloadMarkdownFile = (content: string, filename: string) => {
-    const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = filename;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+  // ── Funzioni di Esportazione Markdown & Testo ──────────────────────────────
+  const downloadMarkdownFile = async (
+    content: string,
+    filename: string,
+    filterName = 'Markdown',
+    extension = 'md'
+  ) => {
     setShowExportMenu(false);
-    setExportNotice(`Esportato con successo: ${filename}`);
-    setTimeout(() => setExportNotice(null), 3500);
+    const savedPath = await saveTextFile(filename, content, filterName, extension);
+    if (savedPath) {
+      setExportNotice('File salvato con successo in: ' + savedPath);
+      setTimeout(() => setExportNotice(null), 4000);
+    }
   };
 
-  const handleExportSingleLecture = () => {
+  const handleExportSingleLecture = async () => {
     if (!selectedLecture) return;
     const dateFormatted = formatDate(selectedLecture.date);
     const durFormatted = formatDuration(selectedLecture.duration_seconds);
@@ -506,10 +561,10 @@ export default function QuadernoView({
     }
 
     const cleanFilename = `${subject.name}_${selectedLecture.title}`.replace(/[^a-zA-Z0-9_\-]/g, '_') + '.md';
-    downloadMarkdownFile(md, cleanFilename);
+    await downloadMarkdownFile(md, cleanFilename, 'Markdown', 'md');
   };
 
-  const handleExportFullQuaderno = () => {
+  const handleExportFullQuaderno = async () => {
     const today = new Date().toLocaleDateString('it-IT', { day: 'numeric', month: 'long', year: 'numeric' });
     let md = `# Quaderno di Studio — ${subject.name}\n\n`;
     md += `*Generato da SbobinAI il ${today}*\n\n`;
@@ -534,24 +589,13 @@ export default function QuadernoView({
     });
 
     const cleanFilename = `Quaderno_${subject.name}`.replace(/[^a-zA-Z0-9_\-]/g, '_') + '.md';
-    downloadMarkdownFile(md, cleanFilename);
+    await downloadMarkdownFile(md, cleanFilename, 'Markdown', 'md');
   };
 
-  const handleExportTranscriptTxt = () => {
+  const handleExportTranscriptTxt = async () => {
     if (!selectedLecture || !selectedLecture.raw_transcript) return;
     const cleanFilename = `Trascrizione_${subject.name}_${selectedLecture.title}`.replace(/[^a-zA-Z0-9_\-]/g, '_') + '.txt';
-    const blob = new Blob([selectedLecture.raw_transcript], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = cleanFilename;
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-    setShowExportMenu(false);
-    setExportNotice(`Trascrizione salvata: ${cleanFilename}`);
-    setTimeout(() => setExportNotice(null), 3500);
+    await downloadMarkdownFile(selectedLecture.raw_transcript, cleanFilename, 'Testo', 'txt');
   };
 
   const handleDownloadAudio = () => {
@@ -615,8 +659,16 @@ export default function QuadernoView({
   return (
     <div className="flex-1 flex overflow-hidden select-none">
       {/* ── Left Column: Chronological Index (w-72) ── */}
-      {!isSidebarCollapsed && (
-        <div className="w-72 flex flex-col border-r border-white/[0.08] liquid-glass-subtle flex-shrink-0 animate-fade-in">
+      <aside
+        aria-label="Indice lezioni"
+        className={clsx(
+          'flex-shrink-0 flex flex-col h-full border-r border-white/[0.08] liquid-glass-subtle transition-all duration-200 ease-out overflow-hidden z-20',
+          !isSidebarCollapsed
+            ? 'w-72 opacity-100'
+            : 'w-0 opacity-0 border-r-0 pointer-events-none'
+        )}
+      >
+        <div className="w-72 flex flex-col h-full">
           {/* Top Bar: Search Bar with + and Collapse */}
           <div className="p-3 border-b border-white/[0.06] flex items-center gap-1.5">
             <div className="relative flex-1 min-w-0">
@@ -721,11 +773,11 @@ export default function QuadernoView({
             )}
           </div>
         </div>
-      )}
+      </aside>
 
       {/* ── Right Column: Clean Reading & Editing Sheet (flex-1) ── */}
       {selectedLecture ? (
-        <div className="flex-1 flex flex-col overflow-hidden content-canvas border-l border-white/[0.06] relative">
+        <div className="flex-1 flex flex-col overflow-hidden content-canvas relative">
           {/* Sheet Header — Clean macOS Document Header */}
           <div className="px-8 pt-6 pb-4 border-b border-white/[0.06] bg-white/[0.015] flex flex-col gap-4 flex-shrink-0">
             {/* Row 1: Title & Metadata on the left, Action buttons on the right */}
@@ -1068,16 +1120,33 @@ export default function QuadernoView({
               ) : activeTab === 'notes' ? (
                 <>
                   {isGeneratingSummary ? (
-                    <div className="p-8 rounded-3xl bg-white/[0.03] border border-amber-400/25 text-center space-y-4 animate-fade-in shadow-liquid-md">
+                    <div className="p-8 rounded-3xl bg-white/[0.03] border border-amber-400/25 text-center space-y-4 animate-fade-in shadow-liquid-md max-w-xl mx-auto">
                       <div className="w-12 h-12 rounded-2xl bg-amber-400/10 border border-amber-400/30 flex items-center justify-center mx-auto text-amber-300">
                         <Loader2 size={22} className="animate-spin text-amber-400" />
                       </div>
                       <div className="space-y-1">
-                        <h3 className="text-sm font-semibold text-white">Generazione Capitolo con Qwen 3.5...</h3>
-                        <p className="text-xs text-white/60 max-w-md mx-auto leading-relaxed">
-                          L'LLM sta sintetizzando la trascrizione e i concetti chiave della lezione per redigere il capitolo strutturato per il tuo Quaderno.
+                        <h3 className="text-sm font-semibold text-white">Generazione Capitolo con Qwen 3.5</h3>
+                        <p className="text-xs text-white/70 max-w-md mx-auto leading-relaxed">
+                          {summaryProgress?.message || "L'LLM sta sintetizzando la trascrizione e i concetti chiave della lezione per redigere il capitolo strutturato per il tuo Quaderno."}
                         </p>
                       </div>
+
+                      {/* Progress Bar in streaming */}
+                      {typeof summaryProgress?.progress === 'number' && (
+                        <div className="max-w-xs mx-auto w-full pt-1">
+                          <div className="h-1.5 w-full bg-white/10 rounded-full overflow-hidden p-0.5">
+                            <div
+                              className="h-full bg-gradient-to-r from-amber-400 to-amber-300 rounded-full transition-all duration-300 shadow-[0_0_8px_rgba(251,191,36,0.5)]"
+                              style={{ width: `${Math.max(5, Math.min(100, summaryProgress.progress))}%` }}
+                            />
+                          </div>
+                          <div className="flex justify-between items-center text-[10px] text-white/40 mt-1.5 font-mono">
+                            <span>Avanzamento</span>
+                            <span>{summaryProgress.progress}%</span>
+                          </div>
+                        </div>
+                      )}
+
                       <div className="flex items-center justify-center gap-1.5 py-1">
                         <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
                         <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse [animation-delay:150ms]" />
@@ -1097,8 +1166,28 @@ export default function QuadernoView({
                       </div>
                     </div>
                   ) : selectedLecture.processed_notes ? (
-                    <div className="p-4 sm:p-6 rounded-3xl bg-white/[0.02] border border-white/[0.06] shadow-liquid-sm">
-                      <MarkdownContent content={selectedLecture.processed_notes} className="quaderno-markdown" />
+                    <div className="space-y-4">
+                      {summaryError && (
+                        <div className="p-3.5 rounded-2xl bg-red-500/10 border border-red-500/25 flex items-start gap-2.5 text-left animate-fade-in">
+                          <AlertTriangle size={15} className="text-red-400 flex-shrink-0 mt-0.5" />
+                          <div className="flex-1 space-y-1">
+                            <p className="text-xs font-medium text-red-300 leading-relaxed">
+                              {summaryError}
+                            </p>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setSummaryError(null)}
+                            className="text-white/40 hover:text-white text-xs px-1"
+                            title="Chiudi avviso"
+                          >
+                            ✕
+                          </button>
+                        </div>
+                      )}
+                      <div className="p-4 sm:p-6 rounded-3xl bg-white/[0.02] border border-white/[0.06] shadow-liquid-sm">
+                        <MarkdownContent content={selectedLecture.processed_notes} className="quaderno-markdown" />
+                      </div>
                     </div>
                   ) : (
                     <div className="p-8 rounded-3xl bg-white/[0.02] border border-white/[0.06] text-center space-y-3">
@@ -1111,9 +1200,22 @@ export default function QuadernoView({
                       </p>
                       
                       {summaryError && (
-                        <p className="text-xs text-red-300 bg-red-500/10 border border-red-500/20 rounded-xl px-3 py-1.5 max-w-sm mx-auto">
-                          {summaryError}
-                        </p>
+                        <div className="max-w-md mx-auto p-3 rounded-2xl bg-red-500/10 border border-red-500/25 flex items-start gap-2.5 text-left animate-fade-in">
+                          <AlertTriangle size={15} className="text-red-400 flex-shrink-0 mt-0.5" />
+                          <div className="flex-1 space-y-1">
+                            <p className="text-xs font-medium text-red-300 leading-relaxed">
+                              {summaryError}
+                            </p>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setSummaryError(null)}
+                            className="text-white/40 hover:text-white text-xs px-1"
+                            title="Chiudi avviso"
+                          >
+                            ✕
+                          </button>
+                        </div>
                       )}
 
                       <div className="flex items-center justify-center gap-2 pt-2">

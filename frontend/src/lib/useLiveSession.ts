@@ -41,6 +41,7 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
   const { settings } = useSettings();
   const wsRef = useRef<WebSocket | null>(null);
   const [isConnected, setIsConnected] = useState(false);
+  const [isReconnecting, setIsReconnecting] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [audioStatus, setAudioStatus] = useState<'idle' | 'listening' | 'transcribing'>('idle');
   const [elapsed, setElapsed] = useState(0);
@@ -51,6 +52,7 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
   // Inspector State
   const [inspectorTab, setInspectorTab] = useState<'domande' | 'chat'>('domande');
   const [detectedQuestions, setDetectedQuestions] = useState<DetectedQuestion[]>([]);
+  const [answeringQuestionIds, setAnsweringQuestionIds] = useState<Set<string>>(new Set());
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [isSendingChat, setIsSendingChat] = useState(false);
@@ -62,6 +64,12 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const elapsedRef = useRef(0);
   const isPausedRef = useRef(isPaused);
+  const isConnectedRef = useRef(isConnected);
+  const isReconnectingRef = useRef(false);
+  const reconnectAttemptsRef = useRef(0);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const wasAutoPausedBySleepRef = useRef(false);
+  const lectureRef = useRef(lecture);
   // Domande eliminate dall'utente: ignorate se arrivano di nuovo (es. con la risposta flash)
   const deletedQuestionIdsRef = useRef<Set<string>>(new Set());
   const deletedQuestionTextsRef = useRef<Set<string>>(new Set());
@@ -85,6 +93,14 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
     isPausedRef.current = isPaused;
   }, [isPaused]);
 
+  useEffect(() => {
+    isConnectedRef.current = isConnected;
+  }, [isConnected]);
+
+  useEffect(() => {
+    lectureRef.current = lecture;
+  }, [lecture]);
+
   // Reset all state when a new lecture starts or is closed
   useEffect(() => {
     setElapsed(0);
@@ -93,17 +109,26 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
     setBookmarks([]);
     setChatMessages([]);
     setDetectedQuestions([]);
+    setAnsweringQuestionIds(new Set());
     setIsPaused(false);
     isPausedRef.current = false;
     setAudioStatus('idle');
     setConnectionError(null);
     setIsStopping(false);
     setIsSendingChat(false);
+    setIsReconnecting(false);
     isStoppingRef.current = false;
+    isReconnectingRef.current = false;
+    reconnectAttemptsRef.current = 0;
+    wasAutoPausedBySleepRef.current = false;
     deletedQuestionIdsRef.current = new Set();
     deletedQuestionTextsRef.current = new Set();
     activeChatQueryRef.current = null;
     cancelledChatResponsesRef.current = 0;
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
     return () => {
       void releaseWakeLock();
     };
@@ -113,7 +138,7 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
   const handleWSMessage = useCallback((msg: WSMessage) => {
     switch (msg.type) {
       case 'started': {
-        void acquireWakeLock(`SbobinAI - Registrazione lezione "${lecture?.title || subject.name}" in corso`);
+        void acquireWakeLock(`SbobinAI - Registrazione lezione "${lectureRef.current?.title || subject.name}" in corso`);
         const startedAtSec = (msg.payload?.session_started_at as number) || (Date.now() / 1000);
         if (timerRef.current) clearInterval(timerRef.current);
         timerRef.current = setInterval(() => {
@@ -123,6 +148,12 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
             setElapsed(currentSec);
           }
         }, 1000);
+        setConnectionError(null);
+        setIsConnected(true);
+        isConnectedRef.current = true;
+        setIsReconnecting(false);
+        isReconnectingRef.current = false;
+        reconnectAttemptsRef.current = 0;
         break;
       }
 
@@ -252,36 +283,141 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
         break;
       }
 
+      case 'reconnected': {
+        void acquireWakeLock(`SbobinAI - Registrazione lezione "${lectureRef.current?.title || subject.name}" in corso`);
+        const paused = Boolean(msg.payload?.is_paused);
+        setIsPaused(paused);
+        isPausedRef.current = paused;
+        if (paused) {
+          setAudioStatus('idle');
+        }
+
+        const restoredElapsed = typeof msg.payload?.elapsed === 'number' ? msg.payload.elapsed : 0;
+        setElapsed(restoredElapsed);
+        elapsedRef.current = restoredElapsed;
+
+        const startedAtSec = (msg.payload?.session_started_at as number) || (Date.now() / 1000 - restoredElapsed);
+        if (timerRef.current) clearInterval(timerRef.current);
+        timerRef.current = setInterval(() => {
+          if (!isPausedRef.current) {
+            const currentSec = Math.max(1, Math.round(Date.now() / 1000 - startedAtSec));
+            elapsedRef.current = currentSec;
+            setElapsed(currentSec);
+          }
+        }, 1000);
+
+        if (Array.isArray(msg.payload?.chunks)) {
+          const restoredChunks: TranscriptChunk[] = (msg.payload.chunks as unknown[]).map((c: any) => {
+            if (typeof c === 'string') {
+              return {
+                text: c,
+                elapsed: restoredElapsed,
+                timestamp: Date.now(),
+                speaker: 'Docente',
+              };
+            }
+            return {
+              text: c.text || '',
+              elapsed: typeof c.elapsed === 'number' ? c.elapsed : restoredElapsed,
+              timestamp: typeof c.timestamp === 'number' ? c.timestamp : Date.now(),
+              speaker: c.speaker || 'Docente',
+            };
+          });
+          setChunks(restoredChunks);
+        }
+
+        if (Array.isArray(msg.payload?.detected_questions)) {
+          const restoredQuestions: DetectedQuestion[] = (msg.payload.detected_questions as unknown[]).map((q: any) => {
+            const qText = typeof q === 'string' ? q : (q.question || q.text || '');
+            const rawAns = q.answer || q.suggested_answer || q.suggestedAnswer || undefined;
+            return {
+              id: String(q.id || generateId()),
+              question: qText,
+              confidence: typeof q.confidence === 'number' ? q.confidence : 0.9,
+              timestamp: typeof q.timestamp === 'number' ? q.timestamp : Date.now(),
+              answer: rawAns,
+              suggestedAnswer: rawAns,
+              sourceLecture: q.source_lecture || q.sourceLecture || 'Quaderno del corso',
+            };
+          });
+          setDetectedQuestions(restoredQuestions);
+        }
+
+        setConnectionError(null);
+        setIsConnected(true);
+        isConnectedRef.current = true;
+        setIsReconnecting(false);
+        isReconnectingRef.current = false;
+        reconnectAttemptsRef.current = 0;
+        break;
+      }
+
+      case 'question_answering': {
+        const qId = (msg.payload?.question_id as string) || (msg.payload?.id as string);
+        if (qId) {
+          setAnsweringQuestionIds((prev) => new Set(prev).add(String(qId)));
+        }
+        break;
+      }
+
       case 'question_detected': {
-        const qText = (msg.payload.question as string) || '';
+        const qText = (msg.payload?.question as string) || '';
         if (!qText.trim()) break;
-        const incomingId = msg.payload.id as string | undefined;
+        const incomingId = msg.payload?.id ? String(msg.payload.id) : undefined;
         if (
-          (incomingId && deletedQuestionIdsRef.current.has(String(incomingId))) ||
+          (incomingId && deletedQuestionIdsRef.current.has(incomingId)) ||
           deletedQuestionTextsRef.current.has(normalizeQuestion(qText))
         ) {
           break;
         }
 
+        const answerText = (msg.payload?.answer as string) || (msg.payload?.suggested_answer as string) || undefined;
+        const qId = incomingId || generateId();
+
+        // Rimuovi da answeringQuestionIds
+        setAnsweringQuestionIds((prev) => {
+          if (!prev.has(qId) && (!incomingId || !prev.has(incomingId))) return prev;
+          const next = new Set(prev);
+          next.delete(qId);
+          if (incomingId) next.delete(incomingId);
+          return next;
+        });
+
         const q: DetectedQuestion = {
-          id: (msg.payload.id as string) || generateId(),
+          id: qId,
           question: qText,
-          confidence: (msg.payload.confidence as number) || 0.9,
+          confidence: (msg.payload?.confidence as number) || 0.9,
           timestamp: Date.now(),
-          answer: (msg.payload.answer as string) || (msg.payload.suggested_answer as string) || undefined,
-          suggestedAnswer: (msg.payload.suggested_answer as string) || (msg.payload.answer as string) || 'Domanda rilevata dal parlato del docente.',
+          answer: answerText,
+          suggestedAnswer: answerText,
           sourceLecture: 'Quaderno del corso',
         };
 
         setDetectedQuestions((prev) => {
           const cleanQ = normalizeQuestion(qText);
           const existingIdx = prev.findIndex((item) => {
+            if (incomingId && item.id === incomingId) return true;
             const itemClean = normalizeQuestion(item.question);
             return itemClean === cleanQ || (cleanQ.length > 15 && itemClean.includes(cleanQ)) || (itemClean.length > 15 && cleanQ.includes(itemClean));
           });
           if (existingIdx >= 0) {
             const updated = [...prev];
-            updated[existingIdx] = { ...updated[existingIdx], ...q, id: updated[existingIdx].id };
+            const existing = updated[existingIdx];
+            if (existing.id !== qId) {
+              setAnsweringQuestionIds((s) => {
+                if (!s.has(existing.id)) return s;
+                const next = new Set(s);
+                next.delete(existing.id);
+                return next;
+              });
+            }
+            updated[existingIdx] = {
+              ...existing,
+              ...q,
+              id: existing.id,
+              answer: answerText || existing.answer,
+              suggestedAnswer: answerText || existing.suggestedAnswer,
+            };
             return updated;
           }
           return [q, ...prev];
@@ -315,11 +451,35 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
       case 'error': {
         const message = (msg.payload?.message as string) || 'Errore sconosciuto del motore di registrazione.';
         console.warn('[LiveSession] Errore dal backend:', message);
+
+        // Se il backend risponde con errore tipo non supportato per reconnect, fallback su start
+        if (message.includes('reconnect') && lectureRef.current && wsRef.current?.readyState === WebSocket.OPEN) {
+          console.info("[LiveSession] 'reconnect' non riconosciuto dal backend, fallback immediato su 'start'");
+          wsRef.current.send(JSON.stringify({
+            type: 'start',
+            payload: {
+              title: lectureRef.current.title,
+              lecture_id: lectureRef.current.id,
+              model: settings.whisperModel,
+              vad_sensitivity: settings.vadSensitivity,
+            }
+          }));
+          break;
+        }
+
         setConnectionError(message);
         // Un errore durante la chat non deve lasciare il pulsante bloccato
         if (activeChatQueryRef.current !== null) {
           activeChatQueryRef.current = null;
           setIsSendingChat(false);
+        }
+        const failedQId = (msg.payload?.question_id as string) || (msg.payload?.id as string);
+        if (failedQId) {
+          setAnsweringQuestionIds((prev) => {
+            const next = new Set(prev);
+            next.delete(String(failedQId));
+            return next;
+          });
         }
         break;
       }
@@ -331,28 +491,73 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
     handleWSMessageRef.current = handleWSMessage;
   }, [handleWSMessage]);
 
-  // ── WebSocket Lifecycle ─────────────────────────────────────────────────────
+  // ── WebSocket Lifecycle & Reconnection ──────────────────────────────────────
   // Il corso della WebSocket è quello della lezione in registrazione (fissato all'avvio)
   const sessionSubjectId = lecture?.subject_id ?? subject.id;
 
-  useEffect(() => {
-    if (!lecture) return;
+  const connectWebSocket = useCallback(() => {
+    const currentLecture = lectureRef.current;
+    if (!currentLecture || isStoppingRef.current) return;
+
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+
+    if (wsRef.current) {
+      try {
+        wsRef.current.onclose = null;
+        wsRef.current.onerror = null;
+        wsRef.current.onmessage = null;
+        wsRef.current.close();
+      } catch {}
+      wsRef.current = null;
+    }
 
     const ws = api.ws.liveLecture(sessionSubjectId);
     wsRef.current = ws;
 
     ws.onopen = () => {
+      if (wsRef.current !== ws) return;
       setIsConnected(true);
+      isConnectedRef.current = true;
+      setIsReconnecting(false);
+      isReconnectingRef.current = false;
       setConnectionError(null);
-      ws.send(JSON.stringify({
-        type: 'start',
-        payload: {
-          title: lecture.title,
-          lecture_id: lecture.id,
-          model: settings.whisperModel,
-          vad_sensitivity: settings.vadSensitivity,
+
+      const isReconnect = reconnectAttemptsRef.current > 0;
+      reconnectAttemptsRef.current = 0;
+
+      if (isReconnect) {
+        console.log(`[LiveSession] Riconnesso con successo al motore di registrazione per lezione ${currentLecture.id}`);
+        try {
+          ws.send(JSON.stringify({
+            type: 'reconnect',
+            payload: {
+              lecture_id: currentLecture.id,
+              title: currentLecture.title,
+              model: settings.whisperModel,
+              vad_sensitivity: settings.vadSensitivity,
+            }
+          }));
+        } catch (err) {
+          console.warn('[LiveSession] Errore invio reconnect:', err);
         }
-      }));
+      } else {
+        try {
+          ws.send(JSON.stringify({
+            type: 'start',
+            payload: {
+              title: currentLecture.title,
+              lecture_id: currentLecture.id,
+              model: settings.whisperModel,
+              vad_sensitivity: settings.vadSensitivity,
+            }
+          }));
+        } catch (err) {
+          console.warn('[LiveSession] Errore invio start:', err);
+        }
+      }
     };
 
     ws.onmessage = (event) => {
@@ -365,40 +570,123 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
     };
 
     ws.onclose = () => {
-      setIsConnected(false);
-      stopTimer();
       if (wsRef.current === ws) wsRef.current = null;
+      setIsConnected(false);
+      isConnectedRef.current = false;
+      stopTimer();
+
       // Sblocca un'eventuale attesa di 'stopped' e una richiesta chat in corso
       if (stopResolverRef.current) stopResolverRef.current(false);
       if (activeChatQueryRef.current !== null) {
         activeChatQueryRef.current = null;
         setIsSendingChat(false);
       }
-      if (!isStoppingRef.current) {
-        setConnectionError((prev) => prev || 'Connessione con il motore di registrazione interrotta.');
-      }
-    };
-    ws.onerror = () => {
-      setIsConnected(false);
-      if (!isStoppingRef.current) {
-        setConnectionError('Impossibile connettersi al motore di registrazione. Verifica che il backend sia attivo.');
+
+      if (!isStoppingRef.current && lectureRef.current) {
+        // Mostra stato di riconnessione automatica a intervalli crescenti (1s, 2s, 3s...)
+        setIsReconnecting(true);
+        isReconnectingRef.current = true;
+        reconnectAttemptsRef.current += 1;
+        const delay = Math.min(reconnectAttemptsRef.current * 1000, 5000);
+        console.warn(`[LiveSession] Connessione interrotta. Riconnessione automatica #${reconnectAttemptsRef.current} tra ${delay}ms...`);
+        reconnectTimerRef.current = setTimeout(() => {
+          connectWebSocket();
+        }, delay);
       }
     };
 
+    ws.onerror = () => {
+      if (wsRef.current === ws) {
+        setIsConnected(false);
+        isConnectedRef.current = false;
+      }
+    };
+  }, [sessionSubjectId, settings.whisperModel, settings.vadSensitivity]);
+
+  useEffect(() => {
+    if (!lecture) return;
+
+    connectWebSocket();
+
     return () => {
       void releaseWakeLock();
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
       if (chatChunkTimerRef.current) {
         clearTimeout(chatChunkTimerRef.current);
         chatChunkTimerRef.current = null;
       }
-      ws.onclose = null;
-      ws.onerror = null;
-      ws.onmessage = null;
-      ws.close();
-      if (wsRef.current === ws) wsRef.current = null;
+      if (wsRef.current) {
+        wsRef.current.onclose = null;
+        wsRef.current.onerror = null;
+        wsRef.current.onmessage = null;
+        wsRef.current.close();
+        wsRef.current = null;
+      }
       stopTimer();
     };
-  }, [sessionSubjectId, lecture?.id]);
+  }, [lecture?.id, connectWebSocket]);
+
+  // ── Fluidità di Pausa / Ripresa ───────────────────────────────────────────
+  const togglePause = useCallback(() => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+
+    if (!isPausedRef.current) {
+      // Feedback istantaneo a zero latenza
+      setIsPaused(true);
+      isPausedRef.current = true;
+      setAudioStatus('idle');
+      try {
+        wsRef.current.send(JSON.stringify({ type: 'pause' }));
+      } catch (err) {
+        console.warn('[LiveSession] Errore invio pause WebSocket:', err);
+      }
+    } else {
+      // Feedback istantaneo per ripresa
+      setIsPaused(false);
+      isPausedRef.current = false;
+      wasAutoPausedBySleepRef.current = false;
+      try {
+        wsRef.current.send(JSON.stringify({ type: 'resume' }));
+      } catch (err) {
+        console.warn('[LiveSession] Errore invio resume WebSocket:', err);
+      }
+    }
+  }, []);
+
+  // ── Riconoscimento Chiusura Schermo / Sleep / Minimizzazione ─────────────────
+  useEffect(() => {
+    if (!lecture) return;
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        if (isConnectedRef.current && !isPausedRef.current && !isStoppingRef.current) {
+          console.log('[LiveSession] Schermo chiuso / minimizzato: auto-pausa automatica attivata');
+          wasAutoPausedBySleepRef.current = true;
+          togglePause();
+        }
+      } else if (document.visibilityState === 'visible') {
+        if (!isStoppingRef.current) {
+          const isSocketOpen = wsRef.current && wsRef.current.readyState === WebSocket.OPEN;
+          if (!isSocketOpen) {
+            console.log('[LiveSession] Schermo riaperto / tornato visibile: avvio immediato riconnessione automatica');
+            if (reconnectTimerRef.current) {
+              clearTimeout(reconnectTimerRef.current);
+              reconnectTimerRef.current = null;
+            }
+            connectWebSocket();
+          }
+        }
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [lecture, togglePause, connectWebSocket]);
 
   // ── Actions ─────────────────────────────────────────────────────────────────
   const lastBookmarkTimeRef = useRef(0);
@@ -418,6 +706,12 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
     if (isStoppingRef.current) return;
     isStoppingRef.current = true;
     setIsStopping(true);
+    setIsReconnecting(false);
+    isReconnectingRef.current = false;
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
     void releaseWakeLock();
     stopTimer();
 
@@ -515,8 +809,24 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
     }
   }, []);
 
+  const handleAnswerQuestion = useCallback((questionId: string) => {
+    setAnsweringQuestionIds((prev) => new Set(prev).add(questionId));
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({
+        type: 'answer_question',
+        payload: { question_id: questionId }
+      }));
+    }
+  }, []);
+
   const handleDeleteQuestion = useCallback((questionId: string) => {
     deletedQuestionIdsRef.current.add(String(questionId));
+    setAnsweringQuestionIds((prev) => {
+      if (!prev.has(questionId)) return prev;
+      const next = new Set(prev);
+      next.delete(questionId);
+      return next;
+    });
     setDetectedQuestions((prev) => {
       const removed = prev.find((q) => q.id === questionId);
       if (removed) deletedQuestionTextsRef.current.add(normalizeQuestion(removed.question));
@@ -530,19 +840,6 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
     }
   }, []);
 
-  const togglePause = useCallback(() => {
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-
-    if (!isPausedRef.current) {
-      setIsPaused(true);
-      isPausedRef.current = true;
-      wsRef.current.send(JSON.stringify({ type: 'pause' }));
-    } else {
-      setIsPaused(false);
-      isPausedRef.current = false;
-      wsRef.current.send(JSON.stringify({ type: 'resume' }));
-    }
-  }, []);
 
   // Keyboard shortcut ⌘B e ⌘⇧B per Segnalibro
   useEffect(() => {
@@ -591,6 +888,7 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
 
   return {
     isConnected,
+    isReconnecting,
     connectionError,
     isStopping,
     isPaused,
@@ -604,6 +902,8 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
     handleBookmark,
     handleStop,
     detectedQuestions,
+    answeringQuestionIds,
+    handleAnswerQuestion,
     handleDeleteQuestion,
     chatMessages,
     chatInput,

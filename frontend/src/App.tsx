@@ -4,7 +4,6 @@ import { api, checkBackendHealth } from './lib/api';
 import Sidebar from './components/Sidebar';
 import SubjectDashboard from './components/SubjectDashboard';
 import EmptyState from './components/EmptyState';
-import UpdateBanner from './components/UpdateBanner';
 import ErrorBoundary from './components/ErrorBoundary';
 import { SettingsProvider, useSettings, isAutoUpdateEnabled } from './lib/SettingsContext';
 import { checkAndAutoInstall, type BootUpdateEvent } from './lib/useUpdater';
@@ -18,17 +17,45 @@ const SettingsModal = lazy(() => import('./components/SettingsModal'));
 function BackendLoadingGate({ children }: { children: React.ReactNode }) {
   const { settings, syncWithBackend } = useSettings();
   const [isReady, setIsReady] = useState(false);
+  const [updatePhaseFinished, setUpdatePhaseFinished] = useState(false);
   const [statusMessage, setStatusMessage] = useState("Sto preparando l'ambiente per l'uso, aspetta ancora un po'...");
   const [error, setError] = useState<string | null>(null);
   const [retryCount, setRetryCount] = useState(0);
   const [bootUpdate, setBootUpdate] = useState<BootUpdateEvent>({ status: 'idle' });
 
-  // Controllo e installazione automatica aggiornamenti all'avvio (se attivo, default ON)
+  // 1. Controllo e installazione automatica aggiornamenti all'avvio PRIMA di aprire l'app
   useEffect(() => {
-    if (!isAutoUpdateEnabled()) return;
-    void checkAndAutoInstall((event) => {
-      setBootUpdate(event);
-    });
+    let cancelled = false;
+
+    if (!isAutoUpdateEnabled()) {
+      setUpdatePhaseFinished(true);
+      return;
+    }
+
+    const runBootUpdate = async () => {
+      try {
+        const updated = await checkAndAutoInstall((event) => {
+          if (!cancelled) {
+            setBootUpdate(event);
+          }
+        });
+        if (updated) {
+          // Un aggiornamento è in fase di installazione o riavvio: l'app non deve aprirsi
+          return;
+        }
+      } catch (err) {
+        console.warn('[Startup] Controllo aggiornamenti iniziale completato o saltato:', err);
+      }
+      if (!cancelled) {
+        setUpdatePhaseFinished(true);
+      }
+    };
+
+    void runBootUpdate();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Pulizia automatica file orfani, vacuum DB e ottimizzazione storage ad ogni avvio dell'app
@@ -48,6 +75,24 @@ function BackendLoadingGate({ children }: { children: React.ReactNode }) {
     const check = async () => {
       if (cancelled) return;
 
+      // Non aprire l'app finché la fase di verifica aggiornamenti iniziale non è terminata
+      if (!updatePhaseFinished) {
+        setTimeout(check, 300);
+        return;
+      }
+
+      // Se c'è un aggiornamento in corso o l'app sta per riavviare, resta nel boot gate
+      const isUpdating =
+        bootUpdate.status === 'available' ||
+        bootUpdate.status === 'downloading' ||
+        bootUpdate.status === 'installing' ||
+        bootUpdate.status === 'relaunching';
+
+      if (isUpdating) {
+        setTimeout(check, 500);
+        return;
+      }
+
       // 1. Controlla lo stato dettagliato da Tauri (se attivo)
       try {
         const tauriStatus = await getBackendStatus();
@@ -65,17 +110,8 @@ function BackendLoadingGate({ children }: { children: React.ReactNode }) {
             return;
           }
           if (tauriStatus.port_ready) {
-            // Se c'è un aggiornamento in corso all'avvio, attendi che si concluda o riavvii
-            if (
-              bootUpdate.status === 'downloading' ||
-              bootUpdate.status === 'installing' ||
-              bootUpdate.status === 'relaunching'
-            ) {
-              setTimeout(check, 800);
-              return;
-            }
-            void syncWithBackend();
-            setIsReady(true);
+            await syncWithBackend();
+            if (!cancelled) setIsReady(true);
             return;
           }
         }
@@ -88,8 +124,8 @@ function BackendLoadingGate({ children }: { children: React.ReactNode }) {
       if (cancelled) return;
 
       if (healthy) {
-        void syncWithBackend();
-        setIsReady(true);
+        await syncWithBackend();
+        if (!cancelled) setIsReady(true);
         return;
       }
 
@@ -109,17 +145,17 @@ function BackendLoadingGate({ children }: { children: React.ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [retryCount, bootUpdate.status]);
+  }, [retryCount, updatePhaseFinished, bootUpdate.status]);
 
   const isBootUpdating =
+    bootUpdate.status === 'available' ||
     bootUpdate.status === 'downloading' ||
     bootUpdate.status === 'installing' ||
     bootUpdate.status === 'relaunching';
 
-  // Se l'utente è al primo avvio (setup non completato) e non c'è un aggiornamento critico in corso,
-  // mostra SUBITO il Wizard (apertura istantanea <100ms) senza attendere il backend.
-  // La preparazione del motore continuerà in background e verrà gestita allo step di download.
-  if (!settings.setupComplete && !isBootUpdating) {
+  // Se l'utente è al primo avvio (setup non completato) e non c'è un aggiornamento in corso,
+  // mostra il Wizard solo dopo aver terminato la verifica iniziale.
+  if (updatePhaseFinished && !isBootUpdating && !settings.setupComplete) {
     return <>{children}</>;
   }
 
@@ -139,7 +175,48 @@ function BackendLoadingGate({ children }: { children: React.ReactNode }) {
 
           <h1 className="text-xl font-bold tracking-tight mb-2">SbobinAI</h1>
 
-          {error ? (
+          {/* Se è presente un aggiornamento all'avvio, mostra solo la card dedicata pulita ed elegante */}
+          {isBootUpdating ? (
+            <div className="mt-5 w-full max-w-[280px] p-4 rounded-2xl bg-white/[0.04] border border-white/10 text-left shadow-2xl backdrop-blur-xl animate-fade-in space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <div className="w-3.5 h-3.5 rounded-full border-2 border-blue-400/30 border-t-blue-400 animate-spin shrink-0" />
+                  <span className="text-xs font-semibold text-white/90 truncate">
+                    {bootUpdate.status === 'installing' || bootUpdate.status === 'relaunching'
+                      ? 'Installazione e riavvio...'
+                      : 'Aggiornamento in corso...'}
+                  </span>
+                </div>
+                {bootUpdate.version && (
+                  <span className="text-[10px] font-mono font-medium px-2 py-0.5 rounded-full bg-blue-500/15 text-blue-300 border border-blue-400/25 shrink-0">
+                    v{bootUpdate.version}
+                  </span>
+                )}
+              </div>
+
+              {/* Barra di avanzamento proporzionata con overflow-hidden */}
+              <div className="w-full h-1.5 rounded-full bg-white/10 overflow-hidden relative">
+                <div
+                  className="h-full bg-gradient-to-r from-blue-500 via-indigo-400 to-emerald-400 transition-all duration-300 rounded-full"
+                  style={{
+                    width:
+                      bootUpdate.status === 'installing' || bootUpdate.status === 'relaunching'
+                        ? '100%'
+                        : `${Math.max(4, bootUpdate.progress || 0)}%`,
+                  }}
+                />
+              </div>
+
+              <div className="flex justify-between items-center text-[10px] text-white/50 font-mono">
+                <span>
+                  {bootUpdate.status === 'installing' || bootUpdate.status === 'relaunching'
+                    ? "Riavvio automatico dell'app..."
+                    : 'Download aggiornamento'}
+                </span>
+                <span className="font-semibold text-blue-300">{bootUpdate.progress || 0}%</span>
+              </div>
+            </div>
+          ) : error ? (
             <div className="mt-4 p-4 rounded-xl bg-red-500/10 border border-red-500/25 text-left text-xs w-full max-w-xs">
               <p className="text-red-400 font-semibold mb-1">Si è verificato un problema</p>
               <p className="text-red-200/80 mb-3 break-words">{error}</p>
@@ -163,52 +240,6 @@ function BackendLoadingGate({ children }: { children: React.ReactNode }) {
               <span className="text-xs text-white/75 font-medium">
                 {statusMessage}
               </span>
-            </div>
-          )}
-
-          {/* Indicatore Aggiornamento in Corso all'avvio (anche su schermo di errore) */}
-          {(bootUpdate.status === 'available' ||
-            bootUpdate.status === 'downloading' ||
-            bootUpdate.status === 'installing' ||
-            bootUpdate.status === 'relaunching') && (
-            <div className="mt-5 w-full max-w-xs p-3.5 rounded-2xl bg-blue-500/10 border border-blue-400/30 text-left shadow-lg backdrop-blur-md animate-fade-in">
-              <div className="flex items-center justify-between gap-2 mb-2">
-                <div className="flex items-center gap-2 min-w-0">
-                  <div className="w-3.5 h-3.5 rounded-full border-2 border-blue-400/30 border-t-blue-400 animate-spin shrink-0" />
-                  <span className="text-xs font-semibold text-blue-200 truncate">
-                    {bootUpdate.status === 'installing' || bootUpdate.status === 'relaunching'
-                      ? 'Installazione e riavvio...'
-                      : 'Aggiornamento in corso...'}
-                  </span>
-                </div>
-                {bootUpdate.version && (
-                  <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-blue-400/20 text-blue-200 border border-blue-400/30 shrink-0">
-                    v{bootUpdate.version}
-                  </span>
-                )}
-              </div>
-
-              {/* Barra di avanzamento */}
-              <div className="w-full h-1.5 rounded-full bg-white/10 overflow-hidden relative">
-                <div
-                  className="h-full bg-gradient-to-r from-blue-500 to-indigo-400 transition-all duration-300 rounded-full"
-                  style={{
-                    width:
-                      bootUpdate.status === 'installing' || bootUpdate.status === 'relaunching'
-                        ? '100%'
-                        : `${Math.max(5, bootUpdate.progress || 0)}%`,
-                  }}
-                />
-              </div>
-
-              <div className="flex justify-between items-center mt-1.5 text-[10px] text-blue-200/70 font-mono">
-                <span>
-                  {bootUpdate.status === 'installing' || bootUpdate.status === 'relaunching'
-                    ? "Riavvio automatico dell'app..."
-                    : `Scaricamento (${bootUpdate.progress || 0}%)`}
-                </span>
-                <span>{bootUpdate.progress || 0}%</span>
-              </div>
             </div>
           )}
         </div>
@@ -313,7 +344,6 @@ function MainApp() {
 
   return (
     <>
-      <UpdateBanner hidden={showSettingsModal} />
       {/* Onboarding Wizard a tutto schermo se setupComplete è false */}
       {!settings.setupComplete ? (
         <Suspense fallback={<div className="h-screen w-screen flex items-center justify-center bg-black/40"><div className="w-8 h-8 rounded-full border-2 border-white/20 border-t-white animate-spin" /></div>}>

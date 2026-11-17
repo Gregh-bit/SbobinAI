@@ -515,18 +515,42 @@ class AudioEngine:
         if not self.is_running or not self.is_paused:
             return False
 
-        if self._stream:
+        if self._stream is not None:
+            started = False
             try:
                 self._stream.start()
+                started = True
                 logger.info(f"[AudioEngine] Stream audio hardware RIPRESO per lezione {self.lecture_id}")
             except Exception as e:
-                logger.warning(f"[AudioEngine] Errore ripresa stream con start(): {e}, provo riapertura...")
+                logger.warning(f"[AudioEngine] Errore ripresa stream con start(): {e}, chiudo preventivamente e riapro...")
                 try:
-                    self._open_stream()
-                    if self._stream:
-                        self._stream.start()
-                except Exception as e2:
-                    logger.error(f"[AudioEngine] Impossibile riaprire lo stream: {e2}")
+                    self._stream.close()
+                except Exception:
+                    pass
+                self._stream = None
+
+            if not started:
+                reopened = False
+                for attempt in range(3):
+                    # Breve pausa per consentire ai driver audio WASAPI / CoreAudio di svegliarsi dallo sleep dell'OS
+                    time.sleep(0.150)
+                    try:
+                        self._stream = self._open_stream()
+                        if self._stream:
+                            self._stream.start()
+                            reopened = True
+                            logger.info(f"[AudioEngine] Stream audio hardware riaperto con successo al tentativo {attempt + 1}")
+                            break
+                    except Exception as e2:
+                        logger.warning(f"[AudioEngine] Tentativo {attempt + 1} riapertura fallito: {e2}")
+                        if self._stream:
+                            try:
+                                self._stream.close()
+                            except Exception:
+                                pass
+                            self._stream = None
+                if not reopened:
+                    logger.error("[AudioEngine] Impossibile riaprire lo stream: tutti i tentativi falliti")
                     return False
 
         self.is_paused = False

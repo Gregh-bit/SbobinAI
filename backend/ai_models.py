@@ -28,6 +28,7 @@ MB = 1024 * 1024
 # ── ID logici (stabili, condivisi con config.DEFAULT_SETTINGS e frontend) ─────
 WHISPER_CORE_ID = "large-v3-turbo-q4"
 LLM_DEFAULT_ID = "mlx-community/Qwen3.5-4B-MLX-4bit"
+LLM_LIGHT_ID = "mlx-community/Qwen3.5-2B-MLX-4bit"
 LLM_ALT_ID = "unsloth/gemma-4-E4B-it-UD-MLX-4bit"
 EMBEDDING_DEFAULT_ID = "mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ"
 MOCK_WHISPER_ID = "mock_mode"
@@ -114,6 +115,30 @@ CATALOG: Dict[str, ModelSpec] = {
                 model_file="Qwen3.5-4B-Q4_K_M.gguf",
                 name="Qwen 3.5 4B",
                 description="Compatto e veloce. Genera capitoli, sintesi ed evidenzia i concetti chiave.",
+            ),
+        },
+    ),
+    LLM_LIGHT_ID: ModelSpec(
+        id=LLM_LIGHT_ID,
+        type="llm",
+        aliases=("qwen3.5-2b", "qwen-2b", "mlx-community/Qwen3.5-2B-4bit"),
+        variants={
+            "mlx": Variant(
+                repo_id="mlx-community/Qwen3.5-2B-MLX-4bit",
+                required=("config.json", "tokenizer*", "*.safetensors"),
+                allow_patterns=None,
+                approx_bytes=1670 * MB,
+                name="Qwen 3.5 2B (Leggero)",
+                description="Versione ultraleggera e velocissima a basso consumo di memoria.",
+            ),
+            "portable": Variant(
+                repo_id="unsloth/Qwen3.5-2B-GGUF",
+                required=("Qwen3.5-2B-Q4_K_M.gguf",),
+                allow_patterns=("Qwen3.5-2B-Q4_K_M.gguf",),
+                approx_bytes=1225 * MB,
+                model_file="Qwen3.5-2B-Q4_K_M.gguf",
+                name="Qwen 3.5 2B (Leggero)",
+                description="Versione ultraleggera e velocissima a basso consumo di memoria.",
             ),
         },
     ),

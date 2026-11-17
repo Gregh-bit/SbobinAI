@@ -53,7 +53,7 @@ export default function SegmentedControl<T extends string>({
             aria-selected={isActive}
             onClick={() => onChange(option.id)}
             className={clsx(
-              'relative flex items-center justify-center gap-1.5 rounded-full font-medium transition-colors duration-150 cursor-pointer z-10',
+              'relative flex items-center justify-center gap-1.5 rounded-full font-medium transition-colors duration-150 cursor-pointer z-10 leading-normal',
               fullWidth ? 'flex-1' : '',
               isSm ? 'h-6 px-2.5 text-[11px]' : 'h-7 px-3 text-xs',
               isActive
@@ -85,10 +85,10 @@ export default function SegmentedControl<T extends string>({
               />
             )}
 
-            <span className="truncate relative z-10">{option.label}</span>
+            <span className="truncate relative z-10 leading-normal flex items-center justify-center">{option.label}</span>
 
             {option.badge && (
-              <span className="relative z-10 flex-shrink-0">{option.badge}</span>
+              <span className="relative z-10 flex-shrink-0 flex items-center justify-center">{option.badge}</span>
             )}
           </button>
         );

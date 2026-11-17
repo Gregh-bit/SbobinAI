@@ -1,6 +1,6 @@
 // lib/api.ts — SbobinAI HTTP API client
 
-const BASE_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000/api/v1';
+export const BASE_URL = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000/api/v1';
 const WS_URL = import.meta.env.VITE_WS_URL || 'ws://127.0.0.1:8000';
 
 // Estrae un messaggio leggibile dal campo `detail` di FastAPI (stringa o array di errori 422)
@@ -20,14 +20,18 @@ async function throwResponseError(res: Response): Promise<never> {
   throw new Error(formatErrorDetail(err?.detail, res.status));
 }
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
+async function request<T>(
+  path: string,
+  options?: RequestInit,
+  timeoutMs: number | null = 30000
+): Promise<T> {
   const headers = new Headers(options?.headers);
   if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
   let signal = options?.signal;
-  let timer: any = null;
-  if (!signal && typeof AbortController !== 'undefined') {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  if (!signal && timeoutMs !== null && timeoutMs > 0 && typeof AbortController !== 'undefined') {
     const controller = new AbortController();
-    timer = setTimeout(() => controller.abort(), 30000);
+    timer = setTimeout(() => controller.abort(), timeoutMs);
     signal = controller.signal;
   }
   try {
@@ -43,6 +47,60 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     return res.json();
   } finally {
     if (timer) clearTimeout(timer);
+  }
+}
+
+async function streamNdjson(
+  path: string,
+  options: RequestInit,
+  onEvent: (ev: import('../types').ChatStreamEvent) => void
+): Promise<void> {
+  const headers = new Headers(options.headers);
+  if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+
+  const res = await fetch(`${BASE_URL}${path}`, {
+    ...options,
+    headers,
+  });
+  if (!res.ok) {
+    await throwResponseError(res);
+  }
+
+  const reader = res.body?.getReader();
+  if (!reader) return;
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  const emitLine = (rawLine: string) => {
+    const trimmed = rawLine.trim();
+    if (!trimmed) return;
+    const parsed = JSON.parse(trimmed) as import('../types').ChatStreamEvent;
+    onEvent(parsed);
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+
+      let newlineIdx = buffer.indexOf('\n');
+      while (newlineIdx !== -1) {
+        const line = buffer.slice(0, newlineIdx);
+        buffer = buffer.slice(newlineIdx + 1);
+        emitLine(line);
+        newlineIdx = buffer.indexOf('\n');
+      }
+
+      if (done) {
+        if (buffer.trim()) {
+          emitLine(buffer);
+        }
+        break;
+      }
+    }
+  } finally {
+    reader.releaseLock();
   }
 }
 
@@ -74,6 +132,12 @@ export const api = {
       request<import('../types').Subject>(`/subjects/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
     delete: (id: number) => request<void>(`/subjects/${id}`, { method: 'DELETE' }),
     getMaterials: (id: number) => request<import('../types').CourseMaterial[]>(`/subjects/${id}/materials`),
+    getMaterialPage: (subjectId: number, filename: string, page: number) =>
+      request<import('../types').MaterialPageOut>(
+        `/subjects/${subjectId}/materials/${encodeURIComponent(filename)}/page/${page}`
+      ),
+    getMaterialFileUrl: (subjectId: number, filename: string): string =>
+      `${BASE_URL}/subjects/${subjectId}/materials/${encodeURIComponent(filename)}/file`,
     deleteMaterialFile: (id: number, filename: string) =>
       request<void>(`/subjects/${id}/materials/${encodeURIComponent(filename)}`, { method: 'DELETE' }),
     chat: (subjectId: number, query: string, modelId?: string, options?: { signal?: AbortSignal }) =>
@@ -135,9 +199,13 @@ export const api = {
       }
     },
     reindex: (subjectId: number) =>
-      request<{ status: string; subject_id: number; indexed_chunks: number }>(`/subjects/${subjectId}/reindex`, {
-        method: 'POST',
-      }),
+      request<{ status: string; subject_id: number; indexed_chunks: number }>(
+        `/subjects/${subjectId}/reindex`,
+        {
+          method: 'POST',
+        },
+        180000
+      ),
     uploadMaterialFile: async (id: number, file: File): Promise<import('../types').CourseMaterial> => {
       const formData = new FormData();
       formData.append('file', file);
@@ -164,10 +232,102 @@ export const api = {
         method: 'POST',
         signal: options?.signal,
       }),
+    generateSummaryStream: async (
+      lectureId: number,
+      onProgress: (ev: { stage: string; message?: string; progress?: number; processed_notes?: string; status?: string }) => void,
+      options?: { signal?: AbortSignal; model_id?: string }
+    ): Promise<{ status: string; lecture_id: number; processed_notes: string }> => {
+      const headers = new Headers();
+      headers.set('Content-Type', 'application/json');
+
+      const res = await fetch(`${BASE_URL}/lectures/${lectureId}/generate-summary-stream`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ model_id: options?.model_id }),
+        signal: options?.signal,
+      });
+
+      if (!res.ok) {
+        await throwResponseError(res);
+      }
+
+      const reader = res.body?.getReader();
+      if (!reader) {
+        throw new Error('Nessun flusso dati ricevuto dal server.');
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let finalResult: { status: string; lecture_id: number; processed_notes: string } | null = null;
+
+      const processLine = (rawLine: string) => {
+        const trimmed = rawLine.trim();
+        if (!trimmed || trimmed.startsWith(':')) return; // ignora commenti keep-alive (: keep-alive)
+        try {
+          const parsed = JSON.parse(trimmed);
+          onProgress(parsed);
+          if (parsed.stage === 'done' && parsed.processed_notes) {
+            finalResult = {
+              status: parsed.status || 'success',
+              lecture_id: parsed.lecture_id || lectureId,
+              processed_notes: parsed.processed_notes,
+            };
+          } else if (parsed.stage === 'cancelled') {
+            finalResult = {
+              status: 'cancelled',
+              lecture_id: lectureId,
+              processed_notes: parsed.processed_notes || '',
+            };
+          } else if (parsed.stage === 'error') {
+            throw new Error(parsed.message || 'Errore durante la generazione del capitolo');
+          }
+        } catch (e: any) {
+          if (e?.message && e.message.includes('Errore durante la generazione')) throw e;
+        }
+      };
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+
+          let newlineIdx = buffer.indexOf('\n');
+          while (newlineIdx !== -1) {
+            const line = buffer.slice(0, newlineIdx);
+            buffer = buffer.slice(newlineIdx + 1);
+            processLine(line);
+            newlineIdx = buffer.indexOf('\n');
+          }
+
+          if (done) {
+            if (buffer.trim()) {
+              processLine(buffer);
+            }
+            break;
+          }
+        }
+      } finally {
+        try {
+          reader.releaseLock();
+        } catch {}
+      }
+
+      if (!finalResult) {
+        const updatedLecture = await request<import('../types').Lecture>(`/lectures/${lectureId}`);
+        return {
+          status: 'success',
+          lecture_id: lectureId,
+          processed_notes: updatedLecture.processed_notes || '',
+        };
+      }
+
+      return finalResult;
+    },
     answerQuestion: (lectureId: number, questionId: string) =>
       request<{ status: string; question: import('../types').DetectedQuestion; answer: string }>(
         `/lectures/${lectureId}/questions/${encodeURIComponent(questionId)}/answer`,
-        { method: 'POST' }
+        { method: 'POST' },
+        180000
       ),
     getAudioUrl: (lectureId: number) => `${BASE_URL}/lectures/${lectureId}/audio`,
     getTimestamps: (lectureId: number) =>
@@ -183,10 +343,14 @@ export const api = {
   settings: {
     get: () => request<Record<string, unknown>>('/settings/'),
     setStorage: (storagePath: string) =>
-      request<{ status: string; storage_path: string; dirs: unknown }>('/settings/storage', {
-        method: 'POST',
-        body: JSON.stringify({ storage_path: storagePath }),
-      }),
+      request<{ status: string; storage_path: string; dirs: unknown }>(
+        '/settings/storage',
+        {
+          method: 'POST',
+          body: JSON.stringify({ storage_path: storagePath }),
+        },
+        180000
+      ),
     update: (data: Record<string, unknown>) =>
       request<Record<string, unknown>>('/settings/', {
         method: 'PATCH',
@@ -201,7 +365,7 @@ export const api = {
         deleted_upload_dirs: string[];
         deleted_db_files: string[];
         message: string;
-      }>('/settings/clean-orphans', { method: 'POST' }),
+      }>('/settings/clean-orphans', { method: 'POST' }, 180000),
     getStorageStats: () =>
       request<{
         audio_mb: number;
@@ -217,7 +381,7 @@ export const api = {
         freed_mb: number;
         total_audio_mb: number;
         message: string;
-      }>('/settings/compress-audio', { method: 'POST' }),
+      }>('/settings/compress-audio', { method: 'POST' }, 180000),
   },
   models: {
     status: () => request<import('../types').ModelsStatusResponse>('/models/status'),
@@ -313,6 +477,115 @@ export const api = {
       request<{ status: string; message: string }>(
         subjectId ? `/study/${subjectId}/abort` : '/study/abort',
         { method: 'POST' }
+      ),
+    listQuizSets: (subjectId: number) =>
+      request<import('../types').QuizSetOut[]>(`/study/${subjectId}/quiz-sets`),
+    getQuizSet: (quizId: number) =>
+      request<import('../types').QuizSetOut>(`/study/quiz-sets/${quizId}`),
+  },
+  chats: {
+    list: (subjectId: number) =>
+      request<import('../types').ChatSession[]>(`/chats/subject/${subjectId}`),
+    create: (subjectId: number, data?: { title?: string; scope?: import('../types').ChatScope }) =>
+      request<import('../types').ChatSessionDetail>(`/chats/subject/${subjectId}`, {
+        method: 'POST',
+        body: JSON.stringify(data || {}),
+      }),
+    get: (chatId: number) =>
+      request<import('../types').ChatSessionDetail>(`/chats/${chatId}`),
+    update: (chatId: number, data: { title?: string; scope?: import('../types').ChatScope }) =>
+      request<import('../types').ChatSessionDetail>(`/chats/${chatId}`, {
+        method: 'PATCH',
+        body: JSON.stringify(data),
+      }),
+    delete: (chatId: number) =>
+      request<{ ok: boolean }>(`/chats/${chatId}`, { method: 'DELETE' }),
+    deleteMessage: (chatId: number, messageId: number) =>
+      request<import('../types').ChatSessionDetail>(`/chats/${chatId}/messages/${messageId}`, {
+        method: 'DELETE',
+      }),
+    compact: (chatId: number) =>
+      request<import('../types').ChatSessionDetail>(
+        `/chats/${chatId}/compact`,
+        {
+          method: 'POST',
+        },
+        180000
+      ),
+    archive: (chatId: number, data: { title?: string; mode?: 'quaderno_and_clear' | 'quaderno_keep' }) =>
+      request<{ lecture_id: number; title: string; session: import('../types').ChatSessionDetail }>(
+        `/chats/${chatId}/archive`,
+        {
+          method: 'POST',
+          body: JSON.stringify(data),
+        },
+        180000
+      ),
+    saveNote: (chatId: number, data: { message_id: number; title?: string }) =>
+      request<{ lecture_id: number; title: string }>(
+        `/chats/${chatId}/save-note`,
+        {
+          method: 'POST',
+          body: JSON.stringify(data),
+        },
+        180000
+      ),
+    importLegacy: (
+      subjectId: number,
+      data: { title?: string; messages: Array<{ role: string; content: string; thinking?: string; context_used?: string }> }
+    ) =>
+      request<import('../types').ChatSessionDetail>(`/chats/subject/${subjectId}/import-legacy`, {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+    streamMessage: (
+      chatId: number,
+      body: {
+        message: string;
+        mode?: import('../types').ChatStudyMode;
+        scope?: import('../types').ChatScope;
+      },
+      onEvent: (ev: import('../types').ChatStreamEvent) => void,
+      signal?: AbortSignal
+    ): Promise<void> =>
+      streamNdjson(
+        `/chats/${chatId}/stream`,
+        {
+          method: 'POST',
+          body: JSON.stringify(body),
+          signal,
+        },
+        onEvent
+      ),
+    regenerateStream: (
+      chatId: number,
+      messageId: number,
+      onEvent: (ev: import('../types').ChatStreamEvent) => void,
+      signal?: AbortSignal
+    ): Promise<void> =>
+      streamNdjson(
+        `/chats/${chatId}/messages/${messageId}/regenerate-stream`,
+        {
+          method: 'POST',
+          signal,
+        },
+        onEvent
+      ),
+    editAndStreamMessage: (
+      chatId: number,
+      messageId: number,
+      payload: import('../types').ChatMessageSend,
+      onEvent: (ev: import('../types').ChatStreamEvent) => void,
+      signal?: AbortSignal
+    ): Promise<void> =>
+      streamNdjson(
+        `/chats/${chatId}/messages/${messageId}/edit-stream`,
+        {
+          method: 'POST',
+          body: JSON.stringify(payload),
+          signal,
+        },
+        onEvent
       ),
   },
   ws: {
