@@ -1,11 +1,23 @@
 // lib/SettingsContext.tsx — Context React per la gestione persistente delle impostazioni di SbobinAI
-import { createContext, useContext, useEffect, useState, useCallback, type ReactNode } from 'react';
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useState,
+  useCallback,
+  useRef,
+  type Dispatch,
+  type ReactNode,
+  type SetStateAction,
+} from 'react';
 import { api } from './api';
+import type { ModelsStatusResponse } from '../types';
 
 export interface AppSettings {
   setupComplete: boolean;
   modelsDownloaded: boolean;
   llmDownloaded?: boolean;
+  llmSupportsThinking?: boolean;
   autoUpdate: boolean;
   storagePath: string;
   whisperModel: string;
@@ -16,8 +28,16 @@ export interface AppSettings {
   audioFormat?: 'm4a';
 }
 
+function inferModelSupportsThinking(modelId?: string): boolean {
+  const low = (modelId || '').trim().toLowerCase();
+  if (!low) return true;
+  return ['qwen3', 'gemma-4', 'gemma4', 'deepseek-r1', 'thinking', 'qwq'].some((tok) => low.includes(tok));
+}
+
 interface SettingsContextType {
   settings: AppSettings;
+  modelsStatus: ModelsStatusResponse | null;
+  setModelsStatus: Dispatch<SetStateAction<ModelsStatusResponse | null>>;
   updateSettings: (newSettings: Partial<AppSettings>) => Promise<void>;
   completeSetup: (customSettings?: Partial<AppSettings>) => Promise<void>;
   resetSetup: () => void;
@@ -28,6 +48,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   setupComplete: false,
   modelsDownloaded: false,
   llmDownloaded: false,
+  llmSupportsThinking: true,
   autoUpdate: true,
   storagePath: '~/Documents/SbobinAI',
   whisperModel: 'large-v3-turbo-q4',
@@ -64,97 +85,196 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     return DEFAULT_SETTINGS;
   });
 
-  // Sincronizza le impostazioni reali e lo stato effettivo dei modelli dal backend
-  const syncWithBackend = useCallback(async () => {
-    try {
-      const [settingsData, modelsData] = await Promise.all([
-        api.settings.get().catch(() => null),
-        api.models.status().catch(() => null),
-      ]);
-      const patch: Partial<AppSettings> = {};
-      if (settingsData && typeof settingsData === 'object') {
-        if (settingsData.storage_path && typeof settingsData.storage_path === 'string') {
-          patch.storagePath = settingsData.storage_path;
-        }
-        if (settingsData.whisper_model && typeof settingsData.whisper_model === 'string') {
-          patch.whisperModel = settingsData.whisper_model;
-        }
-        if (settingsData.llm_model && typeof settingsData.llm_model === 'string') {
-          patch.llmModel = settingsData.llm_model;
-          patch.ollamaModel = settingsData.llm_model;
-        } else if (settingsData.ollama_model && typeof settingsData.ollama_model === 'string') {
-          patch.llmModel = settingsData.ollama_model;
-          patch.ollamaModel = settingsData.ollama_model;
-        }
-        if (settingsData.embedding_model && typeof settingsData.embedding_model === 'string') {
-          patch.embeddingModel = settingsData.embedding_model;
-        }
-        if (typeof settingsData.vad_sensitivity === 'number') {
-          patch.vadSensitivity = settingsData.vad_sensitivity;
-        }
-        if (typeof settingsData.models_downloaded === 'boolean') {
-          patch.modelsDownloaded = settingsData.models_downloaded;
-        }
-        if (settingsData.setup_complete === true) {
-          patch.setupComplete = true;
-        }
-        if (settingsData.audio_format) {
-          patch.audioFormat = 'm4a';
-        }
+  const [modelsStatus, setModelsStatus] = useState<ModelsStatusResponse | null>(null);
+  const llmThinkingMapRef = useRef<Record<string, boolean>>({});
+  const inFlightSyncRef = useRef<Promise<void> | null>(null);
+
+  // Mantieni sempre sincronizzati modelsDownloaded, llmDownloaded e llmSupportsThinking
+  // ogni volta che modelsStatus viene aggiornato (via syncWithBackend o setModelsStatus esterno).
+  useEffect(() => {
+    if (!modelsStatus || typeof modelsStatus !== 'object') return;
+
+    const hasRealWhisper = Boolean(
+      modelsStatus.whisper?.some((m: any) => m.id !== 'mock_mode' && m.downloaded)
+    );
+    const hasRealLLM = Boolean(
+      modelsStatus.llm?.some((m: any) => m.downloaded)
+    );
+
+    if (Array.isArray(modelsStatus.llm)) {
+      const nextMap: Record<string, boolean> = {};
+      for (const m of modelsStatus.llm) {
+        const sup =
+          m.supports_thinking !== undefined
+            ? Boolean(m.supports_thinking)
+            : inferModelSupportsThinking(m.id);
+        if (m.id) nextMap[m.id] = sup;
+        if (m.repo_id) nextMap[m.repo_id] = sup;
+      }
+      llmThinkingMapRef.current = nextMap;
+    }
+
+    setSettings((prev) => {
+      let activeLlm = prev.llmModel;
+      const isCurrentActiveDownloaded = modelsStatus.llm?.some((m: any) => (m.id === activeLlm || m.repo_id === activeLlm) && m.downloaded);
+      const firstDownloadedLlm = modelsStatus.llm?.find((m: any) => m.downloaded);
+      if (!isCurrentActiveDownloaded && firstDownloadedLlm) {
+        activeLlm = firstDownloadedLlm.id;
       }
 
-      const hasRealWhisper = Boolean(
-        modelsData &&
-        typeof modelsData === 'object' &&
-        modelsData.whisper?.some((m: any) => m.id !== 'mock_mode' && m.downloaded)
-      );
+      const llmSupportsThinking =
+        activeLlm in llmThinkingMapRef.current
+          ? llmThinkingMapRef.current[activeLlm]
+          : inferModelSupportsThinking(activeLlm);
 
-      const hasRealLLM = Boolean(
-        modelsData &&
-        typeof modelsData === 'object' &&
-        modelsData.llm?.some((m: any) => m.downloaded)
-      );
+      if (
+        prev.modelsDownloaded === hasRealWhisper &&
+        prev.llmDownloaded === hasRealLLM &&
+        prev.llmSupportsThinking === llmSupportsThinking &&
+        prev.llmModel === activeLlm
+      ) {
+        return prev;
+      }
 
-      if (modelsData && typeof modelsData === 'object') {
-        patch.modelsDownloaded = hasRealWhisper;
-        patch.llmDownloaded = hasRealLLM;
-        if (hasRealWhisper) {
-          patch.setupComplete = true;
-          if (!patch.whisperModel || patch.whisperModel === 'mock_mode' || patch.whisperModel === 'dual-tier-whisper') {
-            patch.whisperModel = 'large-v3-turbo-q4';
+      return {
+        ...prev,
+        llmModel: activeLlm,
+        modelsDownloaded: hasRealWhisper,
+        llmDownloaded: hasRealLLM,
+        llmSupportsThinking,
+      };
+    });
+  }, [modelsStatus]);
+
+  // Sincronizza le impostazioni reali e lo stato effettivo dei modelli dal backend.
+  // Deduplica chiamate concorrenti (es. BackendLoadingGate + React StrictMode)
+  // su un'unica promise condivisa per evitare raffiche duplicate all'avvio.
+  // Nota: è BackendLoadingGate a invocare syncWithBackend() appena il backend risponde
+  // all'healthcheck, evitando richieste premature prima che la porta sia pronta.
+  const syncWithBackend = useCallback(async () => {
+    if (inFlightSyncRef.current) {
+      return inFlightSyncRef.current;
+    }
+
+    const syncPromise = (async () => {
+      try {
+        const [settingsData, modelsData] = await Promise.all([
+          api.settings.get().catch(() => null),
+          api.models.status().catch(() => null),
+        ]);
+        const patch: Partial<AppSettings> = {};
+        if (settingsData && typeof settingsData === 'object') {
+          if (settingsData.storage_path && typeof settingsData.storage_path === 'string') {
+            patch.storagePath = settingsData.storage_path;
+          }
+          if (settingsData.whisper_model && typeof settingsData.whisper_model === 'string') {
+            patch.whisperModel = settingsData.whisper_model;
+          }
+          if (settingsData.llm_model && typeof settingsData.llm_model === 'string') {
+            patch.llmModel = settingsData.llm_model;
+            patch.ollamaModel = settingsData.llm_model;
+          } else if (settingsData.ollama_model && typeof settingsData.ollama_model === 'string') {
+            patch.llmModel = settingsData.ollama_model;
+            patch.ollamaModel = settingsData.ollama_model;
+          }
+          if (settingsData.embedding_model && typeof settingsData.embedding_model === 'string') {
+            patch.embeddingModel = settingsData.embedding_model;
+          }
+          if (typeof settingsData.vad_sensitivity === 'number') {
+            patch.vadSensitivity = settingsData.vad_sensitivity;
+          }
+          if (typeof settingsData.models_downloaded === 'boolean') {
+            patch.modelsDownloaded = settingsData.models_downloaded;
+          }
+          if (settingsData.setup_complete === true) {
+            patch.setupComplete = true;
+          }
+          if (settingsData.audio_format) {
+            patch.audioFormat = 'm4a';
           }
         }
-      }
 
-      setSettings((prev) => {
-        // Se il backend indica setup non completato e non c'è nessun Whisper su disco
-        // (es. reinstallazione dopo residui WebView/localStorage), forza il Wizard.
-        const backendExplicitlyIncomplete =
-          settingsData !== null &&
-          typeof settingsData === 'object' &&
-          settingsData.setup_complete !== true &&
-          modelsData !== null &&
-          !hasRealWhisper;
+        const hasRealWhisper = Boolean(
+          modelsData &&
+          typeof modelsData === 'object' &&
+          modelsData.whisper?.some((m: any) => m.id !== 'mock_mode' && m.downloaded)
+        );
 
-        const nextSetupComplete = backendExplicitlyIncomplete
-          ? false
-          : (patch.setupComplete ?? prev.setupComplete) || prev.setupComplete;
+        const hasRealLLM = Boolean(
+          modelsData &&
+          typeof modelsData === 'object' &&
+          modelsData.llm?.some((m: any) => m.downloaded)
+        );
 
-        const merged = { ...prev, ...patch, setupComplete: nextSetupComplete };
-        // Sincronizza al backend solo se il modello Whisper reale esiste davvero su disco
-        if (nextSetupComplete && settingsData && settingsData.setup_complete !== true && hasRealWhisper) {
-          void api.settings.update({ setup_complete: true, models_downloaded: true }).catch(() => null);
+        if (modelsData && typeof modelsData === 'object') {
+          setModelsStatus(modelsData);
+          patch.modelsDownloaded = hasRealWhisper;
+          patch.llmDownloaded = hasRealLLM;
+          if (Array.isArray(modelsData.llm)) {
+            const nextMap: Record<string, boolean> = {};
+            for (const m of modelsData.llm) {
+              const sup = m.supports_thinking !== undefined ? Boolean(m.supports_thinking) : inferModelSupportsThinking(m.id);
+              if (m.id) nextMap[m.id] = sup;
+              if (m.repo_id) nextMap[m.repo_id] = sup;
+            }
+            llmThinkingMapRef.current = nextMap;
+          }
+          if (hasRealWhisper) {
+            patch.setupComplete = true;
+            if (!patch.whisperModel || patch.whisperModel === 'mock_mode' || patch.whisperModel === 'dual-tier-whisper') {
+              patch.whisperModel = 'large-v3-turbo-q4';
+            }
+          }
         }
-        return merged;
-      });
-    } catch (err) {
-      console.warn('[SettingsContext] Impossibile contattare backend per sincronizzazione:', err);
-    }
-  }, []);
 
-  useEffect(() => {
-    void syncWithBackend();
-  }, [syncWithBackend]);
+        setSettings((prev) => {
+          // Se il backend indica setup non completato e non c'è nessun Whisper su disco
+          // (es. reinstallazione dopo residui WebView/localStorage), forza il Wizard.
+          const backendExplicitlyIncomplete =
+            settingsData !== null &&
+            typeof settingsData === 'object' &&
+            settingsData.setup_complete !== true &&
+            modelsData !== null &&
+            !hasRealWhisper;
+
+          const nextSetupComplete = backendExplicitlyIncomplete
+            ? false
+            : (patch.setupComplete ?? prev.setupComplete) || prev.setupComplete;
+
+          let activeLlm = patch.llmModel || prev.llmModel;
+          const isLlmDownloaded = modelsData?.llm?.some((m: any) => (m.id === activeLlm || m.repo_id === activeLlm) && m.downloaded);
+          const firstDownloaded = modelsData?.llm?.find((m: any) => m.downloaded);
+          if (!isLlmDownloaded && firstDownloaded) {
+            activeLlm = firstDownloaded.id;
+            patch.llmModel = firstDownloaded.id;
+          }
+          const llmSupportsThinking =
+            activeLlm in llmThinkingMapRef.current
+              ? llmThinkingMapRef.current[activeLlm]
+              : inferModelSupportsThinking(activeLlm);
+
+          const merged = {
+            ...prev,
+            ...patch,
+            llmSupportsThinking,
+            setupComplete: nextSetupComplete,
+          };
+          // Sincronizza al backend solo se il modello Whisper reale esiste davvero su disco
+          if (nextSetupComplete && settingsData && settingsData.setup_complete !== true && hasRealWhisper) {
+            void api.settings.update({ setup_complete: true, models_downloaded: true }).catch(() => null);
+          }
+          return merged;
+        });
+      } catch (err) {
+        console.warn('[SettingsContext] Impossibile contattare backend per sincronizzazione:', err);
+      } finally {
+        inFlightSyncRef.current = null;
+      }
+    })();
+
+    inFlightSyncRef.current = syncPromise;
+    return syncPromise;
+  }, []);
 
   // Salva ogni modifica nel localStorage
   useEffect(() => {
@@ -166,6 +286,8 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
   }, [settings]);
 
   const updateSettings = async (partial: Partial<AppSettings>) => {
+    // Non mutare l'oggetto passato dal chiamante: può essere riutilizzato dal form.
+    partial = { ...partial };
     // Il percorso di archiviazione si cambia SOLO tramite POST /settings/storage (migrazione dati),
     // mai dentro il PATCH /settings. In caso di errore viene propagato al chiamante.
     if (partial.storagePath) {
@@ -178,6 +300,13 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         console.warn('[SettingsContext] Errore migrazione storage:', err);
         throw err;
       }
+    }
+    const nextLlm = partial.llmModel ?? partial.ollamaModel;
+    if (nextLlm !== undefined) {
+      partial.llmSupportsThinking =
+        nextLlm in llmThinkingMapRef.current
+          ? llmThinkingMapRef.current[nextLlm]
+          : inferModelSupportsThinking(nextLlm);
     }
     setSettings((prev) => ({ ...prev, ...partial }));
     // Sincronizza anche con il backend
@@ -264,6 +393,8 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     <SettingsContext.Provider
       value={{
         settings,
+        modelsStatus,
+        setModelsStatus,
         updateSettings,
         completeSetup,
         resetSetup,

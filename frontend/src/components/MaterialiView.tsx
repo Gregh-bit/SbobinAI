@@ -1,15 +1,22 @@
 // components/MaterialiView.tsx — Sezione Materiali: Tutta la memoria del database del corso (File + Registrazioni + InfoCorso)
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
 import { 
   Upload, FileText, Presentation, File, Trash2, Plus, 
   Search, Sparkles, X, Info, Mic, RotateCcw,
-  ChevronLeft, ChevronRight, Eye, Code2, ExternalLink, Loader2, AlertCircle
+  ChevronLeft, ChevronRight, Eye, Code2, ExternalLink, Loader2, AlertCircle,
+  BookOpen, ChevronDown, Check
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import { api } from '../lib/api';
 import type { CourseMaterial, Lecture, MaterialPageOut, Subject } from '../types';
-import AddMaterialModal from './AddMaterialModal';
 import MarkdownContent from './MarkdownContent';
+import { liquidMenuVariants } from '../lib/animations';
+import {
+  useDelayedLoading,
+  MaterialiGridSkeleton,
+  SlidePageSkeleton,
+} from './Skeleton';
 
 export interface MaterialTarget {
   sourceId: string;
@@ -27,7 +34,10 @@ interface Props {
 }
 
 function isPaginatedFileMaterial(mat: CourseMaterial): boolean {
-  return !mat.isAutoImported && !mat.lecture_id && (mat.type === 'pdf' || mat.type === 'slide' || mat.type === 'doc');
+  if (mat.isAutoImported || mat.lecture_id) return false;
+  const name = mat.name.toLowerCase();
+  if (name.endsWith('.md') || name.endsWith('.txt')) return false;
+  return mat.type === 'pdf' || mat.type === 'slide';
 }
 
 function isSlideMaterial(mat: CourseMaterial, pageData: MaterialPageOut | null): boolean {
@@ -39,12 +49,15 @@ export default function MaterialiView({
   subject, 
   onDeleteLecturePermanently, 
   onRestoreLectureToQuaderno,
-  onLectureCreated,
+  onLectureCreated: _onLectureCreated,
   initialTarget,
   onClearInitialTarget,
 }: Props) {
   const [materials, setMaterials] = useState<CourseMaterial[]>([]);
   const [loading, setLoading] = useState(true);
+  const showGridSkeleton = useDelayedLoading(loading, 150, 220);
+  const subjectRef = useRef(subject);
+  subjectRef.current = subject;
   const [search, setSearch] = useState('');
   const [previewMaterial, setPreviewMaterial] = useState<CourseMaterial | null>(null);
   const [viewerPage, setViewerPage] = useState<number>(1);
@@ -53,10 +66,141 @@ export default function MaterialiView({
   const [pageLoading, setPageLoading] = useState(false);
   const [pageError, setPageError] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<'visual' | 'text'>('visual');
-  const [showAddModal, setShowAddModal] = useState(false);
   const [itemToDelete, setItemToDelete] = useState<CourseMaterial | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  // Drag & drop e caricamento rapido
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const dragCounter = useRef(0);
+  const [uploadingCount, setUploadingCount] = useState(0);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [tagMenuMaterialId, setTagMenuMaterialId] = useState<string | null>(null);
+
+  useEffect(() => {
+    const handleClickOutside = () => setTagMenuMaterialId(null);
+    window.addEventListener('click', handleClickOutside);
+    return () => window.removeEventListener('click', handleClickOutside);
+  }, []);
+
+  const handleUploadFiles = useCallback(async (files: File[]) => {
+    if (files.length === 0) return;
+    setUploadingCount((prev) => prev + files.length);
+    setUploadError(null);
+
+    for (const file of files) {
+      try {
+        const newMat = await api.subjects.uploadMaterialFile(subject.id, file);
+        // Il corso può cambiare mentre l'upload è in corso: non inserire il
+        // risultato del corso precedente nella griglia attualmente visibile.
+        if (subjectRef.current.id !== subject.id) continue;
+        setMaterials((prev) => {
+          // Mantieni InfoCorso.md sempre in cima, poi il file appena caricato subito dopo (dal più recente)
+          const pinned = prev.filter((m) => m.isAutoImported);
+          const others = prev.filter((m) => !m.isAutoImported && m.id !== newMat.id && m.name !== newMat.name);
+          return [...pinned, newMat, ...others];
+        });
+      } catch (err) {
+        if (subjectRef.current.id === subject.id) {
+          setUploadError(err instanceof Error ? err.message : 'Errore nel caricamento del file.');
+        }
+      } finally {
+        setUploadingCount((prev) => Math.max(0, prev - 1));
+      }
+    }
+  }, [subject.id]);
+
+  // Listener globali drag-and-drop compatibili con Safari, Chrome, Firefox e Tauri
+  useEffect(() => {
+    const isFileDrag = (dt: DataTransfer | null): boolean => {
+      if (!dt) return false;
+      if (dt.types) {
+        const types = Array.from(dt.types);
+        if (types.includes('Files') || types.includes('application/x-moz-file')) return true;
+      }
+      if (dt.items && dt.items.length > 0) return true;
+      if (dt.files && dt.files.length > 0) return true;
+      return false;
+    };
+
+    const onWinDragEnter = (e: DragEvent) => {
+      if (!isFileDrag(e.dataTransfer)) return;
+      e.preventDefault();
+      dragCounter.current += 1;
+      setIsDragging(true);
+    };
+
+    const onWinDragOver = (e: DragEvent) => {
+      if (!isFileDrag(e.dataTransfer)) return;
+      e.preventDefault();
+      if (e.dataTransfer) {
+        e.dataTransfer.dropEffect = 'copy';
+      }
+      setIsDragging(true);
+    };
+
+    const onWinDragLeave = (e: DragEvent) => {
+      if (!isFileDrag(e.dataTransfer)) return;
+      e.preventDefault();
+      dragCounter.current = Math.max(0, dragCounter.current - 1);
+      if (dragCounter.current === 0 || e.relatedTarget === null) {
+        dragCounter.current = 0;
+        setIsDragging(false);
+      }
+    };
+
+    const onWinDrop = (e: DragEvent) => {
+      if (!isFileDrag(e.dataTransfer)) return;
+      e.preventDefault();
+      dragCounter.current = 0;
+      setIsDragging(false);
+      const dropped = e.dataTransfer?.files ? Array.from(e.dataTransfer.files) : [];
+      if (dropped.length > 0) {
+        void handleUploadFiles(dropped);
+      }
+    };
+
+    const resetDrag = () => {
+      dragCounter.current = 0;
+      setIsDragging(false);
+    };
+
+    window.addEventListener('dragenter', onWinDragEnter);
+    window.addEventListener('dragover', onWinDragOver);
+    window.addEventListener('dragleave', onWinDragLeave);
+    window.addEventListener('drop', onWinDrop);
+    window.addEventListener('dragend', resetDrag);
+    window.addEventListener('blur', resetDrag);
+    return () => {
+      window.removeEventListener('dragenter', onWinDragEnter);
+      window.removeEventListener('dragover', onWinDragOver);
+      window.removeEventListener('dragleave', onWinDragLeave);
+      window.removeEventListener('drop', onWinDrop);
+      window.removeEventListener('dragend', resetDrag);
+      window.removeEventListener('blur', resetDrag);
+    };
+  }, [handleUploadFiles]);
+
+  const handleSelectTag = async (mat: CourseMaterial, newTag: 'notes' | 'slide' | 'doc') => {
+    setTagMenuMaterialId(null);
+    const previousSourceType = mat.source_type;
+    setMaterials((prev) =>
+      prev.map((item) => (item.id === mat.id ? { ...item, source_type: newTag } : item))
+    );
+    try {
+      await api.subjects.updateMaterialTag(subject.id, mat.name, newTag);
+    } catch (err) {
+      console.error('Errore aggiornamento tag:', err);
+      if (isMountedRef.current) {
+        setMaterials((prev) =>
+          prev.map((item) =>
+            item.id === mat.id ? { ...item, source_type: previousSourceType } : item
+          )
+        );
+      }
+    }
+  };
 
   // Guardia contro risposte obsolete (dismount o richieste superate)
   const isMountedRef = useRef(true);
@@ -136,6 +280,7 @@ export default function MaterialiView({
     } catch {
       if (isStale()) return;
       // Fallback locale
+      const currentSubject = subjectRef.current;
       const fallbackInfo: CourseMaterial = {
         id: `infocorso-${subject.id}`,
         name: 'InfoCorso.md',
@@ -143,14 +288,14 @@ export default function MaterialiView({
         size: '1.2 KB',
         uploadedAt: 'Auto-importato',
         pageCount: 1,
-        content: `# Informazioni del Corso — ${subject.name}\n\n## Descrizione\n${subject.description || 'Nessuna descrizione specificata.'}`,
+        content: `# Informazioni del Corso — ${currentSubject.name}\n\n## Descrizione\n${currentSubject.description || 'Nessuna descrizione specificata.'}`,
         isAutoImported: true,
       };
       setMaterials([fallbackInfo]);
     } finally {
       if (!isStale()) setLoading(false);
     }
-  }, [subject]);
+  }, [subject.id]);
 
   useEffect(() => {
     loadMaterials();
@@ -217,19 +362,9 @@ export default function MaterialiView({
       return;
     }
 
-    const targetMat: CourseMaterial = {
-      id: src,
-      name: src,
-      type: 'doc',
-      size: '',
-      uploadedAt: 'Citazione',
-      pageCount: 1,
-      isAutoImported: true,
-      content: `### Documento non più disponibile\n\nIl file **"${src}"** citato nella conversazione è stato rimosso dalla memoria del corso e non è più consultabile.`,
-    };
-
-    openMaterialViewer(targetMat, 1);
-  }, [loading, initialTarget, materials, openMaterialViewer, subject.id, subject.name, subject.description]);
+    // Se il file citato non esiste nei materiali del corso, pulisci il target senza aprire modali ingannevoli
+    onClearInitialTarget?.();
+  }, [loading, initialTarget, materials, openMaterialViewer, onClearInitialTarget, subject.id, subject.name, subject.description]);
 
   // Caricamento pagina visuale / testo estratto per file paginati (PDF / Slide / Doc)
   const fetchViewerPage = useCallback(
@@ -307,9 +442,13 @@ export default function MaterialiView({
         } else {
           await api.lectures.delete(itemToDelete.lecture_id);
         }
-      } else if (!itemToDelete.isAutoImported) {
-        // In caso di errore il materiale NON viene rimosso dalla lista
-        await api.subjects.deleteMaterialFile(subject.id, itemToDelete.name);
+      }
+      if (!itemToDelete.isAutoImported) {
+        try {
+          await api.subjects.deleteMaterialFile(subject.id, itemToDelete.name);
+        } catch {
+          // Se era solo una lezione virtuale senza file fisico su disco, ignora il 404
+        }
       }
       setMaterials((prev) => prev.filter((m) => m.id !== itemToDelete.id));
       if (previewMaterial?.id === itemToDelete.id) closePreviewModal();
@@ -338,8 +477,47 @@ export default function MaterialiView({
   };
 
   return (
-    <div className="flex-1 flex flex-col overflow-hidden bg-black/15 select-none relative">
-      {/* Top Bar / Search & Upload */}
+    <div className="flex-1 flex flex-col overflow-hidden content-canvas select-none relative">
+      {/* Hidden file input for native OS picker */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        accept=".pdf,.ppt,.pptx,.key,.odp,.md,.txt,.doc,.docx,.mp3,.wav,.m4a,.aac,.ogg,.flac"
+        className="hidden"
+        onChange={(e) => {
+          if (e.target.files && e.target.files.length > 0) {
+            void handleUploadFiles(Array.from(e.target.files));
+            e.target.value = '';
+          }
+        }}
+      />
+
+      {/* Drag & Drop Visual Overlay (transizione fluida GPU-accelerated) */}
+      <div
+        aria-hidden={!isDragging}
+        className={clsx(
+          'absolute inset-4 z-50 rounded-3xl bg-[#090b12]/88 backdrop-blur-xl border-2 border-dashed border-sky-400/75 flex flex-col items-center justify-center gap-3.5 p-8 pointer-events-none shadow-liquid-lg transition-all duration-200 ease-out',
+          isDragging ? 'opacity-100 scale-100' : 'opacity-0 scale-[0.97]'
+        )}
+      >
+        <div
+          className={clsx(
+            'w-16 h-16 rounded-2xl bg-sky-500/20 border border-sky-400/45 flex items-center justify-center text-sky-300 shadow-[0_0_32px_rgba(56,189,248,0.35)] transition-transform duration-300',
+            isDragging ? 'scale-100 animate-bounce' : 'scale-90'
+          )}
+        >
+          <Upload size={30} strokeWidth={2} />
+        </div>
+        <div className="text-center space-y-1">
+          <h3 className="text-base font-semibold text-white tracking-tight">Rilascia qui i tuoi file</h3>
+          <p className="text-xs text-white/60">
+            Slide (PDF, PPTX), Appunti (.md, .txt) o Registrazioni Audio (.mp3, .wav, .m4a)
+          </p>
+        </div>
+      </div>
+
+      {/* Top Bar / Search, Status & Minimal Add Button */}
       <div className="px-8 py-3.5 border-b border-white/[0.06] flex items-center justify-between">
         <div className="flex items-center gap-3">
           <div className="relative">
@@ -355,35 +533,61 @@ export default function MaterialiView({
           <span className="text-[11px] text-white/40 font-mono">
             {filtered.length} {filtered.length === 1 ? 'elemento' : 'elementi salvati'}
           </span>
+          {uploadingCount > 0 && (
+            <span className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-sky-500/15 border border-sky-400/30 text-[11px] font-mono text-sky-300 animate-pulse">
+              <Loader2 size={11} className="animate-spin" />
+              Caricamento di {uploadingCount} file...
+            </span>
+          )}
+          {uploadError && (
+            <span className="flex items-center gap-1.5 pl-2.5 pr-1.5 py-0.5 rounded-full bg-red-500/15 border border-red-500/30 text-[11px] font-mono text-red-300">
+              <AlertCircle size={11} />
+              {uploadError}
+              <button 
+                type="button" 
+                onClick={() => setUploadError(null)} 
+                title="Chiudi avviso"
+                aria-label="Chiudi avviso"
+                className="ml-0.5 w-5 h-5 rounded-full flex items-center justify-center text-red-200/70 hover:text-white hover:bg-white/[0.10] transition-colors cursor-pointer"
+              >
+                <X size={13} />
+              </button>
+            </span>
+          )}
         </div>
 
         <div>
           <button
-            onClick={() => setShowAddModal(true)}
-            className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-full liquid-glass-pill text-xs font-semibold text-white hover:bg-white/[0.16] shadow-liquid-sm transition-all"
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-full liquid-glass-pill text-xs font-semibold text-white hover:bg-white/[0.16] shadow-liquid-sm transition-all cursor-pointer"
+            title="Apri il Finder o Esplora File per caricare materiale"
           >
-            <Plus size={12} strokeWidth={2.5} />
-            <span>Aggiungi Materiale</span>
+            <Plus size={13} strokeWidth={2.5} />
+            <span>Aggiungi</span>
           </button>
         </div>
       </div>
 
       {/* Grid */}
       <div className="flex-1 overflow-y-auto p-8">
-        {loading ? (
-          <div className="h-64 flex items-center justify-center text-xs text-white/30 font-mono">
-            Caricamento memoria del corso...
-          </div>
+        {loading || showGridSkeleton ? (
+          showGridSkeleton ? (
+            <MaterialiGridSkeleton />
+          ) : (
+            <div className="min-h-[16rem]" aria-busy="true" />
+          )
         ) : filtered.length === 0 ? (
           <div className="h-64 flex flex-col items-center justify-center text-center">
             <Upload size={24} strokeWidth={1.5} className="text-white/20 mb-3" />
             <h4 className="text-sm font-medium text-white/70">Nessun elemento presente</h4>
             <p className="text-xs text-white/30 mt-1 max-w-xs">
-              Aggiungi slide, PDF, appunti o registrazioni per indicizzarle nella memoria di {subject.name}.
+              Trascina qui i tuoi file o clicca Aggiungi per includerli nei materiali del corso.
             </p>
             <button
-              onClick={() => setShowAddModal(true)}
-              className="mt-3 px-3.5 py-1.5 rounded-full liquid-glass-pill text-xs font-medium text-white hover:bg-white/[0.12] transition-all"
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="mt-3.5 px-4 py-1.5 rounded-full liquid-glass-pill text-xs font-semibold text-white hover:bg-white/[0.16] shadow-liquid-sm transition-all cursor-pointer"
             >
               + Aggiungi il primo materiale
             </button>
@@ -392,14 +596,18 @@ export default function MaterialiView({
           <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
             {filtered.map((mat) => {
               const isLecture = mat.type === 'lecture';
+              const isImportedNotes = mat.source_type === 'notes' || mat.name.toLowerCase().endsWith('.md');
               const isInQuaderno = mat.in_quaderno !== false;
+              const tag = mat.isAutoImported
+                ? 'infocorso'
+                : (mat.source_type || (mat.type === 'slide' || mat.type === 'pdf' ? 'slide' : mat.type === 'audio' ? 'audio' : isImportedNotes ? 'notes' : 'doc'));
 
               return (
                 <div
                   key={mat.id}
                   onClick={() => openMaterialViewer(mat, 1)}
                   className={clsx(
-                    'group p-4 rounded-2xl liquid-glass border cursor-pointer transition-all duration-200 flex flex-col justify-between',
+                    'group p-4 rounded-2xl liquid-glass border cursor-pointer transition-all duration-200 flex flex-col justify-between relative',
                     mat.isAutoImported
                       ? 'border-white/[0.18] bg-white/[0.06] hover:bg-white/[0.09] shadow-liquid'
                       : isLecture
@@ -412,23 +620,119 @@ export default function MaterialiView({
                       <div className="w-10 h-10 rounded-xl liquid-glass-subtle border border-white/[0.10] flex items-center justify-center group-hover:scale-105 transition-transform">
                         {mat.isAutoImported ? (
                           <Info size={18} strokeWidth={1.75} className="text-emerald-400" />
-                        ) : isLecture ? (
-                          <Mic size={18} strokeWidth={1.75} className="text-amber-400" />
-                        ) : mat.type === 'slide' ? (
+                        ) : tag === 'notes' ? (
+                          <BookOpen size={18} strokeWidth={1.75} className="text-sky-400" />
+                        ) : tag === 'slide' ? (
                           <Presentation size={18} strokeWidth={1.75} className="text-orange-400" />
                         ) : mat.type === 'pdf' ? (
                           <FileText size={18} strokeWidth={1.75} className="text-red-400" />
+                        ) : mat.type === 'audio' || tag === 'audio' ? (
+                          <Mic size={18} strokeWidth={1.75} className="text-purple-400" />
                         ) : (
                           <File size={18} strokeWidth={1.75} className="text-blue-400" />
                         )}
                       </div>
 
-                      <div className="flex items-center gap-1">
+                      <div className="flex items-center gap-1.5">
+                        {/* Tag Pill con selettore rapido */}
+                        {!mat.isAutoImported && (
+                          <div className="relative">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setTagMenuMaterialId((prev) => (prev === mat.id ? null : mat.id));
+                              }}
+                              className={clsx(
+                                'text-[10px] font-mono px-2 py-0.5 rounded-full border flex items-center gap-1 transition-all cursor-pointer',
+                                tag === 'notes' && 'text-sky-300 bg-sky-500/15 border-sky-400/30 hover:bg-sky-500/25',
+                                tag === 'slide' && 'text-amber-300 bg-amber-500/15 border-amber-400/30 hover:bg-amber-500/25',
+                                tag === 'audio' && 'text-purple-300 bg-purple-500/15 border-purple-400/30 hover:bg-purple-500/25',
+                                tag === 'doc' && 'text-white/80 bg-white/[0.08] border-white/[0.15] hover:bg-white/[0.14]'
+                              )}
+                              title="Modifica tipologia materiale (Appunti vs Slide vs Doc)"
+                            >
+                              {tag === 'notes' && <BookOpen size={9} />}
+                              {tag === 'slide' && <Presentation size={9} />}
+                              {tag === 'audio' && <Mic size={9} />}
+                              {tag === 'doc' && <FileText size={9} />}
+                              <span>{tag === 'notes' ? 'Appunti' : tag === 'slide' ? 'Slide' : tag === 'audio' ? 'Audio' : 'Doc'}</span>
+                              <ChevronDown size={8} className="opacity-60" />
+                            </button>
+
+                            <AnimatePresence>
+                              {tagMenuMaterialId === mat.id && (
+                                <motion.div
+                                  variants={liquidMenuVariants}
+                                  initial="initial"
+                                  animate="animate"
+                                  exit="exit"
+                                  style={{ transformOrigin: 'top right' }}
+                                  className="absolute right-0 top-full mt-1 z-30 w-36 rounded-2xl liquid-glass border border-white/[0.18] shadow-liquid-lg p-1.5 space-y-0.5 bg-[#0d0f18]/98 backdrop-blur-2xl"
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      void handleSelectTag(mat, 'notes');
+                                    }}
+                                    className={clsx(
+                                      'w-full flex items-center justify-between px-2.5 py-1.5 rounded-xl text-left text-[11px] transition-colors cursor-pointer',
+                                      tag === 'notes' ? 'bg-sky-500/20 text-sky-200 font-semibold' : 'text-white/70 hover:bg-white/[0.08] hover:text-white'
+                                    )}
+                                  >
+                                    <div className="flex items-center gap-1.5">
+                                      <BookOpen size={11} className="text-sky-400" />
+                                      <span>Appunti</span>
+                                    </div>
+                                    {tag === 'notes' && <Check size={10} />}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      void handleSelectTag(mat, 'slide');
+                                    }}
+                                    className={clsx(
+                                      'w-full flex items-center justify-between px-2.5 py-1.5 rounded-xl text-left text-[11px] transition-colors cursor-pointer',
+                                      tag === 'slide' ? 'bg-amber-500/20 text-amber-200 font-semibold' : 'text-white/70 hover:bg-white/[0.08] hover:text-white'
+                                    )}
+                                  >
+                                    <div className="flex items-center gap-1.5">
+                                      <Presentation size={11} className="text-orange-400" />
+                                      <span>Slide</span>
+                                    </div>
+                                    {tag === 'slide' && <Check size={10} />}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      void handleSelectTag(mat, 'doc');
+                                    }}
+                                    className={clsx(
+                                      'w-full flex items-center justify-between px-2.5 py-1.5 rounded-xl text-left text-[11px] transition-colors cursor-pointer',
+                                      tag === 'doc' ? 'bg-white/20 text-white font-semibold' : 'text-white/70 hover:bg-white/[0.08] hover:text-white'
+                                    )}
+                                  >
+                                    <div className="flex items-center gap-1.5">
+                                      <FileText size={11} className="text-white/70" />
+                                      <span>Documento</span>
+                                    </div>
+                                    {tag === 'doc' && <Check size={10} />}
+                                  </button>
+                                </motion.div>
+                              )}
+                            </AnimatePresence>
+                          </div>
+                        )}
+
                         {!mat.isAutoImported && (
                           <button
                             onClick={(e) => handleDeleteItem(mat, e)}
                             title="Elimina definitivamente da tutto"
-                            className="opacity-0 group-hover:opacity-100 p-1 rounded-md text-white/30 hover:text-red-400 hover:bg-white/[0.08] transition-all"
+                            className="opacity-0 group-hover:opacity-100 p-1 rounded-md text-white/30 hover:text-red-400 hover:bg-white/[0.08] transition-all cursor-pointer"
                           >
                             <Trash2 size={12} strokeWidth={1.75} />
                           </button>
@@ -451,7 +755,7 @@ export default function MaterialiView({
                     {isLecture && (
                       <div className="mt-1.5 flex items-center gap-1.5">
                         <span className={clsx(
-                          'text-[9px] font-mono px-1.5 py-0.2 rounded-full border',
+                          'text-[9px] font-mono px-1.5 py-0.5 rounded-full border',
                           isInQuaderno
                             ? 'text-emerald-300/90 bg-emerald-500/10 border-emerald-500/20'
                             : 'text-amber-300/90 bg-amber-500/10 border-amber-500/20'
@@ -499,57 +803,45 @@ export default function MaterialiView({
             onClick={closePreviewModal}
           >
             <div
-              className={clsx(
-                'w-full flex flex-col rounded-3xl liquid-glass border border-white/[0.14] shadow-liquid-lg p-5 sm:p-6 animate-slide-up',
-                paginated ? 'max-w-4xl max-h-[90vh]' : 'max-w-2xl max-h-[82vh]'
-              )}
+              className="w-full max-w-4xl max-h-[88vh] flex flex-col rounded-3xl liquid-modal border border-white/[0.14] shadow-liquid-lg p-5 sm:p-7 animate-slide-up"
               onClick={(e) => e.stopPropagation()}
             >
-              {/* Modal Header */}
-              <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-white/[0.08]">
+              {/* Modal Header — Minimale, orientato al documento, zero ridondanze */}
+              <div className="flex items-center justify-between gap-4 pb-4 border-b border-white/[0.08]">
                 <div className="flex items-center gap-3 min-w-0 flex-1">
-                  <div className="w-9 h-9 rounded-xl liquid-glass-subtle border border-white/[0.10] flex items-center justify-center flex-shrink-0">
+                  <div className="w-10 h-10 rounded-2xl liquid-glass-subtle border border-white/[0.10] flex items-center justify-center flex-shrink-0">
                     {previewMaterial.type === 'lecture' ? (
-                      <Mic size={16} className="text-amber-400" />
+                      <Mic size={18} className="text-amber-400" />
                     ) : previewMaterial.isAutoImported ? (
-                      <Info size={16} className="text-emerald-400" />
+                      <Info size={18} className="text-emerald-400" />
                     ) : previewMaterial.type === 'slide' ? (
-                      <Presentation size={16} className="text-orange-400" />
+                      <Presentation size={18} className="text-orange-400" />
                     ) : previewMaterial.type === 'pdf' ? (
-                      <FileText size={16} className="text-red-400" />
+                      <FileText size={18} className="text-red-400" />
                     ) : (
-                      <File size={16} className="text-blue-400" />
+                      <File size={18} className="text-blue-400" />
                     )}
                   </div>
 
                   <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <h3 className="text-sm font-semibold tracking-tight text-white truncate max-w-md">
-                        {displayTitle}
-                      </h3>
-                      <span className="px-2 py-0.5 rounded-full bg-white/[0.06] border border-white/[0.10] text-[10px] font-mono text-white/60 truncate max-w-[200px]">
-                        {pageData?.filename || previewMaterial.name}
-                      </span>
-                      {paginated && (
-                        <span className="px-2 py-0.5 rounded-full bg-blue-500/15 border border-blue-400/30 text-[10px] font-mono text-blue-200 flex-shrink-0">
-                          {unitLabel} {currentPage}{totalPages > 0 ? ` / ${totalPages}` : ''}
-                        </span>
-                      )}
-                    </div>
-
-                    <div className="flex items-center gap-2 mt-1 text-[10px] font-mono text-white/40">
+                    <h3 className="text-base font-semibold tracking-tight text-white truncate max-w-xl">
+                      {displayTitle}
+                    </h3>
+                    <div className="flex items-center gap-2 mt-0.5 text-[11px] font-mono text-white/40">
                       {previewMaterial.size && <span>{previewMaterial.size}</span>}
-                      {previewMaterial.size && previewMaterial.uploadedAt && <span>·</span>}
-                      {previewMaterial.uploadedAt && <span>{previewMaterial.uploadedAt}</span>}
-                      {previewMaterial.lecture_id && (
-                        <span className={clsx(
-                          'px-1.5 py-0.2 rounded-full border',
-                          previewMaterial.in_quaderno !== false
-                            ? 'text-emerald-300 border-emerald-500/20'
-                            : 'text-amber-300 border-amber-500/20'
-                        )}>
-                          {previewMaterial.in_quaderno !== false ? 'Presente nel Quaderno' : 'Archiviato solo in Memoria'}
-                        </span>
+                      {previewMaterial.size && previewMaterial.uploadedAt && previewMaterial.uploadedAt !== 'Caricato' && (
+                        <span>·</span>
+                      )}
+                      {previewMaterial.uploadedAt && previewMaterial.uploadedAt !== 'Caricato' && (
+                        <span>{previewMaterial.uploadedAt}</span>
+                      )}
+                      {paginated && (
+                        <>
+                          <span>·</span>
+                          <span className="text-blue-300 font-medium">
+                            {unitLabel} {currentPage}{totalPages > 0 ? ` / ${totalPages}` : ''}
+                          </span>
+                        </>
                       )}
                     </div>
                   </div>
@@ -565,12 +857,12 @@ export default function MaterialiView({
                       {viewMode === 'visual' ? (
                         <>
                           <Code2 size={12} className="text-white/70" />
-                          <span>Mostra testo estratto</span>
+                          <span>Testo</span>
                         </>
                       ) : (
                         <>
                           <Eye size={12} className="text-blue-300" />
-                          <span>Mostra pagina visuale</span>
+                          <span>Visuale</span>
                         </>
                       )}
                     </button>
@@ -593,17 +885,28 @@ export default function MaterialiView({
                     <button
                       type="button"
                       onClick={() => handleRestore(previewMaterial)}
-                      className="flex items-center gap-1.5 px-3 py-1 rounded-full liquid-glass-pill hover:bg-white/[0.14] text-xs font-medium text-white transition-all cursor-pointer"
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-full liquid-glass-pill hover:bg-white/[0.14] text-xs font-medium text-white transition-all cursor-pointer"
                     >
                       <RotateCcw size={11} />
-                      <span>Ripristina nel Quaderno</span>
+                      <span>Ripristina</span>
+                    </button>
+                  )}
+
+                  {!previewMaterial.isAutoImported && (
+                    <button
+                      type="button"
+                      onClick={(e) => handleDeleteItem(previewMaterial, e)}
+                      title="Elimina materiale"
+                      className="w-8 h-8 rounded-full flex items-center justify-center text-white/40 hover:text-red-400 hover:bg-red-500/15 border border-transparent hover:border-red-500/25 transition-all cursor-pointer"
+                    >
+                      <Trash2 size={14} />
                     </button>
                   )}
 
                   <button
                     type="button"
                     onClick={closePreviewModal}
-                    className="w-7 h-7 rounded-full flex items-center justify-center text-white/40 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer"
+                    className="w-8 h-8 rounded-full flex items-center justify-center bg-white/[0.06] hover:bg-white/[0.12] text-white/60 hover:text-white border border-white/[0.08] transition-all cursor-pointer"
                     title="Chiudi (Esc)"
                   >
                     <X size={14} strokeWidth={2} />
@@ -651,124 +954,118 @@ export default function MaterialiView({
                 </div>
               )}
 
-              {/* Modal Content */}
-              <div className="flex-1 overflow-y-auto py-4 pr-1 space-y-4 text-xs leading-relaxed text-white/80 min-h-[260px]">
-                {paginated ? (
-                  pageLoading ? (
-                    <div className="h-full min-h-[320px] rounded-2xl bg-white/[0.02] border border-white/[0.06] flex flex-col items-center justify-center gap-3 p-8">
-                      <Loader2 size={24} className="animate-spin text-white/50" />
-                      <p className="text-xs text-white/50 font-mono">
-                        Caricamento {unitLabel.toLowerCase()} {viewerPage}...
-                      </p>
-                      <div className="w-full max-w-md space-y-2.5 pt-2 opacity-30">
-                        <div className="h-3 bg-white/20 rounded-full w-4/5 mx-auto animate-pulse" />
-                        <div className="h-36 bg-white/10 rounded-2xl w-full animate-pulse" />
-                        <div className="h-3 bg-white/15 rounded-full w-2/3 mx-auto animate-pulse" />
-                      </div>
-                    </div>
-                  ) : pageError ? (
-                    <div className="rounded-2xl bg-red-500/[0.08] border border-red-500/25 p-6 text-center space-y-3">
-                      <AlertCircle size={26} className="text-red-400 mx-auto" />
-                      <div className="space-y-1">
-                        <h4 className="text-xs font-semibold text-red-200">
-                          Impossibile caricare la {unitLabel.toLowerCase()} {viewerPage}
-                        </h4>
-                        <p className="text-[11px] text-red-300/80 max-w-md mx-auto">
-                          {pageError}
-                        </p>
-                      </div>
-                      <div className="flex items-center justify-center gap-2 pt-1">
-                        <button
-                          type="button"
-                          onClick={() => void fetchViewerPage(previewMaterial.name, viewerPage)}
-                          className="px-3.5 py-1.5 rounded-full bg-white/[0.10] hover:bg-white/[0.16] border border-white/[0.16] text-[11px] font-medium text-white transition-all cursor-pointer"
-                        >
-                          Riprova
-                        </button>
-                        <a
-                          href={api.subjects.getMaterialFileUrl(subject.id, previewMaterial.name)}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="px-3.5 py-1.5 rounded-full bg-white/[0.06] hover:bg-white/[0.12] border border-white/[0.10] text-[11px] font-medium text-white/80 transition-all"
-                        >
-                          Apri file originale
-                        </a>
-                      </div>
-                      {previewMaterial.content && (
-                        <div className="mt-4 pt-4 border-t border-white/[0.08] text-left">
-                          <MarkdownContent content={previewMaterial.content} className="quaderno-markdown" />
-                        </div>
-                      )}
-                    </div>
-                  ) : hasImagePage && viewMode === 'visual' ? (
-                    <div className="flex flex-col items-center justify-center rounded-2xl bg-black/40 border border-white/[0.08] p-3 sm:p-4 min-h-[340px]">
-                      <img
-                        src={pageData!.image_data_url!}
-                        alt={`${displayTitle} - ${unitLabel} ${currentPage}`}
-                        className="max-w-full max-h-[60vh] w-auto h-auto object-contain rounded-xl shadow-[0_12px_40px_rgba(0,0,0,0.65)] select-text"
-                      />
-                    </div>
-                  ) : pageData?.text ? (
-                    <div className="bg-white/[0.02] p-5 rounded-2xl border border-white/[0.06] select-text">
-                      <div className="whitespace-pre-wrap font-sans text-[13px] leading-relaxed text-white/85">
-                        {pageData.text}
-                      </div>
-                    </div>
-                  ) : previewMaterial.content ? (
-                    <div className="bg-white/[0.02] p-5 rounded-2xl border border-white/[0.06] select-text">
-                      <MarkdownContent content={previewMaterial.content} className="quaderno-markdown" />
-                    </div>
-                  ) : (
-                    <div className="py-12 text-center text-white/40 italic">
-                      Nessun contenuto estratto per questa {unitLabel.toLowerCase()}.
-                    </div>
-                  )
-                ) : previewMaterial.content ? (
-                  <div className="bg-white/[0.02] p-5 rounded-2xl border border-white/[0.06] select-text">
-                    <MarkdownContent content={previewMaterial.content} className="quaderno-markdown" />
-                  </div>
-                ) : (
-                  <div className="py-12 text-center text-white/40 italic">
-                    Nessun contenuto di testo memorizzato per questo file.
-                  </div>
-                )}
-              </div>
+              {/* Modal Content — Il centro è il documento */}
+              <div className="flex-1 overflow-y-auto overflow-x-hidden [overscroll-behavior-x:none] py-3 pr-1 space-y-4 text-xs leading-relaxed text-white/80 min-h-[300px]">
+                {(() => {
+                  const isMarkdown = previewMaterial.name.toLowerCase().endsWith('.md') || previewMaterial.name.toLowerCase().endsWith('.markdown') || pageData?.kind === 'markdown';
 
-              {/* Modal Footer: Action to delete permanently */}
-              {!previewMaterial.isAutoImported && (
-                <div className="pt-3 border-t border-white/[0.06] flex items-center justify-between text-xs">
-                  <span className="text-[10px] text-white/30 font-mono">
-                    Elemento salvato nel database locale
-                  </span>
-                  <button
-                    type="button"
-                    onClick={(e) => handleDeleteItem(previewMaterial, e)}
-                    className="flex items-center gap-1 px-3 py-1 rounded-full text-red-400 hover:bg-red-500/10 transition-colors cursor-pointer"
-                  >
-                    <Trash2 size={12} />
-                    <span>Elimina definitivamente da tutto</span>
-                  </button>
-                </div>
-              )}
+                  if (isMarkdown) {
+                    return (
+                      <div className="bg-black/25 p-6 sm:p-8 rounded-2xl border border-white/[0.06] select-text shadow-inner">
+                        <MarkdownContent content={previewMaterial.content || pageData?.text || ''} className="quaderno-markdown text-[14px]" />
+                      </div>
+                    );
+                  }
+
+                  if (paginated) {
+                    if (pageLoading) {
+                      return <SlidePageSkeleton />;
+                    }
+
+                    if (pageError) {
+                      return (
+                        <div className="rounded-2xl bg-red-500/[0.08] border border-red-500/25 p-6 text-center space-y-3">
+                          <AlertCircle size={26} className="text-red-400 mx-auto" />
+                          <div className="space-y-1">
+                            <h4 className="text-xs font-semibold text-red-200">
+                              Impossibile caricare la {unitLabel.toLowerCase()} {viewerPage}
+                            </h4>
+                            <p className="text-[11px] text-red-300/80 max-w-md mx-auto">
+                              {pageError}
+                            </p>
+                          </div>
+                          <div className="flex items-center justify-center gap-2 pt-1">
+                            <button
+                              type="button"
+                              onClick={() => void fetchViewerPage(previewMaterial.name, viewerPage)}
+                              className="px-3.5 py-1.5 rounded-full bg-white/[0.10] hover:bg-white/[0.16] border border-white/[0.16] text-[11px] font-medium text-white transition-all cursor-pointer"
+                            >
+                              Riprova
+                            </button>
+                            <a
+                              href={api.subjects.getMaterialFileUrl(subject.id, previewMaterial.name)}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="px-3.5 py-1.5 rounded-full bg-white/[0.06] hover:bg-white/[0.12] border border-white/[0.10] text-[11px] font-medium text-white/80 transition-all"
+                            >
+                              Apri file originale
+                            </a>
+                          </div>
+                          {previewMaterial.content && (
+                            <div className="mt-4 pt-4 border-t border-white/[0.08] text-left">
+                              <MarkdownContent content={previewMaterial.content} className="quaderno-markdown" />
+                            </div>
+                          )}
+                        </div>
+                      );
+                    }
+
+                    if (hasImagePage && viewMode === 'visual') {
+                      return (
+                        <div className="flex flex-col items-center justify-center rounded-2xl bg-black/40 border border-white/[0.08] p-3 sm:p-4 min-h-[340px]">
+                          <img
+                            src={pageData!.image_data_url!}
+                            alt={`${displayTitle} - ${unitLabel} ${currentPage}`}
+                            className="max-w-full max-h-[64vh] w-auto h-auto object-contain rounded-xl shadow-[0_12px_40px_rgba(0,0,0,0.65)] select-text"
+                          />
+                        </div>
+                      );
+                    }
+
+                    if (pageData?.text) {
+                      return (
+                        <div className="bg-black/25 p-6 sm:p-8 rounded-2xl border border-white/[0.06] select-text shadow-inner">
+                          <div className="whitespace-pre-wrap font-sans text-[13.5px] leading-relaxed text-white/90">
+                            {pageData.text}
+                          </div>
+                        </div>
+                      );
+                    }
+
+                    if (previewMaterial.content) {
+                      return (
+                        <div className="bg-black/25 p-6 sm:p-8 rounded-2xl border border-white/[0.06] select-text shadow-inner">
+                          <MarkdownContent content={previewMaterial.content} className="quaderno-markdown text-[14px]" />
+                        </div>
+                      );
+                    }
+
+                    return (
+                      <div className="py-12 text-center text-white/40 italic">
+                        Nessun contenuto estratto per questa {unitLabel.toLowerCase()}.
+                      </div>
+                    );
+                  }
+
+                  if (previewMaterial.content) {
+                    return (
+                      <div className="bg-black/25 p-6 sm:p-8 rounded-2xl border border-white/[0.06] select-text shadow-inner">
+                        <MarkdownContent content={previewMaterial.content} className="quaderno-markdown text-[14px]" />
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div className="py-12 text-center text-white/40 italic">
+                      Nessun contenuto di testo memorizzato per questo file.
+                    </div>
+                  );
+                })()}
+              </div>
             </div>
           </div>
         );
       })()}
-
-      {/* ── Modal Selettore Tipologia Materiale ── */}
-      <AddMaterialModal
-        isOpen={showAddModal}
-        onClose={() => setShowAddModal(false)}
-        subject={subject}
-        onMaterialAdded={(newMat) => {
-          setMaterials((prev) => [newMat, ...prev]);
-        }}
-        onLectureCreated={(newLecture) => {
-          if (onLectureCreated) {
-            onLectureCreated(newLecture);
-          }
-        }}
-      />
 
       {/* ── Modal Conferma Eliminazione Materiale (Liquid Glass) ── */}
       {itemToDelete && (
@@ -777,7 +1074,7 @@ export default function MaterialiView({
           onClick={() => !isDeleting && setItemToDelete(null)}
         >
           <div 
-            className="w-full max-w-sm rounded-3xl liquid-glass border border-white/[0.14] shadow-liquid-lg p-6 space-y-4 animate-slide-up"
+            className="w-full max-w-sm rounded-3xl liquid-modal border border-white/[0.14] shadow-liquid-lg p-6 space-y-4 animate-slide-up"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center gap-3">

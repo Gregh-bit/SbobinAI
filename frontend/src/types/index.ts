@@ -39,10 +39,12 @@ export type WSMessageType =
   | 'transcript_chunk'
   | 'transcript_refined'
   | 'bookmark_saved'
+  | 'chat_meta'
   | 'chat_response'
   | 'chat_chunk'
   | 'question_detected'
   | 'question_answering'
+  | 'question_answer_chunk'
   | 'reconnected'
   | 'paused'
   | 'resumed'
@@ -101,6 +103,8 @@ export interface ChatMessage {
   content: string;
   timestamp: number;
   contextUsed?: string;
+  citations?: CitationRef[];
+  thinking?: string;
 }
 
 export interface DetectedQuestion {
@@ -133,6 +137,7 @@ export interface CourseMaterial {
 export interface QuizQuestion {
   id: string;
   question: string;
+  concept?: string;
   options: string[];
   correct_index: number;
   correctIndex?: number;
@@ -171,6 +176,7 @@ export interface ModelInfo {
   stage?: string | null;
   error?: string | null;
   is_default?: boolean;
+  supports_thinking?: boolean;
 }
 
 export interface InstalledModelSummary {
@@ -217,6 +223,8 @@ export interface ChatMessageSend {
   message: string;
   mode?: ChatStudyMode;
   scope?: ChatScope;
+  enable_thinking?: boolean;
+  rollback_quiz?: boolean;
 }
 
 export interface ChatStudyAction {
@@ -273,8 +281,19 @@ export interface ChatSessionDetail extends ChatSession {
 
 export interface QuizSetQuestion {
   question: string;
+  concept?: string;
   options: string[];
   correct_index: number;
+  explanation: string;
+}
+
+export interface QuizResultItem {
+  question: string;
+  concept?: string;
+  options: string[];
+  selected_index: number;
+  correct_index: number;
+  is_correct: boolean;
   explanation: string;
 }
 
@@ -285,7 +304,31 @@ export interface QuizSetOut {
   title: string;
   source_label: string;
   questions: QuizSetQuestion[];
+  completed?: boolean;
+  score_percent?: number | null;
+  results_json?: string;
   created_at: string;
+}
+
+export interface StudentConcept {
+  id: number;
+  subject_id: number;
+  topic: string;
+  status: 'da_consolidare' | 'consolidato' | string;
+  error_count: number;
+  correct_count: number;
+  last_context?: string;
+  last_tested_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface StudentMasterySummary {
+  subject_id: number;
+  total_tracked: number;
+  consolidated_count: number;
+  to_consolidate_count: number;
+  concepts: StudentConcept[];
 }
 
 export interface MaterialPageOut {

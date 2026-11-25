@@ -127,17 +127,17 @@ export default function NewSubjectModal({ isOpen, onClose, onSubmit, subjectToEd
           <div>
             <div className="flex items-center justify-between mb-1.5">
               <label className="text-xs font-medium text-white/50">
-                Informazioni & Descrizione (file InfoCorso)
+                Descrizione e dettagli (opzionale)
               </label>
-              <span className="text-[10px] text-emerald-400/80 font-mono">
-                Auto-importato in Materiali
+              <span className="text-[10px] text-white/40">
+                Disponibile nei Materiali
               </span>
             </div>
             <textarea
               rows={3}
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              placeholder="es. Prof. Rossi · 9 CFU · Orario: Lunedì 14-16 · Programma: Architetture distribuite, microservizi, pattern..."
+              placeholder="es. Prof. Rossi · 9 CFU · Orario: Lunedì 14-16 · Programma..."
               className="w-full px-3.5 py-2.5 rounded-xl liquid-input text-xs text-white placeholder-white/20 focus:outline-none transition-all resize-none font-sans"
             />
           </div>
@@ -146,15 +146,15 @@ export default function NewSubjectModal({ isOpen, onClose, onSubmit, subjectToEd
             <div className="flex items-center justify-between mb-1.5">
               <label className="text-xs font-medium text-white/50 flex items-center gap-1.5">
                 <Tag size={12} strokeWidth={1.75} />
-                Keywords Vocabolario Tecnico (per Whisper)
+                Termini specifici o acronimi (opzionale)
               </label>
             </div>
             <input
               type="text"
               value={keywords}
               onChange={(e) => setKeywords(e.target.value)}
-              placeholder="es. deadlock, mutex, paging, kernel, thread (separate da virgola)"
-              className="w-full px-3.5 py-2 rounded-xl liquid-input text-xs text-white placeholder-white/20 focus:outline-none transition-all font-mono"
+              placeholder="es. mitocondri, giurisprudenza, algoritmi (separati da virgola)"
+              className="w-full px-3.5 py-2 rounded-xl liquid-input text-xs text-white placeholder-white/20 focus:outline-none transition-all font-sans"
             />
           </div>
 

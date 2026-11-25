@@ -76,6 +76,43 @@ def test_delete_lecture(client, subject, no_rag):
     assert client.get(f"/api/v1/lectures/{lec['id']}").status_code == 404
 
 
+def test_move_lecture(client, subject, no_rag):
+    # 1. Crea una seconda materia
+    sub2 = client.post("/api/v1/subjects/", json={"name": "Corso Due", "color": "#10b981"}).json()
+    
+    # 2. Crea una lezione nella prima materia con un segnalibro
+    lec = client.post(
+        "/api/v1/lectures/",
+        json={"subject_id": subject["id"], "title": "Lezione Trasferibile", "raw_transcript": "Testo test"},
+    ).json()
+    client.post("/api/v1/bookmarks/", json={"lecture_id": lec["id"], "timestamp_seconds": 10.0, "note": "Nota"})
+
+    # 3. Sposta la lezione nel secondo corso
+    r = client.post(f"/api/v1/lectures/{lec['id']}/move", json={"target_subject_id": sub2["id"]})
+    assert r.status_code == 200, r.text
+    moved = r.json()
+    assert moved["subject_id"] == sub2["id"]
+    assert moved["title"] == "Lezione Trasferibile"
+
+    # 4. Verifica che non sia più nel primo corso
+    lecs_subj1 = client.get(f"/api/v1/lectures/by-subject/{subject['id']}").json()
+    assert len(lecs_subj1) == 0
+
+    # 5. Verifica che sia presente nel secondo corso
+    lecs_subj2 = client.get(f"/api/v1/lectures/by-subject/{sub2['id']}").json()
+    assert len(lecs_subj2) == 1
+    assert lecs_subj2[0]["id"] == lec["id"]
+
+    # 6. Verifica che i segnalibri siano ancora collegati
+    bmarks = client.get(f"/api/v1/bookmarks/by-lecture/{lec['id']}").json()
+    assert len(bmarks) == 1
+    assert bmarks[0]["note"] == "Nota"
+
+    # 7. Casi di errore
+    assert client.post(f"/api/v1/lectures/{lec['id']}/move", json={"target_subject_id": 999999}).status_code == 404
+    assert client.post("/api/v1/lectures/999999/move", json={"target_subject_id": sub2["id"]}).status_code == 404
+
+
 # ── Materials upload ───────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("evil", ["../../evil.txt", "..\\..\\evil.txt", "/abs/evil.txt", "C:\\x\\evil.txt"])
@@ -245,6 +282,7 @@ def test_generate_summary_uses_requested_model_and_keeps_notes_on_error(client, 
 
     for name in ("clear_metal_cache", "unload_whisper", "unload_llm"):
         monkeypatch.setattr(llm_engine, name, lambda *a, **kw: None)
+    monkeypatch.setattr(llm_engine, "is_model_downloaded", lambda *_: True)
 
     seen = {}
 
@@ -282,6 +320,7 @@ def test_generate_summary_stream_success_and_progress(client, subject, no_rag, m
 
     for name in ("clear_metal_cache", "unload_whisper", "unload_llm"):
         monkeypatch.setattr(llm_engine, name, lambda *a, **kw: None)
+    monkeypatch.setattr(llm_engine, "is_model_downloaded", lambda *_: True)
 
     async def mock_chapter(**kw):
         cb = kw.get("progress_callback")

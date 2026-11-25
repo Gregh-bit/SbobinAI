@@ -1,5 +1,5 @@
 // components/SubjectDashboard.tsx — Dashboard Corso con Segmented Control e viste
-import { useState, useEffect, useCallback, useRef, lazy, Suspense } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef, lazy, Suspense } from 'react';
 import { 
   Mic, BookOpen, Layers, HelpCircle, MessageSquare, 
   Loader2, Download, AlertTriangle, Square, Pause, Play, Bookmark 
@@ -13,6 +13,16 @@ import { shortcutLabel } from '../lib/platform';
 import type { CourseTab, Lecture, Subject } from '../types';
 import QuadernoView from './QuadernoView';
 import SegmentedControl from './SegmentedControl';
+import ErrorBoundary from './ErrorBoundary';
+import {
+  ChatStreamSkeleton,
+  LiveWorkspaceSkeleton,
+  MaterialiGridSkeleton,
+  QuadernoSkeleton,
+  QuizWizardSkeleton,
+  SkeletonPill,
+  useDelayedLoading,
+} from './Skeleton';
 
 // Lazy loading viste secondarie e live workspace per apertura istantanea (<100ms)
 const MaterialiView = lazy(() => import('./MaterialiView'));
@@ -22,8 +32,12 @@ const LiveRecordingWorkspace = lazy(() => import('./LiveRecordingWorkspace'));
 
 interface Props {
   subject: Subject;
+  allSubjects?: Subject[];
   onOpenSettings?: () => void;
   onRecordingChange?: (isRecording: boolean) => void;
+  onLectureCountChange?: (subjectId: number, count: number) => void;
+  onMoveLecture?: (lectureId: number, targetSubjectId: number) => Promise<void>;
+  lastMovedLectureId?: number | null;
   [key: string]: any;
 }
 
@@ -38,27 +52,29 @@ const TABS: { id: CourseTab; label: string; icon: typeof BookOpen }[] = [
   { id: 'assistente', label: 'Assistente', icon: MessageSquare },
 ];
 
-export default function SubjectDashboard({ subject, onOpenSettings, onRecordingChange }: Props) {
+export default function SubjectDashboard({ subject, allSubjects, onOpenSettings, onRecordingChange, onLectureCountChange, onMoveLecture, lastMovedLectureId }: Props) {
   const { settings } = useSettings();
   const [activeTab, setActiveTab] = useState<CourseTab>('quaderno');
+  const [hasMountedQuaderno, setHasMountedQuaderno] = useState(true);
   const [lectures, setLectures] = useState<Lecture[]>([]);
+  const quadernoLectures = useMemo(
+    () => lectures.filter((l) => l.in_quaderno !== false),
+    [lectures]
+  );
+
+  useEffect(() => {
+    if (activeTab === 'quaderno') {
+      setHasMountedQuaderno(true);
+    }
+  }, [activeTab]);
   const [loading, setLoading] = useState(true);
+  const [hasLoadedLectures, setHasLoadedLectures] = useState(false);
+  const showLecturesSkeleton = useDelayedLoading(loading, 150, 220);
   const [startingLive, setStartingLive] = useState(false);
   const [liveError, setLiveError] = useState<string | null>(null);
   const [activeRecordingLecture, setActiveRecordingLecture] = useState<Lecture | null>(null);
-
-  // Stato per handoff cross-tab (Citazioni -> Materiali, Quiz/Orale -> QuizRipassoView)
-  const [materialTarget, setMaterialTarget] = useState<{
-    sourceId: string;
-    page?: number;
-    key: number;
-  } | null>(null);
-  const [pendingQuizId, setPendingQuizId] = useState<number | null>(null);
-  const [pendingOralQuestion, setPendingOralQuestion] = useState<{
-    question: string;
-    topic?: string;
-    key: number;
-  } | null>(null);
+  const [isClosingLive, setIsClosingLive] = useState(false);
+  const isCapsuleExpanded = Boolean(activeRecordingLecture) && !isClosingLive;
 
   // Guardie contro risposte asincrone obsolete (dismount o richieste superate)
   const isMountedRef = useRef(true);
@@ -75,11 +91,15 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
 
   const loadLectures = useCallback(async (isInitial = false): Promise<Lecture[] | null> => {
     const seq = ++loadSeqRef.current;
-    if (isInitial) setLoading(true);
+    if (isInitial) {
+      setLoading(true);
+      setHasLoadedLectures(false);
+    }
     try {
       const data = await api.lectures.listBySubject(subject.id);
       if (!isMountedRef.current || seq !== loadSeqRef.current) return null;
       setLectures(data);
+      setHasLoadedLectures(true);
       return data;
     } catch {
       // Ignora silenziosamente
@@ -89,8 +109,71 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
     }
   }, [subject.id]);
 
+  // Se una lezione è stata spostata da un'azione esterna (es. drag sulla Sidebar), la rimuoviamo dallo stato locale
+  useEffect(() => {
+    if (lastMovedLectureId) {
+      setLectures((prev) => prev.filter((l) => l.id !== lastMovedLectureId));
+    }
+  }, [lastMovedLectureId]);
+
+  const handleMoveLecture = useCallback(async (lectureId: number, targetSubjectId: number) => {
+    // 1. Rimuovi immediatamente dalla lista locale per aggiornare la UI all'istante
+    setLectures((prev) => prev.filter((l) => l.id !== lectureId));
+    onLectureCountChange?.(subject.id, Math.max(0, lectures.length - 1));
+    const targetSub = allSubjects?.find((s) => s.id === targetSubjectId);
+    if (targetSub) {
+      onLectureCountChange?.(targetSubjectId, (targetSub.lecture_count || 0) + 1);
+    }
+
+    // 2. Esegui la chiamata di spostamento
+    if (onMoveLecture) {
+      await onMoveLecture(lectureId, targetSubjectId);
+    } else {
+      await api.lectures.move(lectureId, targetSubjectId);
+    }
+
+    // 3. Sincronizza lo stato reale con il backend
+    void loadLectures(false);
+  }, [onMoveLecture, subject.id, lectures.length, allSubjects, onLectureCountChange, loadLectures]);
+
+  // Stato per handoff cross-tab (Citazioni -> Materiali, Audio Snippet -> Quaderno, Quiz/Orale -> QuizRipassoView)
+  const [materialTarget, setMaterialTarget] = useState<{
+    sourceId: string;
+    page?: number;
+    key: number;
+  } | null>(null);
+  const [audioSnippetTarget, setAudioSnippetTarget] = useState<{
+    lectureId: number;
+    seconds: number;
+    autoPlay?: boolean;
+    key: number;
+  } | null>(null);
+  const [pendingQuizId, setPendingQuizId] = useState<number | null>(null);
+  const [pendingOralQuestion, setPendingOralQuestion] = useState<{
+    question: string;
+    topic?: string;
+    key: number;
+  } | null>(null);
+  const [pendingChatReview, setPendingChatReview] = useState<{
+    chatSessionId?: number | null;
+    quizId: number;
+    quizTitle: string;
+    score: number;
+    total: number;
+    wrongCount: number;
+    key: number;
+  } | null>(null);
+
+  // Mantieni sincronizzato il badge del numero lezioni nella Sidebar senza refresh
+  useEffect(() => {
+    if (!loading && hasLoadedLectures) {
+      onLectureCountChange?.(subject.id, lectures.length);
+    }
+  }, [loading, hasLoadedLectures, lectures.length, subject.id, onLectureCountChange]);
+
   useEffect(() => {
     setMaterialTarget(null);
+    setAudioSnippetTarget(null);
     setPendingQuizId(null);
     setPendingOralQuestion(null);
     loadLectures(true);
@@ -107,6 +190,14 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
     setActiveTab('materiali');
   }, []);
 
+  const handleOpenAudioSnippet = useCallback(
+    (lectureId: number, seconds: number, autoPlay: boolean = true) => {
+      setAudioSnippetTarget({ lectureId, seconds, autoPlay, key: Date.now() });
+      setActiveTab('quaderno');
+    },
+    []
+  );
+
   const handleOpenQuiz = useCallback((quizId: number) => {
     setPendingQuizId(quizId);
     setActiveTab('quiz');
@@ -117,18 +208,48 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
     setActiveTab('quiz');
   }, []);
 
+  const handleReviewInChat = useCallback(
+    (review: {
+      quizId: number;
+      chatSessionId?: number | null;
+      quizTitle: string;
+      score: number;
+      total: number;
+      wrongCount: number;
+    }) => {
+      setPendingChatReview({ ...review, key: Date.now() });
+      setActiveTab('assistente');
+    },
+    []
+  );
+
   const handleLectureCreatedFromAssistant = useCallback(() => {
     void loadLectures(false);
   }, [loadLectures]);
 
+  const [pendingQuadernoLectureId, setPendingQuadernoLectureId] = useState<number | null>(null);
+  const handleOpenQuadernoLecture = useCallback(async (lectureId: number) => {
+    await loadLectures(false);
+    setPendingQuadernoLectureId(lectureId);
+    setActiveTab('quaderno');
+  }, [loadLectures]);
+
   const handleClearMaterialTarget = useCallback(() => setMaterialTarget(null), []);
+  const handleClearAudioSnippetTarget = useCallback(() => setAudioSnippetTarget(null), []);
   const handleClearPendingQuiz = useCallback(() => setPendingQuizId(null), []);
   const handleClearPendingOralQuestion = useCallback(() => setPendingOralQuestion(null), []);
+  const handleClearPendingChatReview = useCallback(() => setPendingChatReview(null), []);
 
   // Notifica al genitore lo stato di registrazione (blocca il cambio corso nella Sidebar)
   useEffect(() => {
     onRecordingChange?.(activeRecordingLecture !== null);
   }, [activeRecordingLecture, onRecordingChange]);
+
+  // Prefetch proattivo del modulo di registrazione in background:
+  // quando l'utente preme "Avvia", il componente è già in memoria e si monta a 0ms senza jank.
+  useEffect(() => {
+    void import('./LiveRecordingWorkspace');
+  }, []);
 
   useEffect(() => {
     return () => onRecordingChange?.(false);
@@ -140,29 +261,50 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
   const pollUntilNotesReady = useCallback((lectureId: number) => {
     if (notesPollRef.current) clearInterval(notesPollRef.current);
     const startedAt = Date.now();
+    // Usa llmDownloaded (NON modelsDownloaded che controlla solo Whisper!):
+    // se nessun LLM è scaricato, fa solo 2 controlli rapidi (~12s) per l'audio M4A / coda finale.
+    const hasLLM = Boolean(settings.llmDownloaded);
+    const maxPollMs = hasLLM ? NOTES_POLL_MAX_MS : 12000;
     const isDone = (data: Lecture[] | null) => {
       const lec = data?.find((l) => l.id === lectureId);
       if (!lec) return false;
+      if (!hasLLM) {
+        return Boolean(lec.audio_path && lec.audio_path.endsWith('.m4a'));
+      }
       return Boolean(lec.processed_notes && lec.audio_path);
     };
     notesPollRef.current = setInterval(async () => {
       const data = await loadLectures(false);
-      if (isDone(data) || Date.now() - startedAt > NOTES_POLL_MAX_MS) {
+      if (isDone(data) || Date.now() - startedAt > maxPollMs) {
         if (notesPollRef.current) clearInterval(notesPollRef.current);
         notesPollRef.current = null;
       }
     }, NOTES_POLL_INTERVAL_MS);
-  }, [loadLectures]);
+  }, [loadLectures, settings.llmDownloaded]);
 
   const handleRecordingFinished = useCallback(() => {
     const finished = activeRecordingLectureRef.current;
-    setActiveRecordingLecture(null);
-    loadLectures(false).then((data) => {
-      if (!finished || !isMountedRef.current) return;
+    // Fase 1: richiude la Dynamic Island a 60/120 FPS e carica IN PARALLELO le lezioni aggiornate
+    // così QuadernoView si monta già con raw_transcript, durata e audio_path freschi (zero flash!)
+    setIsClosingLive(true);
+    const preloadPromise = loadLectures(false).catch(() => null);
+    window.setTimeout(async () => {
+      const data = await Promise.race([
+        preloadPromise,
+        new Promise<Lecture[] | null>((resolve) => window.setTimeout(() => resolve(null), 350)),
+      ]);
+      if (!isMountedRef.current) return;
+      // Fase 2: smonta il workspace live e rimonta il Quaderno con dati già aggiornati
+      setActiveRecordingLecture(null);
+      setIsClosingLive(false);
+      if (!finished) return;
       const lec = data?.find((l) => l.id === finished.id);
-      if (!lec || !lec.processed_notes || !lec.audio_path) pollUntilNotesReady(finished.id);
-    });
-  }, [loadLectures, pollUntilNotesReady]);
+      const needsPoll = settings.llmDownloaded
+        ? !lec || !lec.processed_notes || !lec.audio_path
+        : !lec || !lec.audio_path || !lec.audio_path.endsWith('.m4a');
+      if (needsPoll) pollUntilNotesReady(finished.id);
+    }, 190);
+  }, [loadLectures, pollUntilNotesReady, settings.llmDownloaded]);
 
   const liveSession = useLiveSession({
     subject,
@@ -172,6 +314,7 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
 
   const handleStartLive = async () => {
     setStartingLive(true);
+    setIsClosingLive(false);
     setLiveError(null);
     try {
       const today = new Date().toLocaleDateString('it-IT', { day: 'numeric', month: 'long' });
@@ -252,6 +395,7 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
       setLectures((prev) => prev.map((l) => (l.id === id ? updated : l)));
     } catch (e) {
       console.error('Errore rimozione dal quaderno:', e);
+      throw e;
     }
   };
 
@@ -261,6 +405,7 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
       setLectures((prev) => prev.map((l) => (l.id === id ? updated : l)));
     } catch (e) {
       console.error('Errore ripristino nel quaderno:', e);
+      throw e;
     }
   };
 
@@ -271,29 +416,42 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
         data-tauri-drag-region
         className="h-14 px-6 border-b border-white/[0.08] liquid-glass flex items-center justify-between gap-4 flex-shrink-0 z-20 relative"
       >
-        {/* Left: Clean space or live recording lecture title */}
+        {/* Left: Minimal course indicator or live recording lecture title */}
         <div className="flex-1 min-w-0 flex items-center gap-2" data-tauri-drag-region="false">
-          {activeRecordingLecture ? (
+          {isCapsuleExpanded && activeRecordingLecture ? (
             <div className="flex items-center gap-2 text-xs font-medium text-white/85 animate-fade-in truncate">
               <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse flex-shrink-0" />
               <span className="truncate">{activeRecordingLecture.title}</span>
             </div>
-          ) : null}
+          ) : (
+            <div className="flex items-center gap-2 min-w-0 animate-fade-in">
+              <span
+                className="w-2 h-2 rounded-full flex-shrink-0"
+                style={{ backgroundColor: subject.color }}
+              />
+              <span className="text-xs font-medium text-white/55 truncate">
+                {subject.name}
+              </span>
+            </div>
+          )}
         </div>
 
-        {/* Center: Apple-style Liquid Glass Segmented Control — Centrato in modo responsive */}
+        {/* Center: Apple-style Liquid Glass Segmented Control — collassa durante la registrazione così la Dynamic Island ha tutto lo spazio */}
         <div 
           data-tauri-drag-region="false"
-          className="flex-shrink-0 w-full max-w-[440px] flex justify-center items-center h-full"
+          className={clsx(
+            'flex justify-center items-center h-full',
+            !isCapsuleExpanded ? 'flex-shrink-0 w-full max-w-[440px]' : 'w-0 overflow-hidden'
+          )}
         >
-          <AnimatePresence mode="wait">
-            {!activeRecordingLecture ? (
+          <AnimatePresence mode="wait" initial={false}>
+            {!isCapsuleExpanded ? (
               <motion.div
                 key="segmented-tabs"
                 initial={{ opacity: 0, scale: 0.96 }}
                 animate={{ opacity: 1, scale: 1 }}
                 exit={{ opacity: 0, scale: 0.96 }}
-                transition={{ duration: 0.2 }}
+                transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
                 className="w-full"
               >
                 <SegmentedControl
@@ -305,23 +463,18 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
                   size="md"
                 />
               </motion.div>
-            ) : (
-              <motion.div
-                key="recording-indicator"
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                transition={{ duration: 0.2 }}
-                className="text-xs font-medium text-white/50 tracking-wide select-none"
-              >
-                Registrazione in corso
-              </motion.div>
-            )}
+            ) : null}
           </AnimatePresence>
         </div>
 
-        {/* Right: Dynamic Recording Controller — iOS Dynamic Island morphing capsule */}
-        <div data-tauri-drag-region="false" className="flex-1 min-w-0 flex items-center justify-end z-30">
+        {/* Right: Dynamic Recording Controller — iOS Dynamic Island morphing capsule (fluida 60fps senza blur annidato) */}
+        <div
+          data-tauri-drag-region="false"
+          className={clsx(
+            'flex items-center justify-end z-30',
+            isCapsuleExpanded ? 'flex-shrink-0' : 'flex-1 min-w-0'
+          )}
+        >
           <motion.div
             layout
             transition={{
@@ -331,30 +484,42 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
               mass: 0.8,
             }}
             className={clsx(
-              'relative h-9 rounded-full flex items-center select-none transition-colors duration-200',
-              !activeRecordingLecture
+              'relative h-9 rounded-full flex items-center select-none flex-shrink-0 transition-colors duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-white/40',
+              !isCapsuleExpanded
                 ? 'bg-white/[0.08] hover:bg-white/[0.14] border border-white/20 hover:border-white/30 cursor-pointer shadow-liquid-sm'
-                : 'bg-zinc-950/90 backdrop-blur-2xl border border-white/15 shadow-liquid-lg'
+                : 'bg-[#0d0f17]/95 border border-white/15 shadow-liquid-lg'
             )}
+            role={!activeRecordingLecture ? 'button' : undefined}
+            tabIndex={!activeRecordingLecture ? 0 : undefined}
+            aria-label={!activeRecordingLecture ? 'Registra lezione' : undefined}
+            onKeyDown={(e) => {
+              if (!activeRecordingLecture && !startingLive && (e.key === 'Enter' || e.key === ' ')) {
+                e.preventDefault();
+                handleStartLive();
+              }
+            }}
             onClick={!activeRecordingLecture && !startingLive ? handleStartLive : undefined}
-            whileHover={!activeRecordingLecture ? { scale: 1.05 } : undefined}
-            whileTap={!activeRecordingLecture ? { scale: 0.95 } : undefined}
+            whileHover={!isCapsuleExpanded ? { scale: 1.03 } : undefined}
+            whileTap={!isCapsuleExpanded ? { scale: 0.97 } : undefined}
           >
             <AnimatePresence mode="popLayout" initial={false}>
-              {!activeRecordingLecture ? (
+              {!isCapsuleExpanded ? (
                 <motion.div
                   key="mic-bubble"
-                  initial={{ opacity: 0, scale: 0.8 }}
+                  initial={{ opacity: 0, scale: 0.88 }}
                   animate={{ opacity: 1, scale: 1 }}
-                  exit={{ opacity: 0, scale: 0.8 }}
-                  transition={{ duration: 0.18, ease: 'easeOut' }}
-                  className="w-9 h-9 flex items-center justify-center flex-shrink-0"
+                  exit={{ opacity: 0, scale: 0.88 }}
+                  transition={{ duration: 0.16, ease: 'easeOut' }}
+                  className="h-9 px-3.5 gap-1.5 flex items-center justify-center flex-shrink-0 whitespace-nowrap"
                   title="Registra Lezione"
                 >
                   {startingLive ? (
-                    <Loader2 size={15} className="animate-spin text-white/60" />
+                    <Loader2 size={14} className="animate-spin text-white/60" />
                   ) : (
-                    <Mic size={15} strokeWidth={2} className="text-red-400" />
+                    <>
+                      <Mic size={13} strokeWidth={2.2} className="text-red-400" />
+                      <span className="text-[11.5px] font-medium text-white/90">Registra</span>
+                    </>
                   )}
                 </motion.div>
               ) : (
@@ -363,7 +528,7 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
                   initial={{ opacity: 0, scale: 0.95 }}
                   animate={{ opacity: 1, scale: 1 }}
                   exit={{ opacity: 0, scale: 0.92 }}
-                  transition={{ duration: 0.18, ease: 'easeOut' }}
+                  transition={{ duration: 0.16, ease: 'easeOut' }}
                   className="flex items-center gap-1.5 px-1.5 py-1 whitespace-nowrap"
                 >
                   {/* Waveform indicator + Timer */}
@@ -517,21 +682,21 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
       )}
 
       {/* ── Banner stato connessione registrazione live ── */}
-      {activeRecordingLecture && !liveSession.isStopping && (liveSession.connectionError || !liveSession.isConnected || liveSession.isReconnecting) && (
+      {activeRecordingLecture && !isClosingLive && !liveSession.isStopping && (liveSession.connectionError || !liveSession.isConnected || liveSession.isReconnecting) && (
         <div
           className={clsx(
-            'px-6 py-2 border-b flex items-center gap-2.5 text-xs flex-shrink-0 animate-fade-in',
+            'px-6 py-2 border-b flex items-start gap-2.5 text-xs flex-shrink-0 animate-fade-in',
             liveSession.connectionError
               ? 'bg-red-500/10 border-red-500/20 text-red-200/90'
               : 'bg-amber-500/10 border-amber-500/20 text-amber-200/90'
           )}
         >
           {liveSession.connectionError ? (
-            <AlertTriangle size={14} className="text-red-400 flex-shrink-0" />
+            <AlertTriangle size={14} className="text-red-400 flex-shrink-0 mt-0.5" />
           ) : (
-            <Loader2 size={13} className="animate-spin text-amber-400 flex-shrink-0" />
+            <Loader2 size={13} className="animate-spin text-amber-400 flex-shrink-0 mt-0.5" />
           )}
-          <span className="truncate">
+          <span className="flex-1 min-w-0 leading-snug break-words select-text">
             {liveSession.connectionError
               ? `Registrazione non attiva: ${liveSession.connectionError}`
               : liveSession.isReconnecting
@@ -542,11 +707,12 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
       )}
 
       {/* ── Active View / Live Recording Workspace ── */}
-      <main className="flex-1 flex overflow-hidden relative w-full h-full">
+      <main className="flex-1 flex overflow-hidden relative w-full h-full" style={{ transform: 'translateZ(0)' }}>
         {activeRecordingLecture ? (
-          <Suspense fallback={<div className="flex-1 flex items-center justify-center w-full h-full"><Loader2 size={24} className="animate-spin text-white/30" /></div>}>
+          <Suspense fallback={<LiveWorkspaceSkeleton />}>
             <LiveRecordingWorkspace
               subjectId={subject.id}
+              subjectName={subject.name}
               chunks={liveSession.chunks}
               isPaused={liveSession.isPaused}
               audioStatus={liveSession.audioStatus}
@@ -562,85 +728,136 @@ export default function SubjectDashboard({ subject, onOpenSettings, onRecordingC
               handleCancelChat={liveSession.handleCancelChat}
               inspectorTab={liveSession.inspectorTab}
               setInspectorTab={liveSession.setInspectorTab}
+              onOpenSettings={onOpenSettings}
             />
           </Suspense>
-        ) : loading ? (
-          <div className="flex-1 flex items-center justify-center w-full h-full">
-            <Loader2 size={20} className="animate-spin text-white/30" />
-          </div>
+        ) : loading || showLecturesSkeleton ? (
+          showLecturesSkeleton ? (
+            <QuadernoSkeleton />
+          ) : (
+            <div className="flex-1 flex w-full h-full" />
+          )
         ) : (
-          <AnimatePresence mode="wait">
-            <motion.div
-              key={activeTab}
-              initial={{ opacity: 0, y: 5 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -5 }}
-              transition={{ duration: 0.15 }}
-              className="flex-1 flex overflow-hidden w-full h-full"
-            >
-              {activeTab === 'quaderno' && (
+          <div className="flex-1 flex overflow-hidden w-full h-full relative">
+            {hasMountedQuaderno && (
+              <div
+                className={
+                  activeTab === 'quaderno'
+                    ? 'flex-1 flex overflow-hidden w-full h-full animate-fade-in'
+                    : 'hidden'
+                }
+                aria-hidden={activeTab !== 'quaderno'}
+              >
                 <QuadernoView
                   key={subject.id}
+                  isActive={activeTab === 'quaderno'}
                   subject={subject}
-                  lectures={lectures.filter((l) => l.in_quaderno !== false)}
+                  allSubjects={allSubjects}
+                  lectures={quadernoLectures}
+                  onMoveLecture={handleMoveLecture}
+                  initialLectureId={pendingQuadernoLectureId}
+                  onClearInitialLectureId={() => setPendingQuadernoLectureId(null)}
+                  initialAudioTarget={audioSnippetTarget}
+                  onClearInitialAudioTarget={handleClearAudioSnippetTarget}
+                  onOpenAudioSnippet={handleOpenAudioSnippet}
+                  onOpenCitation={handleOpenCitation}
                   onDeletePermanently={handleDeleteLecture}
                   onRemoveFromQuadernoOnly={handleRemoveFromQuadernoOnly}
                   onRestoreToQuaderno={handleRestoreToQuaderno}
                   onAddLecture={handleCreateCustomLecture}
                   onUpdateLecture={handleUpdateLecture}
+                  onStartLive={handleStartLive}
                   onOpenAddMaterialModal={() => setActiveTab('materiali')}
                   onOpenSettings={onOpenSettings}
                   onLocalLectureUpdate={handleLocalLectureUpdate}
                 />
-              )}
-              {activeTab === 'materiali' && (
-                <Suspense fallback={<div className="flex-1 flex items-center justify-center"><Loader2 size={24} className="animate-spin text-white/30" /></div>}>
-                  <MaterialiView 
-                    subject={subject} 
-                    key={subject.id}
-                    initialTarget={materialTarget}
-                    onClearInitialTarget={handleClearMaterialTarget}
-                    onDeleteLecturePermanently={handleDeleteLecture}
-                    onRestoreLectureToQuaderno={handleRestoreToQuaderno}
-                    onLectureCreated={(newLecture) => {
-                      setLectures((prev) => {
-                        const exists = prev.some((l) => l.id === newLecture.id);
-                        if (exists) return prev.map((l) => (l.id === newLecture.id ? newLecture : l));
-                        return [newLecture, ...prev];
-                      });
-                    }}
-                  />
-                </Suspense>
-              )}
-              {activeTab === 'quiz' && (
-                <Suspense fallback={<div className="flex-1 flex items-center justify-center"><Loader2 size={24} className="animate-spin text-white/30" /></div>}>
-                  <QuizRipassoView
-                    key={subject.id}
-                    subject={subject}
-                    lectures={lectures}
-                    onOpenSettings={onOpenSettings}
-                    initialQuizId={pendingQuizId}
-                    onClearInitialQuiz={handleClearPendingQuiz}
-                    initialOralQuestion={pendingOralQuestion}
-                    onClearInitialOralQuestion={handleClearPendingOralQuestion}
-                  />
-                </Suspense>
-              )}
-              {activeTab === 'assistente' && (
-                <Suspense fallback={<div className="flex-1 flex items-center justify-center"><Loader2 size={24} className="animate-spin text-white/30" /></div>}>
-                  <AssistenteCorsoView
-                    key={subject.id}
-                    subject={subject}
-                    lectures={lectures}
-                    onOpenCitation={handleOpenCitation}
-                    onOpenQuiz={handleOpenQuiz}
-                    onOpenOralQuestion={handleOpenOralQuestion}
-                    onLectureCreated={handleLectureCreatedFromAssistant}
-                  />
-                </Suspense>
-              )}
-            </motion.div>
-          </AnimatePresence>
+              </div>
+            )}
+
+            {activeTab !== 'quaderno' && (
+              <div key={activeTab} className="flex-1 flex overflow-hidden w-full h-full animate-fade-in">
+                {activeTab === 'materiali' && (
+                  <Suspense
+                    fallback={
+                      <div className="flex-1 flex flex-col overflow-hidden bg-black/15 select-none animate-fade-in">
+                        <div className="px-8 py-3.5 border-b border-white/[0.06] flex items-center justify-between flex-shrink-0">
+                          <div className="flex items-center gap-3">
+                            <SkeletonPill tone="soft" className="h-7 w-52" />
+                            <SkeletonPill tone="soft" className="h-3 w-24" />
+                          </div>
+                          <SkeletonPill tone="strong" className="h-7 w-24" />
+                        </div>
+                        <div className="flex-1 overflow-hidden p-8">
+                          <MaterialiGridSkeleton />
+                        </div>
+                      </div>
+                    }
+                  >
+                    <MaterialiView
+                      subject={subject}
+                      key={subject.id}
+                      initialTarget={materialTarget}
+                      onClearInitialTarget={handleClearMaterialTarget}
+                      onDeleteLecturePermanently={handleDeleteLecture}
+                      onRestoreLectureToQuaderno={handleRestoreToQuaderno}
+                      onLectureCreated={(newLecture) => {
+                        setLectures((prev) => {
+                          const exists = prev.some((l) => l.id === newLecture.id);
+                          if (exists) return prev.map((l) => (l.id === newLecture.id ? newLecture : l));
+                          return [newLecture, ...prev];
+                        });
+                      }}
+                    />
+                  </Suspense>
+                )}
+                {activeTab === 'quiz' && (
+                  <ErrorBoundary fallbackTitle="Impossibile caricare la schermata Quiz">
+                    <Suspense fallback={<QuizWizardSkeleton />}>
+                      <QuizRipassoView
+                        key={subject.id}
+                        subject={subject}
+                        lectures={lectures}
+                        onOpenSettings={onOpenSettings}
+                        initialQuizId={pendingQuizId}
+                        onClearInitialQuiz={handleClearPendingQuiz}
+                        initialOralQuestion={pendingOralQuestion}
+                        onClearInitialOralQuestion={handleClearPendingOralQuestion}
+                        onReviewInChat={handleReviewInChat}
+                      />
+                    </Suspense>
+                  </ErrorBoundary>
+                )}
+                {activeTab === 'assistente' && (
+                  <ErrorBoundary fallbackTitle="Impossibile caricare l'Assistente">
+                    <Suspense
+                      fallback={
+                        <div className="flex-1 overflow-hidden content-canvas px-6 sm:px-8 py-6">
+                          <div className="max-w-3xl mx-auto">
+                            <ChatStreamSkeleton />
+                          </div>
+                        </div>
+                      }
+                    >
+                      <AssistenteCorsoView
+                        key={subject.id}
+                        subject={subject}
+                        lectures={lectures}
+                        onOpenCitation={handleOpenCitation}
+                        onOpenAudioSnippet={handleOpenAudioSnippet}
+                        onOpenSettings={onOpenSettings}
+                        onOpenQuiz={handleOpenQuiz}
+                        onOpenOralQuestion={handleOpenOralQuestion}
+                        onOpenQuadernoLecture={handleOpenQuadernoLecture}
+                        onLectureCreated={handleLectureCreatedFromAssistant}
+                        initialReviewTarget={pendingChatReview}
+                        onClearInitialReview={handleClearPendingChatReview}
+                      />
+                    </Suspense>
+                  </ErrorBoundary>
+                )}
+              </div>
+            )}
+          </div>
         )}
       </main>
     </div>

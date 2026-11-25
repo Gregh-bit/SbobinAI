@@ -594,26 +594,25 @@ export default function Wizard() {
                 Benvenuto in SbobinAI
               </h1>
               <p className="text-sm text-white/60 max-w-lg mx-auto leading-relaxed">
-                Il quaderno universitario intelligente: registra e trascrivi lezioni senza allucinazioni, 
-                indicizza i materiali del corso e interroga la memoria con modelli IA al 100% in locale.
+                Il quaderno universitario per registrare e trascrivere lezioni, generare capitoli di studio e preparare esami, interamente in locale.
               </p>
             </div>
 
             <div className="grid grid-cols-3 gap-4 pt-4 text-left">
               <div className="p-4 rounded-2xl liquid-glass border border-white/[0.10] shadow-liquid-sm space-y-2">
                 <ShieldCheck size={22} className="text-emerald-400" />
-                <p className="text-xs font-semibold text-white/95">Privacy & Locale</p>
-                <p className="text-[11px] text-white/50 leading-relaxed">Audio, sbobine e vettori risiedono sul tuo computer senza invio a server esterni.</p>
+                <p className="text-xs font-semibold text-white/95">100% Locale</p>
+                <p className="text-[11px] text-white/50 leading-relaxed">Audio, appunti e documenti restano solo sul tuo dispositivo.</p>
               </div>
               <div className="p-4 rounded-2xl liquid-glass border border-white/[0.10] shadow-liquid-sm space-y-2">
                 <Zap size={22} className="text-amber-400" />
-                <p className="text-xs font-semibold text-white/95">Whisper Large Turbo</p>
-                <p className="text-[11px] text-white/50 leading-relaxed">Fedeltà massima della trascrizione vocale su termini tecnici universitari.</p>
+                <p className="text-xs font-semibold text-white/95">Trascrizione accurata</p>
+                <p className="text-[11px] text-white/50 leading-relaxed">Riconoscimento vocale fedele anche su lessico specifico universitario.</p>
               </div>
               <div className="p-4 rounded-2xl liquid-glass border border-white/[0.10] shadow-liquid-sm space-y-2">
                 <Laptop size={22} className="text-blue-400" />
                 <p className="text-xs font-semibold text-white/95">Leggero e veloce</p>
-                <p className="text-[11px] text-white/50 leading-relaxed">KV cache 4-bit, auto-unload intelligente e zero consumo di batteria.</p>
+                <p className="text-[11px] text-white/50 leading-relaxed">Ottimizzato per consumare poche risorse e mantenere il computer scattante.</p>
               </div>
             </div>
           </div>
@@ -649,7 +648,7 @@ export default function Wizard() {
                   type="button"
                   onClick={handleChooseFolder}
                   disabled={isSelectingFolder}
-                  className="px-4 py-3 rounded-2xl liquid-glass-pill border border-white/18 hover:border-white/28 hover:bg-white/[0.12] text-xs font-semibold text-white transition-all flex-shrink-0 disabled:opacity-50 cursor-pointer shadow-liquid-sm"
+                  className="px-4 py-3 rounded-2xl liquid-glass-pill border border-white/[0.18] hover:border-white/[0.28] hover:bg-white/[0.12] text-xs font-semibold text-white transition-all flex-shrink-0 disabled:opacity-50 cursor-pointer shadow-liquid-sm"
                 >
                   {isSelectingFolder ? `Apertura ${fileManagerName}...` : 'Scegli cartella...'}
                 </button>

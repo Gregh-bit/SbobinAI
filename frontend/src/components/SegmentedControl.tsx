@@ -1,5 +1,5 @@
 // components/SegmentedControl.tsx — Apple-style Segmented Control con Framer Motion sliding pill
-import React from 'react';
+import React, { useRef, useState, useLayoutEffect } from 'react';
 import { motion } from 'framer-motion';
 import { clsx } from 'clsx';
 
@@ -24,12 +24,23 @@ export default function SegmentedControl<T extends string>({
   options,
   value,
   onChange,
-  layoutId = 'segmented-pill',
   size = 'md',
   className,
   fullWidth = false,
 }: Props<T>) {
   const isSm = size === 'sm';
+  const tabRefs = useRef<Map<T, HTMLButtonElement>>(new Map());
+  const [indicator, setIndicator] = useState<{ left: number; width: number } | null>(null);
+
+  useLayoutEffect(() => {
+    const activeEl = tabRefs.current.get(value);
+    if (activeEl) {
+      setIndicator({
+        left: activeEl.offsetLeft,
+        width: activeEl.offsetWidth,
+      });
+    }
+  }, [value, options]);
 
   return (
     <div
@@ -41,6 +52,25 @@ export default function SegmentedControl<T extends string>({
         className
       )}
     >
+      {/* Indicatore a pillola scorrevole: SOLO scorrimento orizzontale X relativo al contenitore, zero salti sull'asse Y */}
+      {indicator && (
+        <motion.div
+          className="absolute inset-y-0.5 rounded-full bg-white/[0.14] border border-white/[0.22] shadow-liquid-pill pointer-events-none"
+          initial={false}
+          animate={{
+            x: indicator.left,
+            width: indicator.width,
+          }}
+          transition={{
+            type: 'spring',
+            stiffness: 480,
+            damping: 34,
+            mass: 0.8,
+          }}
+          style={{ left: 0 }}
+        />
+      )}
+
       {options.map((option) => {
         const Icon = option.icon;
         const isActive = value === option.id;
@@ -48,6 +78,10 @@ export default function SegmentedControl<T extends string>({
         return (
           <button
             key={option.id}
+            ref={(el) => {
+              if (el) tabRefs.current.set(option.id, el);
+              else tabRefs.current.delete(option.id);
+            }}
             type="button"
             role="tab"
             aria-selected={isActive}
@@ -61,19 +95,6 @@ export default function SegmentedControl<T extends string>({
                 : 'text-white/55 hover:text-white/85'
             )}
           >
-            {isActive && (
-              <motion.div
-                layoutId={layoutId}
-                className="absolute inset-0 bg-white/[0.14] rounded-full border border-white/[0.22] shadow-liquid-pill"
-                transition={{
-                  type: 'spring',
-                  stiffness: 480,
-                  damping: 32,
-                  mass: 0.8,
-                }}
-              />
-            )}
-
             {Icon && (
               <Icon
                 size={isSm ? 11 : 12}

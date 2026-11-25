@@ -20,6 +20,7 @@ import collections
 import logging
 import os
 import queue
+import sys
 import tempfile
 import threading
 import time
@@ -46,21 +47,88 @@ from config import get_audio_dir
 _SPOOL_MAX_RAM_BYTES = 64 * 1024 * 1024
 
 
-def _resolve_input_device() -> Optional[object]:
-    """Dispositivo di input da SBOBINAI_INPUT_DEVICE (indice numerico o sottostringa del nome)."""
-    wanted = (os.environ.get("SBOBINAI_INPUT_DEVICE") or "").strip()
-    if not wanted or sd is None:
+def _resolve_default_wasapi_device() -> Optional[int]:
+    """Su Windows trova l'indice del dispositivo di input predefinito WASAPI."""
+    if sd is None or sys.platform != "win32":
         return None
-    if wanted.isdigit():
-        return int(wanted)
     try:
-        for idx, dev in enumerate(sd.query_devices()):
-            if dev.get("max_input_channels", 0) > 0 and wanted.lower() in str(dev.get("name", "")).lower():
-                return idx
-    except Exception:
-        pass
-    logger.warning(f"[AudioEngine] Dispositivo '{wanted}' non trovato: uso il microfono predefinito.")
+        hostapis = sd.query_hostapis()
+        for h in hostapis:
+            if "wasapi" in str(h.get("name", "")).lower():
+                dev_id = h.get("default_input_device")
+                if dev_id is not None and int(dev_id) >= 0:
+                    return int(dev_id)
+    except Exception as e:
+        logger.debug(f"[AudioEngine] Query hostapi WASAPI fallita: {e}")
     return None
+
+
+def _resolve_input_device() -> Optional[object]:
+    """Dispositivo di input da SBOBINAI_INPUT_DEVICE o dispositivo WASAPI nativo su Windows."""
+    if sd is None:
+        return None
+    wanted = (os.environ.get("SBOBINAI_INPUT_DEVICE") or "").strip()
+    if wanted:
+        if wanted.isdigit():
+            return int(wanted)
+        try:
+            devices = sd.query_devices()
+            # Su Windows cerca prima se c'è un endpoint WASAPI corrispondente
+            if sys.platform == "win32":
+                for idx, dev in enumerate(devices):
+                    if dev.get("max_input_channels", 0) > 0 and wanted.lower() in str(dev.get("name", "")).lower():
+                        h_id = dev.get("hostapi")
+                        if h_id is not None:
+                            try:
+                                h_name = str(sd.query_hostapis(h_id).get("name", "")).lower()
+                                if "wasapi" in h_name:
+                                    return idx
+                            except Exception:
+                                pass
+            for idx, dev in enumerate(devices):
+                if dev.get("max_input_channels", 0) > 0 and wanted.lower() in str(dev.get("name", "")).lower():
+                    return idx
+        except Exception:
+            pass
+        logger.warning(f"[AudioEngine] Dispositivo '{wanted}' non trovato: uso il microfono predefinito.")
+
+    if sys.platform == "win32":
+        wasapi_dev = _resolve_default_wasapi_device()
+        if wasapi_dev is not None:
+            return wasapi_dev
+
+    return None
+
+
+_DEVICE_INFO_CACHE: dict = {}
+
+
+def _get_cached_device_info(device: Optional[object]) -> tuple[int, float]:
+    """
+    Recupera proprietà (canali, samplerate nativo) del dispositivo di input con cache (60s).
+    Evita il freeze da scansione sincrona del CoreAudio HAL su macOS e COM su Windows.
+    """
+    global _DEVICE_INFO_CACHE
+    if sd is None:
+        return 1, 48000.0
+    now = time.time()
+    cache_key = str(device)
+    if cache_key in _DEVICE_INFO_CACHE:
+        ts, cached_ch, cached_sr = _DEVICE_INFO_CACHE[cache_key]
+        if (now - ts) < 60.0:
+            return cached_ch, cached_sr
+
+    max_ch = 1
+    native_sr = 48000.0
+    try:
+        info = sd.query_devices(device, kind="input") if device is not None else sd.query_devices(kind="input")
+        max_ch = max(1, int(info.get("max_input_channels", 1) or 1))
+        native_sr = float(info.get("default_samplerate", 48000.0) or 48000.0)
+        _DEVICE_INFO_CACHE[cache_key] = (now, max_ch, native_sr)
+    except Exception as q_err:
+        logger.warning(f"[AudioEngine] Query dispositivo input fallita ({q_err}), uso valori standard.")
+
+    return max_ch, native_sr
 
 
 class _StreamResampler:
@@ -129,11 +197,25 @@ class AudioEngine:
         self.device_channels: int = 1
         self.device_samplerate: float = float(self.SAMPLE_RATE)
 
+        # Coda audio decuplicata dal thread real-time PortAudio
+        self._raw_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=1000)
+        self._worker_thread: Optional[threading.Thread] = None
+
+        # Noise floor adattivo per microfoni a basso guadagno (laptop Windows)
+        self._noise_floor: float = 8.0
+
         # Coda vocale per Whisper Large-v3-Turbo
         self.speech_queue: queue.Queue[bytes] = queue.Queue()
 
         # VAD
         self.vad = None
+        # Le impostazioni possono provenire da vecchi file o richieste API non
+        # validate: WebRTC VAD accetta solo livelli 0..3, la UI usa 1..3.
+        try:
+            vad_aggressiveness = max(1, min(3, int(vad_aggressiveness)))
+        except (TypeError, ValueError):
+            vad_aggressiveness = 2
+        self.vad_aggressiveness = vad_aggressiveness
         if webrtcvad:
             try:
                 self.vad = webrtcvad.Vad(vad_aggressiveness)
@@ -153,6 +235,7 @@ class AudioEngine:
         self._speech_frames_count: int = 0
         self._silence_frames_count: int = 0
         self._last_speech_time: float = 0.0
+        self._total_speech_flushes: int = 0
 
         # Filtro High-Pass anti-rumble (80 Hz) con scipy.signal
         self._hp_enabled = False
@@ -176,6 +259,23 @@ class AudioEngine:
         self._stream = None
         self._mock_mic_thread: Optional[threading.Thread] = None
 
+    def set_vad_sensitivity(self, vad_aggressiveness: int) -> None:
+        """
+        Aggiorna in tempo reale la sensibilità del VAD e la soglia RMS senza interrompere la registrazione:
+        1: permissivo (cattura bisbigli e voce lontana del docente, RMS > 45, soglia noise floor 1.5x)
+        2: standard (parlato normale, RMS > 65, soglia noise floor 1.8x)
+        3: reattivo/anti-rumore (aula rumorosa, RMS > 105, soglia noise floor 2.3x)
+        """
+        level = max(1, min(3, int(vad_aggressiveness)))
+        self.vad_aggressiveness = level
+        self.rms_threshold = 45.0 if level == 1 else (105.0 if level == 3 else 65.0)
+        if webrtcvad:
+            try:
+                self.vad = webrtcvad.Vad(level)
+            except Exception as e:
+                logger.warning(f"[AudioEngine] Errore aggiornamento WebRTC VAD: {e}")
+        logger.info(f"[AudioEngine] Sensibilità VAD aggiornata a caldo: livello={level}, soglia RMS={self.rms_threshold}")
+
     def _reset_filter_state(self) -> None:
         """Azzera lo stato del filtro IIR per evitare discontinuità o residui tra registrazioni/pause."""
         if self._hp_enabled and self._hp_b is not None:
@@ -187,82 +287,76 @@ class AudioEngine:
 
     def _open_stream(self):
         """
-        Apre lo stream di input con negoziazione progressiva:
-        1. 16 kHz Mono (standard ideale Whisper/VAD)
-        2. 16 kHz Stereo (richiesto da molti driver WASAPI / USB su Windows)
-        3. Frequenza nativa (es. 48/44.1 kHz) Mono / Stereo con ricampionamento in streaming
+        Apre lo stream audio dal microfono con priorità nativa a zero latenza:
+        - Su Windows: interroga il default WASAPI endpoint e usa samplerate nativo (es. 48kHz)
+          con blocksize=None (evita timeout COM e negoziazioni fallite da 20-40s).
+        - Su macOS / Linux: 16 kHz Mono nativo immediato via CoreAudio / ALSA.
+        - Ricampionamento garantito da _StreamResampler a 16 kHz.
         """
         device = _resolve_input_device()
-        max_ch = 1
-        native_sr = 48000.0
-        try:
-            info = sd.query_devices(device, kind="input") if device is not None else sd.query_devices(kind="input")
-            max_ch = max(1, int(info.get("max_input_channels", 1) or 1))
-            native_sr = float(info.get("default_samplerate", 48000.0) or 48000.0)
-        except Exception as q_err:
-            logger.warning(f"[AudioEngine] Query dispositivo input fallita ({q_err}), uso valori standard.")
+        max_ch, native_sr = _get_cached_device_info(device)
 
-        import sys
+        native_int_sr = int(round(native_sr))
+        preferred_ch = min(2, max_ch)
+
         if sys.platform == "win32":
-            # Su Windows, i driver hardware (WASAPI / Realtek / Intel) operano quasi sempre a 48kHz o 44.1kHz stereo.
-            # Richiedere 16kHz al driver WASAPI genera timeout COM di 4-5s per ciascun tentativo fallito (~20s di freeze iniziale).
-            # Diamo massima priorità al formato nativo del dispositivo (apertura istantanea in <50ms),
-            # demandando il ricampionamento a 16 kHz ad alta precisione a _StreamResampler.
+            # Su Windows WASAPI shared mode:
+            # 1. Native sample rate + canali supportati (preferito stereo/array microfonico) + blocksize=None
+            # 2. Native sample rate + mono (1 ch) + blocksize=None
+            # 3. Dispositivo predefinito generico (device=None)
             candidates = [
-                (int(native_sr), min(2, max_ch)),
-                (int(native_sr), 1),
-                (48000, min(2, max_ch)),
-                (48000, 1),
-                (44100, min(2, max_ch)),
-                (44100, 1),
-                (self.SAMPLE_RATE, min(2, max_ch)),
-                (self.SAMPLE_RATE, 1),
+                (device, native_int_sr, preferred_ch),
+                (device, native_int_sr, 1),
+                (None, native_int_sr, preferred_ch),
+                (None, 48000, preferred_ch),
+                (None, 44100, preferred_ch),
+                (None, self.SAMPLE_RATE, 1),
             ]
         else:
             # Su macOS (CoreAudio) e Linux, la conversione a 16 kHz mono hardware/sistema è nativa e istantanea
             candidates = [
-                (self.SAMPLE_RATE, 1),
-                (self.SAMPLE_RATE, min(2, max_ch)),
-                (int(native_sr), 1),
-                (int(native_sr), min(2, max_ch)),
-                (48000, 1),
-                (48000, min(2, max_ch)),
-                (44100, 1),
-                (44100, min(2, max_ch)),
+                (device, self.SAMPLE_RATE, 1),
+                (device, self.SAMPLE_RATE, preferred_ch),
+                (device, native_int_sr, 1),
+                (device, native_int_sr, preferred_ch),
+                (None, self.SAMPLE_RATE, 1),
             ]
-        # Rimuovi duplicati mantenendo l'ordine di priorità
+
+        # Rimuovi candidati duplicati mantenendo l'ordine di priorità
         unique_candidates = []
         seen = set()
-        for sr, ch in candidates:
-            if (sr, ch) not in seen:
-                seen.add((sr, ch))
-                unique_candidates.append((sr, ch))
+        for dev, sr, ch in candidates:
+            key = (dev, sr, ch)
+            if key not in seen:
+                seen.add(key)
+                unique_candidates.append((dev, sr, ch))
 
         last_err = None
-        for sr, ch in unique_candidates:
-            # Prova prima con blocksize calibrato a 30ms, poi con None (buffer nativo hardware consigliato da WASAPI)
-            for b_size in (int(round(sr * (self.FRAME_MS / 1000.0))), None):
-                try:
-                    stream = sd.InputStream(
-                        device=device,
-                        samplerate=sr,
-                        channels=ch,
-                        dtype="int16",
-                        blocksize=b_size,
-                        callback=self._raw_stream_callback,
-                    )
-                    self.device_samplerate = float(sr)
-                    self.device_channels = ch
-                    if sr != self.SAMPLE_RATE:
-                        logger.info(f"[AudioEngine] Dispositivo aperto a {sr:.0f} Hz ({ch} canali, blocksize={b_size}) con ricampionamento a 16 kHz.")
-                        self._resampler = _StreamResampler(sr, self.SAMPLE_RATE)
-                    else:
-                        logger.info(f"[AudioEngine] Dispositivo aperto a 16 kHz nativi ({ch} canali, blocksize={b_size}).")
-                        self._resampler = None
-                    self._pending = np.zeros(0, dtype=np.float32)
-                    return stream
-                except Exception as e:
-                    last_err = e
+        for dev, sr, ch in unique_candidates:
+            try:
+                # IMPORTANTE: blocksize=None usa il buffer periodico nativo hardware/WASAPI senza forzare
+                # blocchi rigidi che causano timeout COM di 5s o errori AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED.
+                stream = sd.InputStream(
+                    device=dev,
+                    samplerate=sr,
+                    channels=ch,
+                    dtype="int16",
+                    blocksize=None,
+                    latency="low",
+                    callback=self._raw_stream_callback,
+                )
+                self.device_samplerate = float(sr)
+                self.device_channels = ch
+                if sr != self.SAMPLE_RATE:
+                    logger.info(f"[AudioEngine] Dispositivo aperto a {sr:.0f} Hz ({ch} canali) con ricampionamento streaming a 16 kHz.")
+                    self._resampler = _StreamResampler(sr, self.SAMPLE_RATE)
+                else:
+                    logger.info(f"[AudioEngine] Dispositivo aperto a 16 kHz nativi ({ch} canali).")
+                    self._resampler = None
+                self._pending = np.zeros(0, dtype=np.float32)
+                return stream
+            except Exception as e:
+                last_err = e
 
         raise RuntimeError(f"Nessuna configurazione audio hardware supportata dal dispositivo ({last_err})")
 
@@ -275,11 +369,17 @@ class AudioEngine:
         self._last_speech_time = self.started_at
         self._reset_filter_state()
 
+        # Avvia thread worker asincrono per I/O e VAD (non blocca mai il callback PortAudio)
+        self._worker_thread = threading.Thread(target=self._process_audio_worker, daemon=True, name="audio-engine-worker")
+        self._worker_thread.start()
+
         # Prova ad aprire il microfono reale con sounddevice
         if sd:
             try:
                 self._stream = self._open_stream()
                 self._stream.start()
+                self.started_at = time.time()
+                self._last_speech_time = self.started_at
                 logger.info(f"[AudioEngine] Microfono hardware avviato ({self.device_samplerate:.0f}Hz, {self.device_channels}ch) per lezione {self.lecture_id}")
                 return True
             except Exception as e:
@@ -289,6 +389,7 @@ class AudioEngine:
         # Fallback generatore di frame silenziosi (se il mic hardware non è accessibile)
         self._mock_mic_thread = threading.Thread(target=self._run_simulated_mic, daemon=True)
         self._mock_mic_thread.start()
+        self.started_at = time.time()
         logger.info(f"[AudioEngine] Fallback simulato avviato per lezione {self.lecture_id}")
         return True
 
@@ -302,19 +403,56 @@ class AudioEngine:
             logger.error(f"[AudioEngine] Errore scrittura PCM: {e}")
 
     def _raw_stream_callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
-        """Callback universale per cattura audio: gestisce multicanale, frequenze native e ricampionamento."""
+        """Callback universale per cattura audio: ultra-rapido (real-time safe), downmix e accodamento non bloccante."""
         if status:
             logger.debug(f"[AudioEngine] Status sounddevice: {status}")
         if not self.is_running or self.is_paused:
+            # Segnala a PortAudio/CoreAudio di fermare l'AudioUnit dal proprio thread real-time
+            # evitando il deadlock di AudioOutputUnitStop() chiamato da thread esterni su macOS.
+            if sd is not None and hasattr(sd, "CallbackStop"):
+                raise sd.CallbackStop
             return
 
         # 1. Downmix a mono se il flusso hardware è multicanale (stereo / array microfonico)
+        if isinstance(indata, (bytes, bytearray, memoryview)):
+            indata = np.frombuffer(indata, dtype=np.int16)
         if indata.ndim == 2 and indata.shape[1] > 1:
             mono_int16 = np.mean(indata.astype(np.int32), axis=1).astype(np.int16)
         else:
             mono_int16 = indata.reshape(-1).astype(np.int16, copy=False)
 
-        # 2. Se la frequenza nativa è diversa da 16 kHz, ricampiona
+        # 2. Se il worker thread è attivo, delega asincronamente per zero latenza PortAudio
+        if self._worker_thread is not None and self._worker_thread.is_alive():
+            try:
+                self._raw_queue.put_nowait(mono_int16.copy())
+            except queue.Full:
+                pass
+        else:
+            # Fallback sincrono per test unitari diretti o ambienti senza thread
+            self._process_mono_chunk(mono_int16)
+
+    def _process_audio_worker(self) -> None:
+        """Thread worker di background per elaborazione audio, resampling e I/O senza bloccare PortAudio."""
+        while self.is_running:
+            try:
+                mono_chunk = self._raw_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            try:
+                # Elabora sempre il chunk già estratto anche se stop() ha appena azzerato is_running
+                self._process_mono_chunk(mono_chunk, force=not self.is_running)
+            except Exception as exc:
+                logger.debug(f"[AudioEngine Worker] Errore elaborazione: {exc}")
+
+    def _process_mono_chunk(self, mono_int16: np.ndarray, *, force: bool = False) -> None:
+        """Elabora un blocco mono int16: ricampionamento a 16 kHz e suddivisione in frame da 30ms."""
+        if not force and (not self.is_running or self.is_paused):
+            return
+
+        if isinstance(mono_int16, (bytes, bytearray, memoryview)):
+            mono_int16 = np.frombuffer(mono_int16, dtype=np.int16)
+
         if self._resampler is not None:
             out = self._resampler.process(mono_int16)
             buf = np.concatenate([self._pending, out]) if len(self._pending) else out
@@ -322,18 +460,18 @@ class AudioEngine:
             for i in range(n_frames):
                 seg = buf[i * self.SAMPLES_PER_FRAME:(i + 1) * self.SAMPLES_PER_FRAME]
                 frame = np.clip(np.round(seg), -32768, 32767).astype(np.int16)
-                self._process_16k_mono_frame(frame)
+                self._process_16k_mono_frame(frame, force=force)
             self._pending = buf[n_frames * self.SAMPLES_PER_FRAME:].copy()
         else:
-            if len(mono_int16) == self.SAMPLES_PER_FRAME:
-                self._process_16k_mono_frame(mono_int16)
+            if len(mono_int16) == self.SAMPLES_PER_FRAME and len(self._pending) == 0:
+                self._process_16k_mono_frame(mono_int16, force=force)
             else:
                 buf = np.concatenate([self._pending, mono_int16.astype(np.float32, copy=False)]) if len(self._pending) else mono_int16.astype(np.float32, copy=False)
                 n_frames = len(buf) // self.SAMPLES_PER_FRAME
                 for i in range(n_frames):
                     seg = buf[i * self.SAMPLES_PER_FRAME:(i + 1) * self.SAMPLES_PER_FRAME]
                     frame = np.clip(np.round(seg), -32768, 32767).astype(np.int16)
-                    self._process_16k_mono_frame(frame)
+                    self._process_16k_mono_frame(frame, force=force)
                 self._pending = buf[n_frames * self.SAMPLES_PER_FRAME:].copy()
 
     # Alias per compatibilità con test unitari e chiamate dirette
@@ -343,9 +481,9 @@ class AudioEngine:
     def _native_rate_callback(self, indata: np.ndarray, frames: int, time_info, status) -> None:
         self._raw_stream_callback(indata, frames, time_info, status)
 
-    def _process_16k_mono_frame(self, frame: np.ndarray) -> None:
-        """Elabora un singolo frame mono da 480 campioni int16 a 16 kHz (filtro HP, VAD, accumulo)."""
-        if not self.is_running or self.is_paused:
+    def _process_16k_mono_frame(self, frame: np.ndarray, *, force: bool = False) -> None:
+        """Elabora un singolo frame mono da 480 campioni int16 a 16 kHz (filtro HP, VAD con noise floor adattivo, accumulo)."""
+        if not force and (not self.is_running or self.is_paused):
             return
 
         # 1. Filtro High-Pass anti-rumble (80 Hz): rimuove ronzii, ventole e colpi sulla scrivania
@@ -373,19 +511,33 @@ class AudioEngine:
         # 2. Salva sempre tutto il flusso nella registrazione integrale
         self._write_recording(raw_bytes)
 
-        # 3. Analisi VAD ibrida (WebRTC VAD sul segnale pulito + Soglia RMS energetica)
+        # 3. Analisi VAD ibrida adattiva (WebRTC VAD sul segnale pulito + Soglia RMS con Noise Floor)
         vad_active = False
         if self.vad and len(raw_bytes) == self.BYTES_PER_FRAME:
             try:
                 vad_active = self.vad.is_speech(raw_bytes, self.SAMPLE_RATE)
             except Exception:
                 vad_active = False
-            # Se WebRTC VAD rileva fonemi vocali, confermiamo con una soglia minima anti-rumore (35 RMS)
-            # Se WebRTC VAD è incerto, usiamo la soglia energetica rms_threshold
-            is_speech = (vad_active and rms >= 35.0) or (rms >= self.rms_threshold)
+
+        # Adattamento continuo del rumore di fondo (noise floor)
+        # Se non c'è voce evidente o picchi, aggiorna dolcemente la stima del rumore ambientale
+        if not vad_active and rms < max(120.0, self._noise_floor * 1.5):
+            self._noise_floor = self._noise_floor * 0.96 + rms * 0.04
+
+        effective_noise = max(4.0, self._noise_floor)
+
+        # Soglia minima dinamica calcolata sul rumore ambientale locale:
+        # Permette di rilevare la voce anche a 10-15 RMS su laptop Windows a basso guadagno,
+        # respingendo fruscii costanti e rumori di fondo ambientali.
+        if vad_active:
+            # Se WebRTC VAD rileva fonemi vocali, basta superare di poco il rumore di fondo
+            min_rms_vad = max(10.0, effective_noise * 1.15)
+            is_speech = (rms >= min_rms_vad)
         else:
-            # Fallback energetico quando webrtcvad non è presente (es. Windows senza wheel C++)
-            is_speech = (rms >= self.rms_threshold)
+            # Senza WebRTC VAD (o se incerto), serve una variazione energetica significativa sopra il noise floor
+            multiplier = 1.5 if self.rms_threshold <= 45.0 else (2.3 if self.rms_threshold >= 105.0 else 1.8)
+            abs_floor = 16.0 if self.rms_threshold <= 45.0 else (35.0 if self.rms_threshold >= 105.0 else 22.0)
+            is_speech = (rms >= max(abs_floor, effective_noise * multiplier))
 
         now = time.time()
 
@@ -402,10 +554,11 @@ class AudioEngine:
                 self._silence_frames_count = 0
                 self._last_speech_time = now
 
-                # Condizione 1: Finestra temporale continua di 20 secondi (~666 frame x 30ms = 20.0s)
-                if self._speech_frames_count >= 666:
-                    logger.info(f"[AudioEngine] Finestra 20s completata ({self._speech_frames_count * 30 / 1000:.1f}s) -> Invio a Whisper Large Turbo")
-                    overlap = list(self._speech_buffer[-6:]) if len(self._speech_buffer) >= 6 else []
+                # Condizione 1: Finestra temporale continua max 7.5s (250 frame x 30ms = 7.5s)
+                # Evita di accumulare fino a 20s prima di trascrivere se il relatore non fa pause
+                if self._speech_frames_count >= 250:
+                    logger.info(f"[AudioEngine] Finestra 7.5s completata ({self._speech_frames_count * 30 / 1000:.1f}s) -> Invio a Whisper Large Turbo")
+                    overlap = list(self._speech_buffer[-8:]) if len(self._speech_buffer) >= 8 else []
                     self._flush_speech_buffer()
                     self._preroll_buffer.extend(overlap)
 
@@ -417,26 +570,33 @@ class AudioEngine:
                     self._speech_buffer.append(raw_bytes)
                     self._silence_frames_count += 1
 
-                    # Condizione 2: Soglia di Silenzio Adattiva
-                    # - parlato lungo (>= 250 frame ~= 7.5s): basta una pausa di 360ms (12 frame)
-                    # - parlato breve (50..249 frame): attendiamo 510ms (17 frame)
-                    silence_limit = 12 if self._speech_frames_count >= 250 else 17
+                    # Condizione 2: Soglia di Silenzio Adattiva a Bassa Latenza
+                    # - Fast-start (primo blocco della lezione): basta una micro-pausa di 270ms (9 frame) dopo >=25 frame (~750ms) di voce
+                    # - Parlato lungo (>= 150 frame ~= 4.5s): basta una pausa di 330ms (11 frame)
+                    # - Parlato standard: attendiamo 390ms (13 frame) invece di 510ms
+                    is_fast_start = (self._total_speech_flushes == 0 and self._speech_frames_count >= 25)
+                    if is_fast_start:
+                        silence_limit = 9
+                    elif self._speech_frames_count >= 150:
+                        silence_limit = 11
+                    else:
+                        silence_limit = 13
 
                     if self._silence_frames_count >= silence_limit:
                         self.is_voice_active = False
-                        if self._speech_frames_count >= 50:
+                        if self._speech_frames_count >= 12:
                             dur_s = (len(self._speech_buffer) * 30) / 1000.0
                             logger.info(
-                                f"[AudioEngine] Innesco Pausa Docente ({self._silence_frames_count * 30}ms silenzio "
+                                f"[AudioEngine] Innesco Pausa Parlato ({self._silence_frames_count * 30}ms silenzio "
                                 f"dopo ~{dur_s:.1f}s di spiegazione, soglia={silence_limit * 30}ms) -> Invio a Whisper Large Turbo"
                             )
                             self._flush_speech_buffer()
-                        elif self._silence_frames_count >= 40:
-                            # Se il silenzio è superiore a 1.2s e la voce era brevissima (<1.5s)
-                            if self._speech_frames_count >= 30:  # ~1.0s di voce
+                        elif self._silence_frames_count >= 35:
+                            # Se il silenzio è superiore a 1.0s e la voce era brevissima
+                            if self._speech_frames_count >= 8:  # ~240ms di voce
                                 self._flush_speech_buffer()
                             else:
-                                # Rumore isolato o colpo sul tavolo: scarta senza affaticare Whisper
+                                # Micro-rumore isolato (<240ms) seguito da silenzio
                                 self._speech_buffer.clear()
                                 self._speech_frames_count = 0
                                 self._silence_frames_count = 0
@@ -445,10 +605,11 @@ class AudioEngine:
                     self._silence_frames_count += 1
 
     def _flush_speech_buffer(self) -> None:
-        """Chiude il blocco vocale accumulato e lo accoda per Whisper."""
+        """Chiude il blocco vocale accumulato, applica AGC software anti-whisper e lo accoda per Whisper."""
         if not self._speech_buffer:
             return
 
+        self._total_speech_flushes += 1
         chunk_bytes = b"".join(self._speech_buffer)
         self._speech_buffer.clear()
         self._speech_frames_count = 0
@@ -461,10 +622,21 @@ class AudioEngine:
         samples_f = samples.astype(np.float32)
         seg_energy = float(np.dot(samples_f, samples_f))
         seg_rms = float(np.sqrt(seg_energy / len(samples_f)))
-        min_rms = 15.0 if self.vad else 25.0
+        min_rms = 4.0 if self.vad else 8.0
         if seg_rms < min_rms:
             logger.debug(f"[AudioEngine] Blocco ignorato (RMS troppo basso: {seg_rms:.1f})")
             return
+
+        # Normalizzazione digitale automatica del guadagno (AGC) per microfoni a basso volume
+        # (es. laptop Windows/Mac integrati con il prof a distanza o slider volume basso nel sistema operativo):
+        # evita che Whisper riceva audio quasi inudibile (peak < 1000) che porta ad allucinazioni o parole perse.
+        peak = int(np.max(np.abs(samples)))
+        if 30 <= peak < 16000:
+            target_peak = 18000.0
+            boost = min(60.0, target_peak / max(1.0, float(peak)))
+            if boost > 1.15:
+                boosted = np.clip(np.round(samples.astype(np.float32) * boost), -32768, 32767).astype(np.int16)
+                chunk_bytes = boosted.tobytes()
 
         duration_s = len(chunk_bytes) / (self.SAMPLE_RATE * 2)
         self.speech_queue.put(chunk_bytes)
@@ -477,26 +649,83 @@ class AudioEngine:
             except Exception as e:
                 logger.error(f"[AudioEngine] Errore in on_speech_chunk callback: {e}")
 
+    def _close_stream_safely(self, stream) -> None:
+        """
+        Chiude uno stream PortAudio/CoreAudio/WASAPI senza mai bloccare il salvataggio del WAV:
+        1. Attende brevemente (fino a 250ms) che CallbackStop fermi lo stream dal thread CoreAudio.
+        2. Esegue abort/close in un thread helper con timeout massimo di 1.0s, così stop() esporta
+           sempre l'audio registrato su disco anche se il driver hardware macOS impiega tempo.
+        """
+        if stream is None:
+            return
+
+        # 1. Se il callback sta fermando lo stream via CallbackStop, attendi fino a 250ms
+        deadline = time.monotonic() + 0.25
+        while time.monotonic() < deadline:
+            try:
+                if not getattr(stream, "active", False):
+                    break
+            except Exception:
+                break
+            time.sleep(0.01)
+
+        def _do_close() -> None:
+            try:
+                if getattr(stream, "active", True):
+                    if hasattr(stream, "abort"):
+                        stream.abort()
+                    else:
+                        stream.stop()
+            except Exception:
+                try:
+                    stream.stop()
+                except Exception:
+                    pass
+            try:
+                stream.close()
+            except Exception as exc:
+                logger.warning(f"[AudioEngine] Errore chiusura stream: {exc}")
+
+        closer = threading.Thread(target=_do_close, daemon=True, name="audio-stream-closer")
+        closer.start()
+        closer.join(timeout=1.0)
+        if closer.is_alive():
+            logger.warning(
+                "[AudioEngine] Chiusura hardware stream lenta (>1s): procedo subito con salvataggio WAV."
+            )
+
     def pause(self) -> Optional[bytes]:
         """
         Sospende la cattura audio del microfono e restituisce subito l'ultimo frammento:
-        1. Arresta l'ascolto hardware (sounddevice stream).
-        2. Raccoglie tutto il parlato ancora nel buffer (anche solo 2-5 secondi) per Whisper.
-        3. Imposta is_paused = True (0% CPU, 0% microfono).
+        1. Imposta is_paused = True (callback PortAudio diventa no-op immediato).
+        2. Chiude pulitamente lo stream hardware (abort + close) evitando il deadlock CoreAudio stop->start->stop.
+        3. Drena in modo limitato i frammenti già in coda e restituisce il parlato residuo.
         """
         if not self.is_running or self.is_paused:
             return None
 
         self.is_paused = True
         self.is_voice_active = False
-        self._reset_filter_state()
 
-        if self._stream:
+        stream = self._stream
+        self._stream = None
+        if stream is not None:
+            self._was_hardware_stream = True
+            self._close_stream_safely(stream)
+            logger.info(f"[AudioEngine] Stream audio hardware in PAUSA (chiuso pulitamente) per lezione {self.lecture_id}")
+
+        # Drena in modo limitato i frammenti già presenti in coda prima della pausa
+        for _ in range(500):
             try:
-                self._stream.stop()
-                logger.info(f"[AudioEngine] Stream audio hardware in PAUSA per lezione {self.lecture_id}")
-            except Exception as e:
-                logger.warning(f"[AudioEngine] Errore arresto stream per pausa: {e}")
+                chunk = self._raw_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                self._process_mono_chunk(chunk, force=True)
+            except Exception:
+                break
+
+        self._reset_filter_state()
 
         # Estrai l'eventuale parlato residuo rimasto nel buffer in modo thread-safe
         last_audio = None
@@ -511,47 +740,42 @@ class AudioEngine:
         return last_audio
 
     def resume(self) -> bool:
-        """Riattiva la cattura audio hardware dal microfono."""
+        """Riattiva la cattura audio hardware dal microfono aprendo uno stream pulito."""
         if not self.is_running or not self.is_paused:
             return False
 
+        needs_reopen = False
         if self._stream is not None:
-            started = False
             try:
                 self._stream.start()
-                started = True
                 logger.info(f"[AudioEngine] Stream audio hardware RIPRESO per lezione {self.lecture_id}")
             except Exception as e:
-                logger.warning(f"[AudioEngine] Errore ripresa stream con start(): {e}, chiudo preventivamente e riapro...")
-                try:
-                    self._stream.close()
-                except Exception:
-                    pass
+                logger.warning(f"[AudioEngine] Errore ripresa stream con start(): {e}, riapro...")
+                self._close_stream_safely(self._stream)
                 self._stream = None
+                needs_reopen = True
+        elif getattr(self, "_was_hardware_stream", False) and sd is not None:
+            needs_reopen = True
 
-            if not started:
-                reopened = False
-                for attempt in range(3):
-                    # Breve pausa per consentire ai driver audio WASAPI / CoreAudio di svegliarsi dallo sleep dell'OS
-                    time.sleep(0.150)
-                    try:
-                        self._stream = self._open_stream()
-                        if self._stream:
-                            self._stream.start()
-                            reopened = True
-                            logger.info(f"[AudioEngine] Stream audio hardware riaperto con successo al tentativo {attempt + 1}")
-                            break
-                    except Exception as e2:
-                        logger.warning(f"[AudioEngine] Tentativo {attempt + 1} riapertura fallito: {e2}")
-                        if self._stream:
-                            try:
-                                self._stream.close()
-                            except Exception:
-                                pass
-                            self._stream = None
-                if not reopened:
-                    logger.error("[AudioEngine] Impossibile riaprire lo stream: tutti i tentativi falliti")
-                    return False
+        if needs_reopen:
+            reopened = False
+            for attempt in range(3):
+                if attempt > 0:
+                    time.sleep(0.120)
+                try:
+                    self._stream = self._open_stream()
+                    if self._stream:
+                        self._stream.start()
+                        reopened = True
+                        logger.info(f"[AudioEngine] Stream audio hardware riaperto con successo al tentativo {attempt + 1}")
+                        break
+                except Exception as e2:
+                    logger.warning(f"[AudioEngine] Tentativo {attempt + 1} riapertura fallito: {e2}")
+                    self._close_stream_safely(self._stream)
+                    self._stream = None
+            if not reopened:
+                logger.error("[AudioEngine] Impossibile riaprire lo stream: tutti i tentativi falliti")
+                return False
 
         self.is_paused = False
         self.is_voice_active = False
@@ -574,29 +798,45 @@ class AudioEngine:
 
     def stop(self, audio_format: Optional[str] = None) -> str:
         """
-        Interrompe la registrazione ed esporta un file .wav completo nella directory audio.
-        La copia avviene a blocchi da 1 MB (nessuna copia dell'intera lezione in RAM) e il file
-        viene scritto come .part e poi rinominato atomicamente.
+        Interrompe la registrazione in modo istantaneo e non bloccante (abort + close) ed esporta
+        un file .wav completo nella directory audio.
+        La copia avviene a blocchi da 1 MB e il file viene scritto come .part e rinominato atomicamente.
         Restituisce il percorso assoluto del file generato.
         """
+        # 1. Ferma subito i flag così il callback PortAudio termina immediatamente senza accodare altro
         self.is_running = False
+        self.is_paused = True
         self.is_voice_active = False
 
-        if self._stream:
+        # 2. Chiudi subito lo stream hardware con abort() + close() (evita deadlock CoreAudio su macOS)
+        stream = self._stream
+        self._stream = None
+        self._was_hardware_stream = False
+        self._close_stream_safely(stream)
+
+        # 3. Attendi uscita del worker thread prima del drenaggio finale
+        if self._worker_thread and self._worker_thread.is_alive():
             try:
-                self._stream.stop()
+                self._worker_thread.join(timeout=0.5)
             except Exception:
                 pass
-            try:
-                self._stream.close()
-            except Exception as e:
-                logger.warning(f"[AudioEngine] Errore chiusura stream: {e}")
-            self._stream = None
+            self._worker_thread = None
 
         if self._mock_mic_thread:
             self._mock_mic_thread.join(timeout=0.5)
 
-        # Svuota l'ultimo frammento residuo se ha contenuto vocale
+        # 4. Drena in modo limitato gli ultimi frammenti già in coda (force=True perché is_running=False)
+        for _ in range(500):
+            try:
+                chunk = self._raw_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                self._process_mono_chunk(chunk, force=True)
+            except Exception:
+                break
+
+        # 5. Svuota l'ultimo frammento residuo se ha contenuto vocale
         if self._speech_frames_count >= 20:
             self._flush_speech_buffer()
         else:
@@ -614,9 +854,30 @@ class AudioEngine:
             total = self._recorded_bytes
             logger.info(f"[AudioEngine] Esportazione {total} bytes di audio PCM in {output_path}")
             try:
+                gain = 1.0
                 if self._temp_pcm_file and not self._temp_pcm_file.closed:
                     self._temp_pcm_file.flush()
                     self._temp_pcm_file.seek(0)
+                    # 1. Scansione rapida del picco massimo per normalizzazione volume riascolto (Playback AGC)
+                    max_abs = 0
+                    while True:
+                        block = self._temp_pcm_file.read(1024 * 1024)
+                        if not block:
+                            break
+                        i16_block = np.frombuffer(block, dtype=np.int16)
+                        if len(i16_block):
+                            b_max = int(np.max(np.abs(i16_block)))
+                            if b_max > max_abs:
+                                max_abs = b_max
+
+                    # Se la registrazione ha ampiezza ridotta (microfoni a basso guadagno o aula grande),
+                    # applichiamo un guadagno trasparente fino a ~24000 peak evitando di amplificare silenzio digitale puro (< 80)
+                    if 80 <= max_abs < 18000:
+                        gain = min(80.0, 24000.0 / float(max_abs))
+                        logger.info(f"[AudioEngine] Normalizzazione volume riascolto applicata: peak {max_abs} -> ~24000 (gain={gain:.2f}x)")
+
+                    self._temp_pcm_file.seek(0)
+
                 with wave.open(part_path, "wb") as wf:
                     wf.setnchannels(self.CHANNELS)
                     wf.setsampwidth(2)  # 16-bit = 2 bytes
@@ -626,7 +887,12 @@ class AudioEngine:
                             block = self._temp_pcm_file.read(1024 * 1024)
                             if not block:
                                 break
-                            wf.writeframesraw(block)
+                            if gain != 1.0:
+                                i16_block = np.frombuffer(block, dtype=np.int16)
+                                boosted = np.clip(np.round(i16_block.astype(np.float32) * gain), -32768, 32767).astype(np.int16)
+                                wf.writeframesraw(boosted.tobytes())
+                            else:
+                                wf.writeframesraw(block)
                 # Sostituzione atomica con retry difensivo per blocchi file su Windows
                 replaced = False
                 for _ in range(5):

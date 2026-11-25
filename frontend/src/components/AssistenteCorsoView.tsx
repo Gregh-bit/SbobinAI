@@ -1,15 +1,16 @@
-import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
 import {
   PanelLeft,
   Archive,
   BookmarkPlus,
   ChevronDown,
-  ChevronRight,
   AlertTriangle,
   CheckCircle2,
   X,
   Loader2,
   Layers,
+  Cpu,
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import type {
@@ -26,17 +27,32 @@ import type {
 } from '../types';
 import { api } from '../lib/api';
 import { useSettings } from '../lib/SettingsContext';
+import { liquidMenuVariants, liquidPopoverContainerClass } from '../lib/animations';
 import ChatSidebar from './chat/ChatSidebar';
 import ChatMessageItem, { parseThinkingContent } from './chat/ChatMessageItem';
 import ChatComposer from './chat/ChatComposer';
+import { useDelayedLoading, ChatStreamSkeleton } from './Skeleton';
 
 interface AssistenteCorsoViewProps {
   subject: Subject;
   lectures: Lecture[];
   onOpenCitation?: (sourceId: string, page?: number) => void;
+  onOpenAudioSnippet?: (lectureId: number, seconds: number, autoPlay?: boolean) => void;
+  onOpenSettings?: () => void;
   onOpenQuiz?: (quizId: number) => void;
   onOpenOralQuestion?: (question: string, topic?: string) => void;
+  onOpenQuadernoLecture?: (lectureId: number) => void;
   onLectureCreated?: () => void;
+  initialReviewTarget?: {
+    chatSessionId?: number | null;
+    quizId: number;
+    quizTitle: string;
+    score: number;
+    total: number;
+    wrongCount: number;
+    key: number;
+  } | null;
+  onClearInitialReview?: () => void;
 }
 
 const DEFAULT_CONTEXT_STATS: ContextStats = {
@@ -51,6 +67,16 @@ const DEFAULT_CONTEXT_STATS: ContextStats = {
 
 const EMPTY_SCOPE: ChatScope = { lecture_ids: [], material_ids: [] };
 
+// Cache in memoria per materia: evita flash/reload della chat cambiando scheda
+const subjectChatCache = new Map<
+  number,
+  {
+    sessions: ChatSession[];
+    activeSession: ChatSessionDetail | null;
+    materials: CourseMaterial[];
+  }
+>();
+
 function getSaturationTone(percentage: number) {
   if (percentage <= 0) {
     return {
@@ -62,14 +88,14 @@ function getSaturationTone(percentage: number) {
   if (percentage >= 85) {
     return {
       bar: 'bg-rose-500',
-      pill: 'bg-rose-500/12 border-rose-500/30 text-rose-200',
+      pill: 'bg-rose-500/[0.12] border-rose-500/30 text-rose-200',
       dot: 'bg-rose-400',
     };
   }
   if (percentage >= 65) {
     return {
       bar: 'bg-amber-400',
-      pill: 'bg-amber-500/12 border-amber-500/30 text-amber-200',
+      pill: 'bg-amber-500/[0.12] border-amber-500/30 text-amber-200',
       dot: 'bg-amber-400',
     };
   }
@@ -99,30 +125,45 @@ function CompactionDivider({ summary }: { summary?: string }) {
   const [expanded, setExpanded] = useState(false);
 
   return (
-    <div className="my-5 animate-fade-in">
-      <div className="flex items-center gap-3">
-        <div className="h-px flex-1 bg-gradient-to-r from-transparent via-indigo-400/30 to-indigo-400/20" />
+    <div className="my-5 animate-fade-in w-full">
+      <div className="flex items-center gap-3 w-full">
+        <div className="h-px flex-1 bg-gradient-to-r from-transparent via-white/[0.12] to-white/[0.08]" />
         <button
           type="button"
           onClick={() => summary && setExpanded((prev) => !prev)}
           className={clsx(
-            'inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-indigo-500/10 border border-indigo-400/25 text-[11px] font-medium text-indigo-200/90 transition-colors',
-            summary ? 'hover:bg-indigo-500/20 cursor-pointer' : 'cursor-default'
+            'inline-flex items-center gap-1.5 py-1 text-xs text-zinc-400 transition-colors select-none group',
+            summary ? 'hover:text-zinc-200 cursor-pointer' : 'cursor-default opacity-60'
           )}
         >
-          <Archive size={11} className="text-indigo-300" />
-          <span>Contesto precedente compattato — Riassunto attivo in memoria</span>
-          {summary &&
-            (expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />)}
+          <Archive size={13} className="text-zinc-400 group-hover:text-zinc-200 transition-colors flex-shrink-0" />
+          <span className="font-normal">Contesto compattato</span>
+          {summary && (
+            <ChevronDown
+              size={12}
+              className={clsx(
+                'text-zinc-500 group-hover:text-zinc-300 transition-transform duration-200 flex-shrink-0 ml-0.5',
+                expanded && 'rotate-180'
+              )}
+            />
+          )}
         </button>
-        <div className="h-px flex-1 bg-gradient-to-l from-transparent via-indigo-400/30 to-indigo-400/20" />
+        <div className="h-px flex-1 bg-gradient-to-l from-transparent via-white/[0.12] to-white/[0.08]" />
       </div>
 
-      {expanded && summary && (
-        <div className="mt-2.5 mx-auto max-w-2xl rounded-2xl bg-zinc-900/80 border border-indigo-400/20 px-4 py-3 text-xs text-zinc-300 leading-relaxed whitespace-pre-wrap select-text">
-          {summary}
-        </div>
-      )}
+      <AnimatePresence>
+        {expanded && summary && (
+          <motion.div
+            initial={{ opacity: 0, height: 0, y: -4 }}
+            animate={{ opacity: 1, height: 'auto', y: 0 }}
+            exit={{ opacity: 0, height: 0, y: -4 }}
+            transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
+            className="overflow-hidden w-full max-w-2xl mx-auto mt-2.5 rounded-2xl bg-[#121622]/85 border border-white/10 px-4 py-3 text-xs text-zinc-300 leading-relaxed whitespace-pre-wrap select-text"
+          >
+            {summary}
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
@@ -136,23 +177,43 @@ export default function AssistenteCorsoView({
   subject,
   lectures,
   onOpenCitation,
+  onOpenAudioSnippet,
+  onOpenSettings,
   onOpenQuiz,
   onOpenOralQuestion,
+  onOpenQuadernoLecture,
   onLectureCreated,
+  initialReviewTarget,
+  onClearInitialReview,
 }: AssistenteCorsoViewProps) {
+  const initialCache = subjectChatCache.get(subject.id);
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(() =>
     typeof window !== 'undefined' ? window.innerWidth >= 900 : true
   );
-  const [sessions, setSessions] = useState<ChatSession[]>([]);
-  const [activeSession, setActiveSession] = useState<ChatSessionDetail | null>(null);
-  const [materials, setMaterials] = useState<CourseMaterial[]>([]);
+  const [sessions, setSessions] = useState<ChatSession[]>(() => initialCache?.sessions ?? []);
+  const [activeSession, setActiveSession] = useState<ChatSessionDetail | null>(
+    () => initialCache?.activeSession ?? null
+  );
+  const [materials, setMaterials] = useState<CourseMaterial[]>(() => initialCache?.materials ?? []);
 
-  const [isLoadingSessions, setIsLoadingSessions] = useState(true);
+  const [isLoadingSessions, setIsLoadingSessions] = useState(() => !initialCache?.activeSession);
   const [isLoadingSessionDetail, setIsLoadingSessionDetail] = useState(false);
   const [isCreatingSession, setIsCreatingSession] = useState(false);
+  const isChatStreamLoading = isLoadingSessionDetail || (isLoadingSessions && !activeSession);
+  const showChatStreamSkeleton = useDelayedLoading(isChatStreamLoading, 150, 220);
+
+  const { settings } = useSettings();
+  const supportsThinking = settings.llmSupportsThinking !== false;
 
   const [input, setInput] = useState('');
   const [studyMode, setStudyMode] = useState<ChatStudyMode>('auto');
+  const [thinkingMode, setThinkingMode] = useState(false);
+
+  useEffect(() => {
+    if (!supportsThinking && thinkingMode) {
+      setThinkingMode(false);
+    }
+  }, [supportsThinking, thinkingMode]);
   const [streamingMessageId, setStreamingMessageId] = useState<number | null>(null);
   const [savingNoteId, setSavingNoteId] = useState<number | null>(null);
   const [savedNoteIds, setSavedNoteIds] = useState<Record<number, boolean>>({});
@@ -170,10 +231,18 @@ export default function AssistenteCorsoView({
   const [toast, setToast] = useState<{ text: string; tone: 'success' | 'error' } | null>(null);
   const [pendingScope, setPendingScope] = useState<ChatScope | null>(null);
 
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
   const streamEndRef = useRef<HTMLDivElement>(null);
+  const scrolledSessionIdRef = useRef<number | null>(null);
+  const prevMsgCountRef = useRef<number>(0);
+  const nearBottomRef = useRef(true);
+  const clientKeyMapRef = useRef<Map<number, string>>(new Map());
   const abortControllerRef = useRef<AbortController | null>(null);
   const streamTokenRef = useRef(0);
+  const stopSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activeSessionRef = useRef<ChatSessionDetail | null>(activeSession);
   const activeSessionIdRef = useRef<number | null>(null);
+  const sessionsRef = useRef<ChatSession[]>(sessions);
   const loadSeqRef = useRef(0);
   const contextMenuRef = useRef<HTMLDivElement>(null);
   const isMountedRef = useRef(true);
@@ -184,7 +253,9 @@ export default function AssistenteCorsoView({
     prevMessage: PersistentChatMessage;
   } | null>(null);
 
+  activeSessionRef.current = activeSession;
   activeSessionIdRef.current = activeSession?.id ?? null;
+  sessionsRef.current = sessions;
 
   const updatePendingScope = useCallback((next: ChatScope | null) => {
     pendingScopeRef.current = next;
@@ -224,20 +295,30 @@ export default function AssistenteCorsoView({
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  // Close archive modal on Escape key
+  // Close archive modal or context menu on Escape key
   useEffect(() => {
-    if (!archiveModalOpen) return;
+    if (!archiveModalOpen && !contextMenuOpen) return;
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !isArchiving) {
-        setArchiveModalOpen(false);
+      if (e.key === 'Escape') {
+        if (contextMenuOpen) {
+          setContextMenuOpen(false);
+          return;
+        }
+        if (archiveModalOpen && !isArchiving) {
+          setArchiveModalOpen(false);
+        }
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [archiveModalOpen, isArchiving]);
+  }, [archiveModalOpen, contextMenuOpen, isArchiving]);
 
   const abortActiveStream = useCallback(() => {
     streamTokenRef.current += 1;
+    if (stopSyncTimerRef.current !== null) {
+      clearTimeout(stopSyncTimerRef.current);
+      stopSyncTimerRef.current = null;
+    }
     if (abortControllerRef.current) {
       try {
         abortControllerRef.current.abort();
@@ -276,10 +357,18 @@ export default function AssistenteCorsoView({
     abortActiveStream();
     regeneratingSnapshotRef.current = null;
     updatePendingScope(null);
-    setSessions([]);
-    setActiveSession(null);
-    setSavedNoteIds({});
-    setIsLoadingSessions(true);
+    const cached = subjectChatCache.get(subject.id);
+    if (cached?.activeSession) {
+      setSessions(cached.sessions);
+      setActiveSession(cached.activeSession);
+      setMaterials(cached.materials);
+      setIsLoadingSessions(false);
+    } else {
+      setSessions([]);
+      setActiveSession(null);
+      setSavedNoteIds({});
+      setIsLoadingSessions(true);
+    }
 
     const legacyKey = `sbobinai_chat_subject_${subject.id}`;
     const migratedKey = `sbobinai_chat_migrated_${subject.id}`;
@@ -362,12 +451,35 @@ export default function AssistenteCorsoView({
               syncSessionIntoList(resolved);
             }
           } else {
-            const firstDetail = await api.chats.get(list[0].id);
-            if (!cancelled) {
-              const resolved = await applyPendingScopeIfAny(firstDetail);
+            const preferredId =
+              activeSessionIdRef.current && list.some((s) => s.id === activeSessionIdRef.current)
+                ? activeSessionIdRef.current
+                : list[0].id;
+            try {
+              const firstDetail = await api.chats.get(preferredId);
               if (!cancelled) {
-                setActiveSession(resolved);
-                syncSessionIntoList(resolved);
+                const resolved = await applyPendingScopeIfAny(firstDetail);
+                if (!cancelled) {
+                  setActiveSession(resolved);
+                  syncSessionIntoList(resolved);
+                }
+              }
+            } catch {
+              if (!cancelled && list.length > 1 && preferredId !== list[0].id) {
+                try {
+                  const fallbackDetail = await api.chats.get(list[0].id);
+                  if (!cancelled) {
+                    const resolved = await applyPendingScopeIfAny(fallbackDetail);
+                    if (!cancelled) {
+                      setActiveSession(resolved);
+                      syncSessionIntoList(resolved);
+                    }
+                  }
+                } catch {
+                  if (!cancelled) setActiveSession(null);
+                }
+              } else if (!cancelled) {
+                setActiveSession(null);
               }
             }
           }
@@ -378,12 +490,10 @@ export default function AssistenteCorsoView({
             setActiveSession(resolved);
           }
         } else {
-          const initialScope = pendingScopeRef.current || undefined;
-          updatePendingScope(null);
-          const created = await api.chats.create(subject.id, initialScope ? { scope: initialScope } : undefined);
+          // Nessuna chat presente: stato iniziale pulito senza creare sessioni vuote nel database
           if (!cancelled) {
-            setSessions([toSessionSummary(created)]);
-            setActiveSession(created);
+            setSessions([]);
+            setActiveSession(null);
           }
         }
       } catch (err: any) {
@@ -403,10 +513,55 @@ export default function AssistenteCorsoView({
     };
   }, [subject.id, abortActiveStream, syncSessionIntoList, showToast, updatePendingScope]);
 
-  // Smooth auto-scroll when messages update or streaming starts
+  // Sincronizza la cache in memoria per la materia corrente (evita flash cambiando tab)
   useEffect(() => {
-    streamEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [activeSession?.id, activeSession?.messages.length, streamingMessageId]);
+    if (sessions.length > 0 || activeSession) {
+      subjectChatCache.set(subject.id, { sessions, activeSession, materials });
+    } else {
+      subjectChatCache.delete(subject.id);
+    }
+  }, [subject.id, sessions, activeSession, materials]);
+
+  const handleScroll = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    nearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  }, []);
+
+  // Posizionamento istantaneo in fondo PRIMA del paint quando si apre/cambia chat (zero scroll visibile),
+  // e scroll fluido durante invio, streaming e arrivo token.
+  useLayoutEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el || isLoadingSessionDetail || showChatStreamSkeleton) return;
+
+    const currentSessionId = activeSession?.id ?? null;
+    const msgCount = activeSession?.messages.length ?? 0;
+
+    if (currentSessionId !== scrolledSessionIdRef.current) {
+      if (currentSessionId !== null && msgCount > 0) {
+        el.scrollTop = el.scrollHeight;
+        scrolledSessionIdRef.current = currentSessionId;
+        prevMsgCountRef.current = msgCount;
+        nearBottomRef.current = true;
+      } else if (currentSessionId !== null) {
+        scrolledSessionIdRef.current = currentSessionId;
+        prevMsgCountRef.current = 0;
+        nearBottomRef.current = true;
+      }
+      return;
+    }
+
+    if (nearBottomRef.current) {
+      const raf = requestAnimationFrame(() => {
+        if (scrollContainerRef.current && nearBottomRef.current) {
+          scrollContainerRef.current.scrollTop = scrollContainerRef.current.scrollHeight;
+        }
+      });
+      prevMsgCountRef.current = msgCount;
+      return () => cancelAnimationFrame(raf);
+    }
+    prevMsgCountRef.current = msgCount;
+  }, [activeSession?.id, activeSession?.messages, streamingMessageId, isLoadingSessionDetail, showChatStreamSkeleton]);
 
   const handleSelectSession = async (sessionId: number) => {
     if (sessionId === activeSessionIdRef.current && activeSession) return;
@@ -469,25 +624,38 @@ export default function AssistenteCorsoView({
   };
 
   const handleDeleteSession = async (sessionId: number) => {
-    if (activeSessionIdRef.current === sessionId) {
+    const isDeletingActive =
+      activeSessionIdRef.current === sessionId || activeSession?.id === sessionId;
+
+    if (isDeletingActive) {
       abortActiveStream();
     }
+
     try {
       await api.chats.delete(sessionId);
       if (!isMountedRef.current) return;
-      const remaining = sessions.filter((s) => s.id !== sessionId);
+
+      const remaining = sessionsRef.current.filter((s) => s.id !== sessionId);
+      sessionsRef.current = remaining;
       setSessions(remaining);
 
-      if (activeSessionIdRef.current === sessionId) {
-        if (remaining.length > 0) {
+      // Se non ci sono più chat per questa materia, azzera completamente la sessione attiva e la cache
+      if (remaining.length === 0) {
+        setActiveSession(null);
+        subjectChatCache.delete(subject.id);
+        return;
+      }
+
+      // Se la chat eliminata era quella aperta a schermo, passa alla prima chat rimanente
+      if (isDeletingActive) {
+        try {
           const nextDetail = await api.chats.get(remaining[0].id);
           if (!isMountedRef.current) return;
           setActiveSession(nextDetail);
-        } else {
-          const fresh = await api.chats.create(subject.id);
-          if (!isMountedRef.current) return;
-          setSessions([toSessionSummary(fresh)]);
-          setActiveSession(fresh);
+        } catch {
+          if (isMountedRef.current) {
+            setActiveSession(null);
+          }
         }
       }
     } catch (err: any) {
@@ -594,15 +762,46 @@ export default function AssistenteCorsoView({
         });
       };
 
+      let tokenRafId: number | null = null;
+      let pendingBufferUpdate = false;
+
+      const flushTokenUpdate = () => {
+        if (!pendingBufferUpdate) return;
+        pendingBufferUpdate = false;
+        const parsed = parseThinkingContent(rawBuffer);
+        setActiveSession((prev) => {
+          if (!prev || prev.id !== chatId) return prev;
+          return {
+            ...prev,
+            messages: prev.messages.map((m) =>
+              m.id === currentAssistantId
+                ? {
+                    ...m,
+                    content: rawBuffer,
+                    thinking: parsed.thinking || m.thinking,
+                  }
+                : m
+            ),
+          };
+        });
+      };
+
       try {
         await invoke((ev) => {
           if (!isCurrentContext()) return;
 
           if (ev.type === 'meta') {
+            if (tokenRafId !== null) {
+              cancelAnimationFrame(tokenRafId);
+              tokenRafId = null;
+            }
+            flushTokenUpdate();
             setActiveSession((prev) => {
               if (!prev || prev.id !== chatId) return prev;
               const updatedMsgs = prev.messages.map((m) => {
                 if (optimisticUserId !== undefined && m.id === optimisticUserId) {
+                  const stableKey = clientKeyMapRef.current.get(optimisticUserId);
+                  if (stableKey) clientKeyMapRef.current.set(ev.user_message.id, stableKey);
                   return ev.user_message;
                 }
                 if (m.id === currentAssistantId) {
@@ -625,27 +824,26 @@ export default function AssistenteCorsoView({
 
           if (ev.type === 'token') {
             rawBuffer += ev.text;
-            const parsed = parseThinkingContent(rawBuffer);
-            setActiveSession((prev) => {
-              if (!prev || prev.id !== chatId) return prev;
-              return {
-                ...prev,
-                messages: prev.messages.map((m) =>
-                  m.id === currentAssistantId
-                    ? {
-                        ...m,
-                        content: rawBuffer,
-                        thinking: parsed.thinking || m.thinking,
-                      }
-                    : m
-                ),
-              };
-            });
+            pendingBufferUpdate = true;
+            if (tokenRafId === null) {
+              tokenRafId = requestAnimationFrame(() => {
+                tokenRafId = null;
+                flushTokenUpdate();
+              });
+            }
             return;
           }
 
           if (ev.type === 'action') {
+            if (tokenRafId !== null) {
+              cancelAnimationFrame(tokenRafId);
+              tokenRafId = null;
+            }
+            flushTokenUpdate();
             streamAction = ev.action;
+            if (ev.action?.type === 'saved_to_quaderno') {
+              onLectureCreated?.();
+            }
             setActiveSession((prev) => {
               if (!prev || prev.id !== chatId) return prev;
               return {
@@ -659,6 +857,11 @@ export default function AssistenteCorsoView({
           }
 
           if (ev.type === 'done') {
+            if (tokenRafId !== null) {
+              cancelAnimationFrame(tokenRafId);
+              tokenRafId = null;
+            }
+            flushTokenUpdate();
             const finalizedMsg: PersistentChatMessage = {
               ...ev.assistant_message,
               followups:
@@ -667,11 +870,26 @@ export default function AssistenteCorsoView({
                   : ev.followups || [],
               action: ev.assistant_message.action ?? streamAction ?? null,
             };
+            const stableKey = clientKeyMapRef.current.get(targetAssistantId);
+            if (stableKey) clientKeyMapRef.current.set(finalizedMsg.id, stableKey);
             currentAssistantId = finalizedMsg.id;
+
+            const currentSession = activeSessionRef.current;
+            const nextDetailForSync: ChatSessionDetail | null =
+              currentSession && currentSession.id === chatId
+                ? {
+                    ...currentSession,
+                    title: ev.session_title || currentSession.title,
+                    context_stats: ev.context_stats,
+                    messages: currentSession.messages.map((m) =>
+                      m.id === targetAssistantId || m.id === finalizedMsg.id ? finalizedMsg : m
+                    ),
+                  }
+                : null;
 
             setActiveSession((prev) => {
               if (!prev || prev.id !== chatId) return prev;
-              const nextDetail: ChatSessionDetail = {
+              return {
                 ...prev,
                 title: ev.session_title || prev.title,
                 context_stats: ev.context_stats,
@@ -679,9 +897,11 @@ export default function AssistenteCorsoView({
                   m.id === targetAssistantId || m.id === finalizedMsg.id ? finalizedMsg : m
                 ),
               };
-              syncSessionIntoList(nextDetail, true);
-              return nextDetail;
             });
+
+            if (nextDetailForSync) {
+              syncSessionIntoList(nextDetailForSync, true);
+            }
             return;
           }
 
@@ -694,6 +914,11 @@ export default function AssistenteCorsoView({
         if (!isCurrentContext()) return;
         handleStreamFailure(String(err?.message || err), true);
       } finally {
+        if (tokenRafId !== null) {
+          cancelAnimationFrame(tokenRafId);
+          tokenRafId = null;
+        }
+        flushTokenUpdate();
         if (streamTokenRef.current === myStreamToken) {
           abortControllerRef.current = null;
           regeneratingSnapshotRef.current = null;
@@ -706,13 +931,18 @@ export default function AssistenteCorsoView({
     [syncSessionIntoList, showToast]
   );
 
-  const handleSend = async (overrideText?: string, overrideMode?: ChatStudyMode) => {
+  const handleSend = async (
+    overrideText?: string,
+    overrideMode?: ChatStudyMode,
+    explicitSession?: ChatSessionDetail
+  ) => {
     const rawText = (overrideText ?? input).trim();
     const effectiveMode = overrideMode ?? studyMode;
-    const text = rawText || (effectiveMode === 'quiz' ? 'Genera un quiz a scelta multipla sui temi principali del corso' : '');
-    if (!text || streamingMessageId !== null) return;
+    const hasMode = effectiveMode && effectiveMode !== 'auto';
+    if (!rawText && !hasMode) return;
+    if (streamingMessageId !== null) return;
 
-    let targetSession = activeSession;
+    let targetSession = explicitSession || activeSessionRef.current || activeSession;
 
     if (!targetSession) {
       try {
@@ -737,11 +967,15 @@ export default function AssistenteCorsoView({
     const tempAssistantId = tempUserId - 1;
     const nowIso = new Date().toISOString();
 
+    clientKeyMapRef.current.set(tempUserId, `client-msg-${tempUserId}`);
+    clientKeyMapRef.current.set(tempAssistantId, `client-msg-${tempAssistantId}`);
+    nearBottomRef.current = true;
+
     const optimisticUser: PersistentChatMessage = {
       id: tempUserId,
       session_id: targetSession.id,
       role: 'user',
-      content: text,
+      content: rawText,
       thinking: '',
       mode: effectiveMode,
       context_used: '',
@@ -767,7 +1001,10 @@ export default function AssistenteCorsoView({
       created_at: nowIso,
     };
 
-    if (!overrideText) setInput('');
+    if (!overrideText) {
+      setInput('');
+      setStudyMode('auto');
+    }
     setStreamingMessageId(tempAssistantId);
     setActiveSession((prev) =>
       prev && prev.id === targetSession!.id
@@ -785,12 +1022,71 @@ export default function AssistenteCorsoView({
       invoke: (onEvent, signal) =>
         api.chats.streamMessage(
           chatId,
-          { message: text, mode: effectiveMode, scope },
+          {
+            message: rawText,
+            mode: effectiveMode,
+            scope,
+            enable_thinking: supportsThinking && thinkingMode,
+          },
           onEvent,
           signal
         ),
     });
   };
+
+  const lastReviewKeyRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (!initialReviewTarget || lastReviewKeyRef.current === initialReviewTarget.key) return;
+    lastReviewKeyRef.current = initialReviewTarget.key;
+
+    const runReviewHandoff = async () => {
+      const { chatSessionId, quizTitle, score, total } = initialReviewTarget;
+      onClearInitialReview?.();
+
+      let targetSession = activeSession;
+      if (chatSessionId && (!targetSession || targetSession.id !== chatSessionId)) {
+        try {
+          const detail = await api.chats.get(chatSessionId);
+          if (isMountedRef.current) {
+            setActiveSession(detail);
+            syncSessionIntoList(detail);
+            targetSession = detail;
+          }
+        } catch {
+          // fallback
+        }
+      } else if (!chatSessionId) {
+        try {
+          const cleanTitle = `Ripasso: ${quizTitle.replace(/^Quiz:\s*/i, '')}`.slice(0, 100);
+          const fresh = await api.chats.create(subject.id, { title: cleanTitle });
+          if (isMountedRef.current) {
+            setActiveSession(fresh);
+            syncSessionIntoList(fresh, true);
+            targetSession = fresh;
+          }
+        } catch (err: any) {
+          console.warn('[Assistente] Errore avvio sessione ripasso:', err);
+        }
+      }
+
+      const percent = total > 0 ? Math.round((score / total) * 100) : 0;
+      let reviewPrompt = '';
+      if (score === total) {
+        reviewPrompt = `Ho completato il quiz "${quizTitle}" con il punteggio massimo (${score}/${total}, 100%)! Quali argomenti correlati possiamo approfondire per prepararmi all'esame?`;
+      } else {
+        reviewPrompt = `Ho completato il quiz "${quizTitle}" con un punteggio di ${score} su ${total} (${percent}%). Aiutami a ripassare dove ho sbagliato e a capire i concetti chiave.`;
+      }
+
+      setTimeout(() => {
+        if (isMountedRef.current) {
+          void handleSend(reviewPrompt, 'auto', targetSession || undefined);
+        }
+      }, 150);
+    };
+
+    void runReviewHandoff();
+  }, [initialReviewTarget, activeSession, subject.id, onClearInitialReview, handleSelectSession]);
 
   const handleRegenerate = async (messageId: number) => {
     if (!activeSession || streamingMessageId !== null || messageId <= 0) return;
@@ -825,11 +1121,17 @@ export default function AssistenteCorsoView({
       targetAssistantId: messageId,
       prevMessage,
       invoke: (onEvent, signal) =>
-        api.chats.regenerateStream(chatId, messageId, onEvent, signal),
+        api.chats.regenerateStream(
+          chatId,
+          messageId,
+          onEvent,
+          signal,
+          supportsThinking && thinkingMode
+        ),
     });
   };
 
-  const handleEditMessage = async (messageId: number, newText: string) => {
+  const handleEditMessage = async (messageId: number, newText: string, rollbackQuiz: boolean = true) => {
     const text = newText.trim();
     if (!activeSession || streamingMessageId !== null || messageId <= 0 || !text) return;
 
@@ -839,6 +1141,8 @@ export default function AssistenteCorsoView({
     const userMsg = activeSession.messages[userIdx];
     const tempAssistantId = -Date.now();
     const nowIso = new Date().toISOString();
+    clientKeyMapRef.current.set(tempAssistantId, `client-msg-${tempAssistantId}`);
+    nearBottomRef.current = true;
 
     const updatedUserMsg: PersistentChatMessage = {
       ...userMsg,
@@ -886,7 +1190,13 @@ export default function AssistenteCorsoView({
         api.chats.editAndStreamMessage(
           chatId,
           messageId,
-          { message: text, mode: effectiveMode, scope },
+          {
+            message: text,
+            mode: effectiveMode,
+            scope,
+            enable_thinking: supportsThinking && thinkingMode,
+            rollback_quiz: rollbackQuiz,
+          },
           onEvent,
           signal
         ),
@@ -895,6 +1205,7 @@ export default function AssistenteCorsoView({
 
   const handleStopStream = () => {
     const activeMsgId = streamingMessageId;
+    const sessionIdToRefresh = activeSession?.id ?? activeSessionIdRef.current;
     const regenSnap = regeneratingSnapshotRef.current;
     regeneratingSnapshotRef.current = null;
     abortActiveStream();
@@ -947,6 +1258,56 @@ export default function AssistenteCorsoView({
       });
     }
     api.ai.stop(true).catch(() => {});
+
+    // Quietly refresh persisted messages so any negative optimistic temp IDs
+    // get replaced with real positive SQLite IDs (re-enabling Regenerate/Delete/SaveNote).
+    if (sessionIdToRefresh != null) {
+      const refreshToken = streamTokenRef.current;
+      stopSyncTimerRef.current = setTimeout(() => {
+        stopSyncTimerRef.current = null;
+        if (
+          !isMountedRef.current ||
+          activeSessionIdRef.current !== sessionIdToRefresh ||
+          streamTokenRef.current !== refreshToken
+        ) {
+          return;
+        }
+        void api.chats
+          .get(sessionIdToRefresh)
+          .then((detail) => {
+            if (
+              !isMountedRef.current ||
+              activeSessionIdRef.current !== detail.id ||
+              streamTokenRef.current !== refreshToken
+            ) {
+              return;
+            }
+            setActiveSession((prev) => {
+              if (!prev || prev.id !== detail.id) return prev;
+              if (detail.messages.length >= prev.messages.length) {
+                return detail;
+              }
+              const persistedByRoleAndContent = new Map<string, PersistentChatMessage>();
+              for (const m of detail.messages) {
+                persistedByRoleAndContent.set(`${m.role}:${m.content}`, m);
+              }
+              const mergedMessages = prev.messages.map((m) => {
+                if (m.id > 0) {
+                  return detail.messages.find((dm) => dm.id === m.id) || m;
+                }
+                const matched = persistedByRoleAndContent.get(`${m.role}:${m.content}`);
+                return matched || m;
+              });
+              return {
+                ...detail,
+                messages: mergedMessages,
+              };
+            });
+            syncSessionIntoList(detail);
+          })
+          .catch(() => {});
+      }, 250);
+    }
   };
 
   const handleSaveNote = async (messageId: number) => {
@@ -1084,7 +1445,6 @@ export default function AssistenteCorsoView({
     }
   };
 
-  const { settings } = useSettings();
   const hasInstalledLLM = Boolean(settings.llmDownloaded);
 
   const contextStats = activeSession?.context_stats || DEFAULT_CONTEXT_STATS;
@@ -1097,7 +1457,6 @@ export default function AssistenteCorsoView({
   const saturationPct = isZeroSaturation
     ? 0
     : Math.min(100, Math.max(0, Math.round(contextStats.percentage || 0)));
-  const effectiveUsedTokens = isZeroSaturation ? 0 : contextStats.used_tokens;
   const saturationTone = getSaturationTone(saturationPct);
   const showSaturationBanner =
     !isZeroSaturation && (contextStats.needs_compaction || saturationPct >= 75);
@@ -1162,7 +1521,7 @@ export default function AssistenteCorsoView({
             </button>
             <div className="min-w-0">
               <div className="flex items-center gap-1.5 text-xs font-medium text-zinc-200 truncate">
-                <span className="truncate">{activeSession?.title || 'Assistente del Corso'}</span>
+                <span className="truncate">{activeSession?.title || 'Nuova chat'}</span>
                 <span className="text-zinc-600 hidden sm:inline">·</span>
                 <span className="text-zinc-400 font-normal truncate hidden sm:inline">
                   {subject.name}
@@ -1171,124 +1530,209 @@ export default function AssistenteCorsoView({
             </div>
           </div>
 
-          {/* Calm Default Context Saturation Pill + Actions */}
-          <div ref={contextMenuRef} className="relative flex items-center gap-2 flex-shrink-0">
-            <button
-              type="button"
-              onClick={() => setContextMenuOpen((prev) => !prev)}
-              title="Stato memoria contesto e azioni di compattazione"
-              className={clsx(
-                'flex items-center gap-2 px-3 py-1.5 rounded-full border text-[11px] font-medium transition-all cursor-pointer',
-                saturationTone.pill,
-                'hover:brightness-110'
-              )}
-            >
-              <span className={clsx('w-1.5 h-1.5 rounded-full', saturationTone.dot)} />
-              <div className="w-12 h-1.5 rounded-full bg-white/10 overflow-hidden hidden sm:block">
-                <div
-                  className={clsx('h-full rounded-full transition-all duration-300', saturationTone.bar)}
-                  style={{ width: `${saturationPct}%` }}
-                />
-              </div>
-              <span className="tabular-nums">
-                {!hasInstalledLLM ? (
-                  <>
-                    <span className="text-zinc-400 font-normal hidden md:inline">Nessun LLM scaricato · </span>
-                    0 / {contextStats.max_tokens.toLocaleString('it-IT')} (0%)
-                  </>
-                ) : (
-                  `${effectiveUsedTokens.toLocaleString('it-IT')} / ${contextStats.max_tokens.toLocaleString('it-IT')} (${saturationPct}%)`
+          {/* Spazio Chat (Visibile SOLO quando un modello LLM è installato) */}
+          {hasInstalledLLM && (
+            <div ref={contextMenuRef} className="relative flex items-center gap-2 flex-shrink-0">
+              <motion.button
+                type="button"
+                layout
+                transition={{
+                  type: 'spring',
+                  stiffness: 420,
+                  damping: 32,
+                  mass: 0.8,
+                }}
+                onClick={() => setContextMenuOpen((prev) => !prev)}
+                title={contextMenuOpen ? "Chiudi (Esc)" : "Stato della memoria e opzioni per liberare spazio"}
+                className={clsx(
+                  'relative h-7 rounded-full flex items-center justify-center select-none cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-white/40',
+                  contextMenuOpen
+                    ? 'w-7 liquid-glass border border-white/[0.22] text-white hover:bg-white/[0.14] shadow-liquid-sm'
+                    : clsx('px-2.5 border text-[11px] font-medium hover:brightness-110 shadow-sm', saturationTone.pill)
                 )}
-              </span>
-              <ChevronDown size={12} className="opacity-70" />
-            </button>
-
-            {contextMenuOpen && (
-              <div className="absolute right-0 top-full mt-2 w-72 rounded-2xl bg-zinc-900/95 border border-white/12 shadow-2xl backdrop-blur-xl p-2 z-40 animate-fade-in">
-                <div className="px-2.5 py-1.5 border-b border-white/[0.07] mb-1">
-                  <div className="flex items-center justify-between text-[11px] text-zinc-300 font-medium">
-                    <span>Saturazione finestra contesto</span>
-                    <span className="tabular-nums">{saturationPct}%</span>
-                  </div>
-                  <div className="w-full h-1.5 rounded-full bg-white/10 overflow-hidden mt-1.5">
-                    <div
-                      className={clsx('h-full rounded-full transition-all', saturationTone.bar)}
-                      style={{ width: `${saturationPct}%` }}
-                    />
-                  </div>
-                  <p className="text-[10px] text-zinc-400 mt-1.5">
-                    {!hasInstalledLLM
-                      ? 'Nessun LLM scaricato — barra inattiva (0 token)'
-                      : `${contextStats.active_messages_count} messaggi attivi${
-                          contextStats.compacted_messages_count > 0
-                            ? ` · ${contextStats.compacted_messages_count} compattati`
-                            : ''
-                        }`}
-                  </p>
-                </div>
-
-                <button
-                  type="button"
-                  disabled={!activeSession || isCompacting || streamingMessageId !== null || messages.length === 0}
-                  onClick={() => void handleCompactContext()}
-                  className="w-full flex items-start gap-2.5 px-2.5 py-2 rounded-xl text-left text-zinc-200 hover:bg-white/[0.07] transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-                >
-                  {isCompacting ? (
-                    <Loader2 size={14} className="mt-0.5 text-indigo-300 animate-spin flex-shrink-0" />
+                whileHover={{ scale: 1.03 }}
+                whileTap={{ scale: 0.96 }}
+              >
+                <AnimatePresence mode="popLayout" initial={false}>
+                  {contextMenuOpen ? (
+                    <motion.div
+                      key="close"
+                      initial={{ opacity: 0, scale: 0.85, rotate: -45 }}
+                      animate={{ opacity: 1, scale: 1, rotate: 0 }}
+                      exit={{ opacity: 0, scale: 0.85, rotate: 45 }}
+                      transition={{ duration: 0.16, ease: 'easeOut' }}
+                      className="w-7 h-7 flex items-center justify-center flex-shrink-0"
+                    >
+                      <X size={13} strokeWidth={2.3} className="text-white" />
+                    </motion.div>
                   ) : (
-                    <Layers size={14} className="mt-0.5 text-indigo-300 flex-shrink-0" />
-                  )}
-                  <div>
-                    <div className="text-xs font-medium">Compatta contesto</div>
-                    <div className="text-[10px] text-zinc-400 leading-snug">
-                      Riassume i messaggi precedenti liberando token in memoria
-                    </div>
-                  </div>
-                </button>
+                    <motion.div
+                      key="pill"
+                      initial={{ opacity: 0, scale: 0.88 }}
+                      animate={{ opacity: 1, scale: 1 }}
+                      exit={{ opacity: 0, scale: 0.88 }}
+                      transition={{ duration: 0.16, ease: 'easeOut' }}
+                      className="flex items-center gap-1.5 whitespace-nowrap overflow-hidden flex-shrink-0"
+                    >
+                      {/* Indicatore circolare SVG che si riempie */}
+                      <div className="relative w-3.5 h-3.5 flex items-center justify-center flex-shrink-0">
+                        <svg className="w-full h-full -rotate-90" viewBox="0 0 36 36">
+                          <circle
+                            cx="18"
+                            cy="18"
+                            r="14"
+                            fill="none"
+                            stroke="rgba(255, 255, 255, 0.16)"
+                            strokeWidth="4"
+                          />
+                          <circle
+                            cx="18"
+                            cy="18"
+                            r="14"
+                            fill="none"
+                            stroke={
+                              saturationPct < 60
+                                ? '#34d399' // Smeraldo / Verde
+                                : saturationPct < 85
+                                ? '#fbbf24' // Ambra / Giallo
+                                : '#f43f5e' // Rosa-Rosso
+                            }
+                            strokeWidth="4"
+                            strokeDasharray="87.96"
+                            strokeDashoffset={Math.max(0, 87.96 - (87.96 * saturationPct) / 100)}
+                            strokeLinecap="round"
+                            className="transition-all duration-500 ease-out"
+                          />
+                        </svg>
+                      </div>
 
-                <button
-                  type="button"
-                  disabled={!activeSession || streamingMessageId !== null || messages.length === 0}
-                  onClick={openArchiveModal}
-                  className="w-full flex items-start gap-2.5 px-2.5 py-2 rounded-xl text-left text-zinc-200 hover:bg-white/[0.07] transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-                >
-                  <BookmarkPlus size={14} className="mt-0.5 text-emerald-300 flex-shrink-0" />
-                  <div>
-                    <div className="text-xs font-medium">Salva nel Quaderno (DB) e Cancella</div>
-                    <div className="text-[10px] text-zinc-400 leading-snug">
-                      Esporta la chat come capitolo nel Quaderno e libera la finestra
+                      <span>Spazio</span>
+                      <span className="tabular-nums text-white/70 font-normal">
+                        {saturationPct}%
+                      </span>
+                      <ChevronDown
+                        size={11}
+                        className="opacity-60"
+                      />
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </motion.button>
+
+              {/* Menu a Bolla Liquid Glass con animazione spring standard */}
+              <AnimatePresence>
+                {contextMenuOpen && (
+                  <motion.div
+                    variants={liquidMenuVariants}
+                    initial="initial"
+                    animate="animate"
+                    exit="exit"
+                    style={{ transformOrigin: 'top right' }}
+                    className={clsx(
+                      "absolute right-0 top-full mt-2 w-80 max-w-[calc(100vw-2rem)]",
+                      liquidPopoverContainerClass,
+                      "p-3.5 space-y-3"
+                    )}
+                  >
+                    {/* Header memoria */}
+                    <div className="px-1 py-1 space-y-2">
+                      <div className="flex items-center justify-between text-xs font-semibold text-white">
+                        <span>Memoria della chat</span>
+                        <span className="tabular-nums font-mono text-white/80">
+                          {saturationPct}%
+                        </span>
+                      </div>
+
+                      {/* Barra di riempimento precisa */}
+                      <div className="w-full h-2 rounded-full bg-white/10 overflow-hidden p-0.5">
+                        <div
+                          className={clsx(
+                            'h-full rounded-full transition-all duration-300',
+                            saturationTone.bar
+                          )}
+                          style={{ width: `${Math.max(4, saturationPct)}%` }}
+                        />
+                      </div>
+
+                      <p className="text-[11px] text-white/60 leading-relaxed bg-white/[0.03] p-2.5 rounded-2xl border border-white/[0.06]">
+                        {saturationPct >= 80
+                          ? "La memoria è quasi piena. Libera spazio o archivia la chat nel Quaderno per continuare a ricevere risposte accurate."
+                          : "Man mano che la conversazione cresce, la memoria si riempie. Puoi compattarla o salvarla nel Quaderno in ogni momento."}
+                      </p>
                     </div>
-                  </div>
-                </button>
-              </div>
-            )}
-          </div>
+
+                    {/* Azioni rapide */}
+                    <div className="space-y-1.5 border-t border-white/[0.08] pt-2.5">
+                      <button
+                        type="button"
+                        disabled={
+                          !activeSession || isCompacting || streamingMessageId !== null || messages.length === 0
+                        }
+                        onClick={() => void handleCompactContext()}
+                        className="w-full flex items-start gap-3 p-2.5 rounded-2xl text-left text-zinc-100 hover:bg-white/[0.08] transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed group"
+                      >
+                        <div className="w-8 h-8 rounded-xl bg-indigo-500/20 border border-indigo-400/30 flex items-center justify-center text-indigo-300 flex-shrink-0 mt-0.5 group-hover:scale-105 transition-transform">
+                          {isCompacting ? (
+                            <Loader2 size={15} className="animate-spin text-indigo-300" />
+                          ) : (
+                            <Layers size={15} />
+                          )}
+                        </div>
+                        <div className="min-w-0">
+                          <div className="text-xs font-semibold text-white">Libera memoria (Compatta)</div>
+                          <div className="text-[11px] text-white/50 leading-snug mt-0.5">
+                            Riassume i messaggi precedenti e fa spazio per continuare a chattare
+                          </div>
+                        </div>
+                      </button>
+
+                      <button
+                        type="button"
+                        disabled={!activeSession || streamingMessageId !== null || messages.length === 0}
+                        onClick={openArchiveModal}
+                        className="w-full flex items-start gap-3 p-2.5 rounded-2xl text-left text-zinc-100 hover:bg-white/[0.08] transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed group"
+                      >
+                        <div className="w-8 h-8 rounded-xl bg-emerald-500/20 border border-emerald-400/30 flex items-center justify-center text-emerald-300 flex-shrink-0 mt-0.5 group-hover:scale-105 transition-transform">
+                          <BookmarkPlus size={15} />
+                        </div>
+                        <div className="min-w-0">
+                          <div className="text-xs font-semibold text-white">Salva nel Quaderno</div>
+                          <div className="text-[11px] text-white/50 leading-snug mt-0.5">
+                            Trasforma la discussione in un appunto del corso.
+                          </div>
+                        </div>
+                      </button>
+                    </div>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+          )}
         </header>
 
-        {/* Subtle Saturation Warning Banner when >= 75% or needs_compaction */}
+        {/* Apple Liquid Glass Subtle Context Saturation Pill */}
         {showSaturationBanner && (
-          <div className="px-4 sm:px-6 py-2 bg-amber-500/10 border-b border-amber-500/20 flex flex-wrap items-center justify-between gap-2 text-xs animate-fade-in">
-            <div className="flex items-center gap-2 text-amber-200">
-              <AlertTriangle size={14} className="text-amber-400 flex-shrink-0" />
-              <span>
-                Memoria della conversazione al {saturationPct}%. Compatta il contesto o salva nel
-                Quaderno per mantenere massima precisione.
+          <div className="px-6 py-2 bg-white/[0.02] border-b border-white/[0.06] flex items-center justify-between gap-3 text-xs text-zinc-400 flex-shrink-0 animate-fade-in backdrop-blur-sm select-none">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="w-1.5 h-1.5 rounded-full bg-amber-400/90 flex-shrink-0 animate-pulse" />
+              <span className="truncate">
+                Memoria conversazione quasi piena ({saturationPct}%)
               </span>
             </div>
-            <div className="flex items-center gap-1.5">
+            <div className="flex items-center gap-2 flex-shrink-0">
               <button
                 type="button"
                 disabled={isCompacting || streamingMessageId !== null}
                 onClick={() => void handleCompactContext()}
-                className="px-2.5 py-1 rounded-full bg-amber-500/20 hover:bg-amber-500/30 text-amber-100 border border-amber-400/30 text-[11px] font-medium transition-colors cursor-pointer disabled:opacity-50"
+                className="px-2.5 py-1 rounded-full bg-white/[0.06] hover:bg-white/[0.12] text-zinc-200 hover:text-white border border-white/[0.10] text-[11px] font-medium transition-all cursor-pointer disabled:opacity-40"
               >
-                {isCompacting ? 'Compattazione...' : 'Compatta contesto'}
+                {isCompacting ? 'Compattazione...' : 'Compatta'}
               </button>
               <button
                 type="button"
                 disabled={streamingMessageId !== null}
                 onClick={openArchiveModal}
-                className="px-2.5 py-1 rounded-full bg-white/[0.07] hover:bg-white/[0.12] text-zinc-100 border border-white/15 text-[11px] font-medium transition-colors cursor-pointer"
+                className="text-[11px] text-zinc-400 hover:text-zinc-200 transition-colors cursor-pointer px-1.5 py-1"
               >
                 Salva nel Quaderno
               </button>
@@ -1304,7 +1748,7 @@ export default function AssistenteCorsoView({
                 'inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full border shadow-xl backdrop-blur-md text-xs font-medium',
                 toast.tone === 'error'
                   ? 'bg-rose-950/90 border-rose-500/40 text-rose-200'
-                  : 'bg-zinc-900/95 border-emerald-500/35 text-emerald-200'
+                  : 'bg-[#121622]/[0.96] border-white/[0.14] text-emerald-200'
               )}
             >
               {toast.tone === 'error' ? <AlertTriangle size={13} /> : <CheckCircle2 size={13} />}
@@ -1314,13 +1758,14 @@ export default function AssistenteCorsoView({
         )}
 
         {/* Centered Reading Stream */}
-        <div className="flex-1 overflow-y-auto py-6">
+        <div ref={scrollContainerRef} onScroll={handleScroll} className="flex-1 overflow-y-auto [scrollbar-gutter:stable] py-6">
           <div className="max-w-3xl mx-auto w-full px-4 sm:px-6">
-            {isLoadingSessionDetail ? (
-              <div className="py-16 flex flex-col items-center justify-center gap-3 text-zinc-400 text-xs">
-                <Loader2 size={20} className="animate-spin text-emerald-400" />
-                <span>Caricamento conversazione...</span>
-              </div>
+            {isChatStreamLoading || showChatStreamSkeleton ? (
+              showChatStreamSkeleton ? (
+                <ChatStreamSkeleton />
+              ) : (
+                <div className="min-h-[240px]" aria-busy="true" />
+              )
             ) : messages.length === 0 ? (
               /* Empty Welcome State: Pure ChatGPT 2026 Style */
               <div className="py-24 sm:py-32 flex flex-col items-center text-center animate-fade-in max-w-md mx-auto select-none">
@@ -1330,32 +1775,53 @@ export default function AssistenteCorsoView({
                 <p className="text-xs sm:text-sm text-zinc-400 mt-2.5 leading-relaxed font-normal">
                   Chiedi spiegazioni sulle lezioni di <span className="text-zinc-200 font-medium">{subject.name}</span>, approfondisci i materiali o crea un quiz.
                 </p>
+                {!hasInstalledLLM && onOpenSettings && (
+                  <button
+                    type="button"
+                    onClick={onOpenSettings}
+                    className="mt-4 px-3.5 py-1.5 rounded-full bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 text-amber-200 text-xs font-medium transition-all flex items-center gap-2 cursor-pointer shadow-sm select-none"
+                  >
+                    <Cpu size={13} className="text-amber-300" />
+                    <span>Scarica un modello LLM nelle Impostazioni</span>
+                  </button>
+                )}
               </div>
             ) : (
-              <div className="space-y-6 pb-4">
-                {messages.map((msg, idx) => (
-                  <div key={msg.id}>
-                    <ChatMessageItem
-                      message={msg}
-                      isStreamingThis={streamingMessageId === msg.id}
-                      isAnyStreaming={streamingMessageId !== null}
-                      isLastAssistant={msg.id === lastAssistantMessageId}
-                      isSavedToQuaderno={Boolean(savedNoteIds[msg.id])}
-                      isSavingNote={savingNoteId === msg.id}
-                      isDeleting={deletingMessageId === msg.id}
-                      onOpenCitation={onOpenCitation}
-                      onOpenQuiz={onOpenQuiz}
-                      onOpenOralQuestion={onOpenOralQuestion}
-                      onRegenerate={(id) => void handleRegenerate(id)}
-                      onSaveNote={(id) => void handleSaveNote(id)}
-                      onDelete={(id) => void handleDeleteMessage(id)}
-                      onEdit={(id, newText) => void handleEditMessage(id, newText)}
-                    />
-                    {idx === lastCompactedIndex && (
-                      <CompactionDivider summary={activeSession?.compacted_summary} />
-                    )}
-                  </div>
-                ))}
+              <div className="space-y-6 pb-6">
+                {messages.map((msg, idx) => {
+                  const itemKey = clientKeyMapRef.current.get(msg.id) || `msg-${msg.id}`;
+                  const subsequentMessages = messages.slice(idx + 1);
+                  const hasSubsequentQuizActions = subsequentMessages.some(
+                    (m) => m.role === 'assistant' && m.action && (m.action.type === 'quiz_created' || m.action.type === 'quiz_deleted')
+                  );
+                  return (
+                    <div key={itemKey}>
+                      <ChatMessageItem
+                        message={msg}
+                        isStreamingThis={streamingMessageId === msg.id}
+                        isAnyStreaming={streamingMessageId !== null}
+                        isLastAssistant={msg.id === lastAssistantMessageId}
+                        isSavedToQuaderno={Boolean(savedNoteIds[msg.id])}
+                        isSavingNote={savingNoteId === msg.id}
+                        isDeleting={deletingMessageId === msg.id}
+                        hasSubsequentQuizActions={hasSubsequentQuizActions}
+                        onOpenCitation={onOpenCitation}
+                        onOpenAudioSnippet={onOpenAudioSnippet}
+                        onOpenSettings={onOpenSettings}
+                        onOpenQuiz={onOpenQuiz}
+                        onOpenOralQuestion={onOpenOralQuestion}
+                        onOpenQuadernoLecture={onOpenQuadernoLecture}
+                        onRegenerate={(id) => void handleRegenerate(id)}
+                        onSaveNote={(id) => void handleSaveNote(id)}
+                        onDelete={(id) => void handleDeleteMessage(id)}
+                        onEdit={(id, newText, rollbackQuiz) => void handleEditMessage(id, newText, rollbackQuiz)}
+                      />
+                      {idx === lastCompactedIndex && (
+                        <CompactionDivider summary={activeSession?.compacted_summary} />
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             )}
             <div ref={streamEndRef} />
@@ -1373,6 +1839,9 @@ export default function AssistenteCorsoView({
           subjectName={subject.name}
           studyMode={studyMode}
           onStudyModeChange={setStudyMode}
+          thinkingMode={thinkingMode}
+          onThinkingModeChange={setThinkingMode}
+          supportsThinking={supportsThinking}
           scope={activeSession?.scope || pendingScope || EMPTY_SCOPE}
           onScopeChange={(nextScope) => void handleScopeChange(nextScope)}
           lectures={lectures}
@@ -1380,7 +1849,7 @@ export default function AssistenteCorsoView({
         />
       </div>
 
-      {/* Lightweight Archive to Quaderno Modal */}
+      {/* Salva nel Quaderno Modal */}
       {archiveModalOpen && (
         <div
           onClick={(e) => {
@@ -1388,80 +1857,112 @@ export default function AssistenteCorsoView({
               setArchiveModalOpen(false);
             }
           }}
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 backdrop-blur-sm p-4 animate-fade-in"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 backdrop-blur-md p-4 animate-fade-in select-none"
         >
-          <div className="w-full max-w-md rounded-3xl bg-zinc-900 border border-white/12 shadow-2xl p-5 space-y-4">
-            <div className="flex items-start justify-between gap-3">
+          <div className="w-full max-w-md rounded-2xl liquid-modal border border-white/[0.14] shadow-liquid-lg p-5 space-y-4 animate-scale-up">
+            <div className="flex items-start justify-between gap-3 border-b border-white/[0.08] pb-3">
               <div>
-                <h3 className="text-sm font-semibold text-zinc-100">
-                  Salva conversazione nel Quaderno
+                <h3 className="text-sm font-semibold text-white">
+                  Salva nel Quaderno
                 </h3>
-                <p className="text-xs text-zinc-400 mt-0.5">
-                  L&apos;IA trasformerà la chat in un capitolo ordinato salvato nel DB del corso.
+                <p className="text-xs text-white/50 mt-0.5">
+                  Esporta la conversazione negli appunti del corso.
                 </p>
               </div>
               <button
                 type="button"
                 onClick={() => !isArchiving && setArchiveModalOpen(false)}
-                className="p-1.5 rounded-full text-zinc-400 hover:text-zinc-100 hover:bg-white/[0.08] cursor-pointer"
+                className="w-7 h-7 rounded-xl flex items-center justify-center text-white/40 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer"
               >
                 <X size={15} />
               </button>
             </div>
 
             <div className="space-y-1.5">
-              <label className="text-[11px] font-medium text-zinc-300">
-                Titolo capitolo nel Quaderno
+              <label className="text-xs font-medium text-white/80">
+                Titolo
               </label>
               <input
                 type="text"
                 value={archiveTitle}
                 onChange={(e) => setArchiveTitle(e.target.value)}
-                placeholder="Es. Riepilogo Teorema di Bayes"
-                className="w-full rounded-xl bg-zinc-950/80 border border-white/12 px-3 py-2 text-xs text-zinc-100 placeholder-zinc-500 focus:outline-none focus:border-emerald-400/50 select-text"
+                placeholder="Es. Sintesi della discussione"
+                className="w-full rounded-xl liquid-input px-3.5 py-2.5 text-xs text-white placeholder-white/30 focus:outline-none select-text"
               />
             </div>
 
-            <div className="space-y-2">
-              <button
-                type="button"
+            <div className="space-y-2 pt-1">
+              {/* Opzione 1: Salva e pulisci chat */}
+              <div
+                role="button"
+                tabIndex={0}
                 onClick={() => setArchiveMode('quaderno_and_clear')}
                 className={clsx(
-                  'w-full p-3 rounded-2xl border text-left transition-all cursor-pointer',
+                  'w-full p-3 rounded-xl border text-left transition-all cursor-pointer flex items-start gap-3 select-none',
                   archiveMode === 'quaderno_and_clear'
-                    ? 'bg-emerald-500/12 border-emerald-400/35 text-zinc-100'
-                    : 'bg-white/[0.03] border-white/[0.08] text-zinc-300 hover:bg-white/[0.06]'
+                    ? 'bg-emerald-500/[0.12] border-emerald-400/40 text-white shadow-liquid-xs'
+                    : 'bg-white/[0.03] border-white/[0.08] text-white/70 hover:bg-white/[0.06] hover:border-white/[0.14]'
                 )}
               >
-                <div className="text-xs font-medium">Salva nel Quaderno e pulisci chat</div>
-                <div className="text-[11px] text-zinc-400 mt-0.5">
-                  Crea il capitolo nel Quaderno e azzera la finestra di contesto per continuare.
+                <div className={clsx(
+                  'w-4 h-4 rounded-full border mt-0.5 flex items-center justify-center flex-shrink-0 transition-colors',
+                  archiveMode === 'quaderno_and_clear'
+                    ? 'border-emerald-400 bg-emerald-400'
+                    : 'border-white/30 bg-transparent'
+                )}>
+                  {archiveMode === 'quaderno_and_clear' && (
+                    <div className="w-1.5 h-1.5 rounded-full bg-black" />
+                  )}
                 </div>
-              </button>
+                <div className="min-w-0 flex-1">
+                  <div className="text-xs font-semibold text-white">
+                    Salva e pulisci chat
+                  </div>
+                  <div className="text-[11px] text-white/50 mt-0.5 leading-relaxed">
+                    Crea il capitolo nel Quaderno e azzera la chat per continuare.
+                  </div>
+                </div>
+              </div>
 
-              <button
-                type="button"
+              {/* Opzione 2: Salva una copia e mantieni chat */}
+              <div
+                role="button"
+                tabIndex={0}
                 onClick={() => setArchiveMode('quaderno_keep')}
                 className={clsx(
-                  'w-full p-3 rounded-2xl border text-left transition-all cursor-pointer',
+                  'w-full p-3 rounded-xl border text-left transition-all cursor-pointer flex items-start gap-3 select-none',
                   archiveMode === 'quaderno_keep'
-                    ? 'bg-emerald-500/12 border-emerald-400/35 text-zinc-100'
-                    : 'bg-white/[0.03] border-white/[0.08] text-zinc-300 hover:bg-white/[0.06]'
+                    ? 'bg-emerald-500/[0.12] border-emerald-400/40 text-white shadow-liquid-xs'
+                    : 'bg-white/[0.03] border-white/[0.08] text-white/70 hover:bg-white/[0.06] hover:border-white/[0.14]'
                 )}
               >
-                <div className="text-xs font-medium">Salva una copia e mantieni chat</div>
-                <div className="text-[11px] text-zinc-400 mt-0.5">
-                  Esporta gli appunti nel Quaderno mantenendo intatta la conversazione attuale.
+                <div className={clsx(
+                  'w-4 h-4 rounded-full border mt-0.5 flex items-center justify-center flex-shrink-0 transition-colors',
+                  archiveMode === 'quaderno_keep'
+                    ? 'border-emerald-400 bg-emerald-400'
+                    : 'border-white/30 bg-transparent'
+                )}>
+                  {archiveMode === 'quaderno_keep' && (
+                    <div className="w-1.5 h-1.5 rounded-full bg-black" />
+                  )}
                 </div>
-              </button>
+                <div className="min-w-0 flex-1">
+                  <div className="text-xs font-semibold text-white">
+                    Salva una copia e mantieni chat
+                  </div>
+                  <div className="text-[11px] text-white/50 mt-0.5 leading-relaxed">
+                    Esporta gli appunti nel Quaderno mantenendo intatta la chat.
+                  </div>
+                </div>
+              </div>
             </div>
 
-            <div className="flex items-center justify-end gap-2 pt-1">
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-white/[0.08]">
               <button
                 type="button"
                 disabled={isArchiving}
                 onClick={() => setArchiveModalOpen(false)}
-                className="px-4 py-2 rounded-full bg-white/[0.05] hover:bg-white/[0.10] text-xs font-medium text-zinc-300 transition-colors cursor-pointer disabled:opacity-50"
+                className="px-4 py-2 rounded-xl text-xs font-medium text-white/60 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer disabled:opacity-50"
               >
                 Annulla
               </button>
@@ -1469,7 +1970,7 @@ export default function AssistenteCorsoView({
                 type="button"
                 disabled={isArchiving}
                 onClick={() => void handleConfirmArchive()}
-                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-full bg-emerald-500 hover:bg-emerald-400 text-zinc-950 text-xs font-semibold transition-colors cursor-pointer disabled:opacity-50"
+                className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl bg-white text-[#0d1017] hover:bg-white/90 text-xs font-semibold transition-all cursor-pointer shadow-liquid-sm disabled:opacity-50"
               >
                 {isArchiving && <Loader2 size={13} className="animate-spin" />}
                 <span>{isArchiving ? 'Salvataggio...' : 'Salva nel Quaderno'}</span>

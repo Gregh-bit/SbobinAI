@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -61,6 +62,15 @@ class LiveSession:
         self.full_transcript: list[str] = []
         self.detected_questions: list[dict] = []
 
+        # File temporaneo su disco per recupero progressivo in caso di crash/spegnimento
+        try:
+            from config import get_audio_dir
+            audio_dir = get_audio_dir()
+            os.makedirs(audio_dir, exist_ok=True)
+            self.recovery_transcript_path = os.path.join(audio_dir, f"lecture_{lecture_id}.partial.txt")
+        except Exception:
+            self.recovery_transcript_path = None
+
         # Motore audio in RAM con VAD configurato
         self.audio_engine: AudioEngine = AudioEngine(
             lecture_id=lecture_id,
@@ -104,8 +114,9 @@ class LiveSession:
         return len(self.detected_questions) < initial_len
 
     def start_audio(self) -> None:
-        """Avvia la cattura audio."""
+        """Avvia la cattura audio e sincronizza il timestamp d'inizio effettivo."""
         self.audio_engine.start()
+        self.started_at = self.audio_engine.started_at
 
     def push_transcript(self, text: str) -> None:
         """Aggiunge un blocco definitivo di testo al ring buffer e alla trascrizione integrale."""
@@ -119,6 +130,14 @@ class LiveSession:
         chunk = TranscriptChunk(text=clean_text, timestamp=now)
         self._buffer.append(chunk)
         self.full_transcript.append(clean_text)
+
+        # Scrittura progressiva su disco (recovery anti-crash)
+        if self.recovery_transcript_path:
+            try:
+                with open(self.recovery_transcript_path, "a", encoding="utf-8") as rf:
+                    rf.write(f"{clean_text}\n")
+            except Exception:
+                pass
 
         # Rimuovi chunk piu vecchi di RING_BUFFER_SECONDS calcolati sul tempo effettivo di lezione
         cutoff = now - RING_BUFFER_SECONDS
@@ -136,6 +155,56 @@ class LiveSession:
         snapshot = list(self._buffer)
         recent = [c.text for c in snapshot if c.timestamp >= cutoff]
         return " ".join(recent)
+
+    def get_timestamped_recent_context(
+        self,
+        minutes: int = RING_BUFFER_MINUTES,
+        max_chars: int = 4500,
+    ) -> str:
+        """
+        Restituisce la trascrizione live degli ultimi `minutes` minuti annotata con
+        timestamp assoluto [MM:SS] e distanza temporale relativa (es. '2 min fa'),
+        così l'LLM risponde con precisione anche a domande temporali ('cosa ho detto 2 minuti fa?').
+        """
+        now = self.elapsed_seconds()
+        cutoff = now - (minutes * 60)
+        snapshot = list(self._buffer)
+        recent = [c for c in snapshot if c.timestamp >= cutoff and c.text.strip()]
+        if not recent and self.full_transcript:
+            # Fallback se il buffer circolare è vuoto ma esiste testo trascritto
+            tail_text = " ".join(self.full_transcript[-20:]).strip()
+            return tail_text[-max_chars:] if tail_text else ""
+        if not recent:
+            return ""
+
+        def _fmt_mmss(sec: float) -> str:
+            total = max(0, int(round(sec)))
+            m, s = divmod(total, 60)
+            return f"{m:02d}:{s:02d}"
+
+        def _fmt_ago(delta_sec: float) -> str:
+            delta = max(0, int(round(delta_sec)))
+            if delta < 15:
+                return "appena detto"
+            if delta < 60:
+                return f"{delta} sec fa"
+            mins = int(round(delta / 60.0))
+            return f"{mins} min fa"
+
+        header = f"[Tempo attuale della lezione: {_fmt_mmss(now)}]"
+        lines: list[str] = []
+        used_chars = len(header) + 1
+        # Accumula dal più recente al più vecchio rispettando max_chars, poi inverti in ordine cronologico
+        for chunk in reversed(recent):
+            delta = max(0.0, now - chunk.timestamp)
+            line = f"[{_fmt_mmss(chunk.timestamp)} | {_fmt_ago(delta)}] {chunk.text.strip()}"
+            if lines and used_chars + len(line) + 1 > max_chars:
+                break
+            lines.append(line)
+            used_chars += len(line) + 1
+
+        lines.reverse()
+        return header + "\n" + "\n".join(lines)
 
     def get_full_transcript(self) -> str:
         return " ".join(self.full_transcript)
@@ -183,7 +252,19 @@ class LiveSession:
             except Exception as e:
                 logger.debug(f"[LiveSession] Errore release memory: {e}")
 
+        # Rimozione file recovery temporaneo al completamento pulito della sessione
+        if getattr(self, "recovery_transcript_path", None) and os.path.exists(self.recovery_transcript_path):
+            try:
+                os.remove(self.recovery_transcript_path)
+            except Exception:
+                pass
+
         return audio_path
+
+    def update_vad_sensitivity(self, level: int) -> None:
+        """Aggiorna in tempo reale la sensibilità del VAD e la soglia RMS sulla registrazione attiva."""
+        if hasattr(self, "audio_engine") and self.audio_engine:
+            self.audio_engine.set_vad_sensitivity(level)
 
 
 # ── Registry globale delle sessioni attive ──────────────────────────────────────
@@ -216,12 +297,24 @@ def start_session(
         vad_sensitivity=vad_sensitivity,
     )
     session.start_audio()
+    # Pre-riscaldamento asincrono immediato: carica Whisper in RAM prima dell'arrivo del parlato
+    if hasattr(session, "transcriber") and session.transcriber:
+        try:
+            session.transcriber.preload_model_background()
+        except Exception as e:
+            logger.debug(f"[LiveSession] Preload background: {e}")
+
     _active_sessions[subject_id] = session
     return session
 
 
 def get_session(subject_id: int) -> Optional[LiveSession]:
     return _active_sessions.get(subject_id)
+
+
+def get_all_sessions() -> Dict[int, LiveSession]:
+    """Restituisce un dizionario con tutte le sessioni live registrate."""
+    return dict(_active_sessions)
 
 
 def has_active_sessions() -> bool:

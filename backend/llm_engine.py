@@ -57,11 +57,50 @@ SUPPORTED_LLM_MODELS = {
 LLM_CONTEXT_TOKENS = int(os.environ.get("SBOBINAI_LLM_CTX", "8192"))
 USABLE_CHAT_CONTEXT_TOKENS = max(2048, LLM_CONTEXT_TOKENS - 2048)
 
+_TOKENIZER_CACHE: Dict[str, Any] = {}
 
-def estimate_tokens(text: str) -> int:
-    """Stima rapida del numero di token di un testo (~3 caratteri per token per italiano/LaTeX)."""
+
+def estimate_tokens(text: str, model_id: Optional[str] = None) -> int:
+    """
+    Calcola il numero EFFETTIVO di token se il modello LLM è scaricato o caricato in RAM,
+    altrimenti calcola la stima empirica (~3 caratteri per token per italiano/LaTeX).
+    """
     if not text or not text.strip():
         return 0
+
+    # 1. Se il tokenizer è già caldo in RAM per inferenza attiva
+    global _loaded_tokenizer, _TOKENIZER_CACHE
+    if _loaded_tokenizer is not None:
+        try:
+            if hasattr(_loaded_tokenizer, "encode"):
+                return len(_loaded_tokenizer.encode(text))
+            elif hasattr(_loaded_tokenizer, "tokenize"):
+                return len(_loaded_tokenizer.tokenize(text.encode("utf-8")))
+        except Exception:
+            pass
+
+    # 2. Se il modello è scaricato in locale su disco, usa il tokenizer HuggingFace/MLX reale
+    target_id = resolve_llm_model(model_id)
+    if target_id not in _TOKENIZER_CACHE:
+        try:
+            _, local_path = _resolve_model_path(target_id)
+            if local_path and os.path.exists(local_path):
+                from transformers import AutoTokenizer
+                tok = AutoTokenizer.from_pretrained(local_path, local_files_only=True)
+                _TOKENIZER_CACHE[target_id] = tok
+            else:
+                _TOKENIZER_CACHE[target_id] = None
+        except Exception:
+            _TOKENIZER_CACHE[target_id] = None
+
+    tok = _TOKENIZER_CACHE.get(target_id)
+    if tok is not None:
+        try:
+            return len(tok.encode(text))
+        except Exception:
+            pass
+
+    # 3. Fallback se nessun modello è scaricato
     return max(1, (len(text) + 2) // 3)
 
 # ── Soglie Map-Reduce per sintesi di lezioni lunghe ───────────────────────────
@@ -79,8 +118,8 @@ class LLMModelNotDownloadedError(FileNotFoundError):
     """Il modello LLM richiesto non è presente in locale."""
 
 
-# ── Stato Singleton del Modello in RAM & Auto-Unload Inattività (120s) ────────
-INACTIVITY_TIMEOUT_SECONDS = 120.0
+# ── Stato Singleton del Modello in RAM & Auto-Unload Inattività (300s) ────────
+INACTIVITY_TIMEOUT_SECONDS = 300.0
 
 _model_lock = threading.RLock()
 _loaded_model: Optional[Any] = None
@@ -191,6 +230,11 @@ def stop_all_ai(force_unload: bool = True) -> Dict[str, Any]:
     }
 
 
+def cancel_active_generations() -> None:
+    """Interrompe immediatamente qualsiasi generazione LLM attiva senza scaricare il modello dalla RAM."""
+    stop_all_ai(force_unload=False)
+
+
 def clear_metal_cache() -> None:
     """Rilascia la memoria di calcolo temporanea (Metal su Apple Silicon) ed esegue la GC."""
     if USE_MLX:
@@ -198,7 +242,7 @@ def clear_metal_cache() -> None:
             import mlx.core as mx
             if hasattr(mx, "clear_cache"):
                 mx.clear_cache()
-            if hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
+            elif hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
                 mx.metal.clear_cache()
         except Exception as exc:
             logger.debug(f"[LLM Engine] clear_cache: {exc}")
@@ -337,16 +381,30 @@ def is_model_downloaded(model_id: str) -> bool:
 
 
 def resolve_llm_model(model_id: Optional[str] = None) -> str:
-    """Risolve il modello LLM da utilizzare: model_id esplicito -> impostazioni utente -> DEFAULT_LLM_MODEL."""
+    """Risolve il modello LLM da utilizzare con fallback intelligente a qualsiasi modello scaricato."""
     if model_id:
-        return model_id
+        if is_model_downloaded(model_id):
+            return model_id
     try:
         from config import load_settings
         settings_model = load_settings().get("llm_model")
-        if settings_model:
+        if settings_model and is_model_downloaded(str(settings_model)):
             return str(settings_model)
     except Exception:
+        settings_model = None
+
+    # Fallback prioritario: se un qualsiasi altro modello LLM è scaricato in locale, usa quello!
+    try:
+        for spec in ai_models.CATALOG.values():
+            if spec.type == "llm" and ai_models.is_downloaded(spec)[0]:
+                return spec.id
+    except Exception:
         pass
+
+    if model_id:
+        return model_id
+    if settings_model:
+        return str(settings_model)
     return DEFAULT_LLM_MODEL
 
 
@@ -420,7 +478,9 @@ class _GGUFChatTokenizer:
             text = "".join(parts)
             if add_generation_prompt:
                 text += "<|im_start|>assistant\n"
-                if kwargs.get("enable_thinking") is False:
+                if kwargs.get("enable_thinking") is True:
+                    text += "<think>\n"
+                elif kwargs.get("enable_thinking") is False:
                     text += "<think>\n\n</think>\n\n"
         return text
 
@@ -614,20 +674,52 @@ def get_or_load_model(model_id: Optional[str] = None) -> Tuple[Any, Any]:
     return model, tokenizer
 
 
-# ── Pulizia output & Disattivazione Thinking per Risposte Flash ─────────────────
+# ── Pulizia output & Gestione Thinking (Qwen 3.5 / Gemma 4) ────────────────────
+
+THINKING_TOKEN_BUDGET = 4096
+
+_THINK_TAG_PAIRS: Tuple[Tuple[str, str], ...] = (
+    ("<think>", "</think>"),
+    ("<|channel>thought", "<channel|>"),
+    ("<|thought|>", "<|/thought|>"),
+)
+
 
 def _clean_thinking_artifacts(text: str) -> str:
-    """Rimuove eventuali tag <think>...</think> o sezioni 'Thinking Process:'."""
+    """Rimuove eventuali blocchi di reasoning interno (Qwen <think>, Gemma <|channel>thought / <|thought|>)."""
     cleaned = re.sub(r"<think>[\s\S]*?</think>", "", text)
     cleaned = re.sub(r"<think>[\s\S]*$", "", cleaned)
+    cleaned = re.sub(r"<\|channel>thought[\s\S]*?<channel\|>", "", cleaned)
+    cleaned = re.sub(r"<\|channel>thought[\s\S]*$", "", cleaned)
+    cleaned = re.sub(r"<\|thought\|>[\s\S]*?<\|/thought\|>", "", cleaned)
+    cleaned = re.sub(r"<\|thought\|>[\s\S]*$", "", cleaned)
     cleaned = re.sub(r"(?i)^Thinking Process:[\s\S]*?(?=\n# |\n## |\n---|\Z)", "", cleaned)
     return cleaned.strip()
 
 
-def _format_chat_prompt(tokenizer: Any, messages: list[dict], fallback_str: str) -> str:
+def _detect_opened_think_tag(prompt_str: str) -> Optional[str]:
     """
-    Formatta il prompt chat del modello (Qwen 3.5 / Gemma 4) disattivando esplicitamente
-    la modalità thinking per eliminare latenza e generare subito l'output utile.
+    Se il chat template ha già aperto un blocco di ragionamento in fondo al prompt
+    senza chiuderlo, restituisce il relativo tag di chiusura nativo (altrimenti None).
+    """
+    tail = prompt_str[-64:] if len(prompt_str) > 64 else prompt_str
+    for open_tag, close_tag in _THINK_TAG_PAIRS:
+        idx = tail.rfind(open_tag)
+        if idx != -1 and close_tag not in tail[idx + len(open_tag):]:
+            return close_tag
+    return None
+
+
+def _format_chat_prompt(
+    tokenizer: Any,
+    messages: list[dict],
+    fallback_str: str,
+    *,
+    enable_thinking: bool = False,
+) -> str:
+    """
+    Formatta il prompt chat del modello (Qwen 3.5 / Gemma 4) controllando esplicitamente
+    la modalità thinking (disattivata di default per latenza minima, attivabile in chat).
     """
     if hasattr(tokenizer, "apply_chat_template"):
         try:
@@ -635,7 +727,7 @@ def _format_chat_prompt(tokenizer: Any, messages: list[dict], fallback_str: str)
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=False,
+                enable_thinking=enable_thinking,
             )
         except Exception:
             prompt_str = tokenizer.apply_chat_template(
@@ -643,9 +735,11 @@ def _format_chat_prompt(tokenizer: Any, messages: list[dict], fallback_str: str)
                 tokenize=False,
                 add_generation_prompt=True,
             )
-        # Se il template apre <think> senza chiuderlo, chiudilo per forzare la risposta immediata
-        if "<think>" in prompt_str and "</think>" not in prompt_str:
-            prompt_str = prompt_str.rstrip() + "\n</think>\n\n"
+        if not enable_thinking:
+            # Se il template apre un blocco di thinking senza chiuderlo, chiudilo per risposta immediata
+            opened_close = _detect_opened_think_tag(prompt_str)
+            if opened_close is not None:
+                prompt_str = prompt_str.rstrip() + f"\n{opened_close}\n\n"
         return prompt_str
     return fallback_str
 
@@ -660,6 +754,22 @@ def _make_mlx_sampler(temperature: float, top_p: float = 0.9) -> Optional[Any]:
         return make_sampler(temp=temp, top_p=top_p, min_p=0.05)
     except Exception as exc:
         logger.debug(f"[LLM Engine] make_sampler non disponibile ({exc}), uso default.")
+        return None
+
+
+def _make_mlx_logits_processors(
+    repetition_penalty: float = 1.12,
+    repetition_context_size: int = 64,
+) -> Optional[Any]:
+    """Applica una penalità alle ripetizioni in MLX per evitare cicli identici nei modelli locali."""
+    try:
+        from mlx_lm.sample_utils import make_logits_processors
+        return make_logits_processors(
+            repetition_penalty=repetition_penalty,
+            repetition_context_size=repetition_context_size,
+        )
+    except Exception as exc:
+        logger.debug(f"[LLM Engine] make_logits_processors non disponibile ({exc}), uso default.")
         return None
 
 
@@ -692,6 +802,9 @@ def stream_tokens(
         sampler = _make_mlx_sampler(temp, top_p=top_p)
         if sampler is not None:
             kwargs["sampler"] = sampler
+        logits_processors = _make_mlx_logits_processors()
+        if logits_processors:
+            kwargs["logits_processors"] = logits_processors
         if kv_bits:
             kwargs.update(kv_bits=kv_bits, kv_group_size=kv_group_size)
         if max_kv_size:
@@ -848,6 +961,167 @@ def generate_text(
 
 # ── 1. Risposta Flash alle Domande Docente (Live) ──────────────────────────────
 
+_FLASH_ANSWER_SYSTEM_PROMPT = (
+    "Sei SbobinAI, assistente universitario in diretta. "
+    "Rispondi alla domanda del professore in modo IMMEDIATO, ACCURATO e CONCISO.\n"
+    "REGOLE FERREE:\n"
+    "1. NESSUN ragionamento interno, nessun preambolo, nessun saluto, nessuna formula introduttiva.\n"
+    "2. PRIORITÀ ASSOLUTA ALLA TRASCRIZIONE LIVE: i blocchi della lezione in corso hanno timestamp "
+    "[MM:SS | quanto tempo fa] (es. '2 min fa', 'appena detto'). Se la domanda riguarda cosa è stato detto "
+    "poco fa o X minuti fa, individua il segmento corrispondente e riporta fedelmente i concetti e i termini esatti.\n"
+    "3. Se la domanda riguarda concetti teorici o lezioni precedenti, integra trascrizione live e materiali del corso con precisione.\n"
+    "4. DOMANDE INCOMPLETE, TRONCHE O SENZA SENSO: se la domanda sembra trascritta male dal microfono, "
+    "priva di senso o non trova risposta nel contesto, NON inventare risposte e NON ripetere punti fittizi: "
+    "dillo onestamente in UNA sola frase breve e chiara.\n"
+    "5. Rispondi in italiano in 1-2 frasi brevi (usa al massimo 2-3 punti elenco SOLO se ci sono concetti davvero distinti, max 65 parole). "
+    "DIVIETO ASSOLUTO di ripetere la stessa frase o lo stesso concetto più volte."
+)
+
+
+def _deduplicate_repeated_answer(text: str) -> str:
+    """Rimuove punti elenco o frasi ripetute identiche generate da piccoli modelli locali."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+    lines = [ln.rstrip() for ln in cleaned.splitlines()]
+    seen_norm: set[str] = set()
+    kept_lines: List[str] = []
+    for ln in lines:
+        stripped = ln.strip()
+        if not stripped:
+            if kept_lines and kept_lines[-1] != "":
+                kept_lines.append("")
+            continue
+        # Normalizza rimuovendo eventuali prefissi numerati ('1. ', '2) ') o bullet ('- ', '* ')
+        body = re.sub(r"^(?:\d+[.)]\s*|[-*•]\s*)", "", stripped).strip()
+        norm = re.sub(r"\s+", " ", body.lower())
+        if norm and norm in seen_norm:
+            continue
+        if norm:
+            seen_norm.add(norm)
+        kept_lines.append(ln)
+
+    while kept_lines and not kept_lines[-1]:
+        kept_lines.pop()
+
+    # Se dopo la deduplica resta un solo punto numerato ('1. ...'), rimuovi il numero superfluo
+    non_empty = [ln for ln in kept_lines if ln.strip()]
+    if len(non_empty) == 1:
+        single = re.sub(r"^\s*\d+[.)]\s+", "", non_empty[0]).strip()
+        return single
+    return "\n".join(kept_lines).strip()
+
+
+async def stream_flash_answer(
+    question: str,
+    context: str,
+    model_id: Optional[str] = None,
+) -> AsyncGenerator[str, None]:
+    """
+    Risposta flash in streaming token-by-token per le domande del docente in diretta.
+    Thinking RIGOROSAMENTE disattivato (`enable_thinking=False`) per latenza minima
+    e consapevolezza immediata della trascrizione live con timestamp.
+    """
+    target = resolve_llm_model(model_id)
+    if not is_model_downloaded(target):
+        yield "Scarica un modello LLM dalle [[action:settings|Impostazioni]] per attivare le risposte rapide."
+        return
+
+    user_prompt = (
+        f"Contesto della lezione in diretta e materiali del corso:\n{context}\n\n"
+        f"Domanda del docente:\n{question}"
+    )
+
+    queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    stop_flag = threading.Event()
+
+    def _emit(item: Optional[str]) -> None:
+        try:
+            loop.call_soon_threadsafe(queue.put_nowait, item)
+        except RuntimeError:
+            stop_flag.set()
+
+    def _sync_stream():
+        try:
+            with generation_session("Risposta Flash") as epoch:
+                if stop_flag.is_set() or is_cancelled(epoch):
+                    return
+                model, tokenizer = get_or_load_model(target)
+                messages = [
+                    {"role": "system", "content": _FLASH_ANSWER_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ]
+                prompt_str = _format_chat_prompt(
+                    tokenizer,
+                    messages,
+                    fallback_str=f"{_FLASH_ANSWER_SYSTEM_PROMPT}\n\n{user_prompt}\n\nRisposta Flash:",
+                    enable_thinking=False,
+                )
+
+                all_markers: Tuple[str, ...] = tuple(m for pair in _THINK_TAG_PAIRS for m in pair)
+                in_think = False
+                pending = ""
+
+                for raw_chunk in stream_tokens(
+                    model,
+                    tokenizer,
+                    prompt_str,
+                    max_tokens=200,
+                    temperature=TEMP_STRUCTURED,
+                    epoch=epoch,
+                    stop_event=stop_flag,
+                    kv_bits=None,
+                    max_kv_size=4096,
+                ):
+                    if not raw_chunk:
+                        continue
+                    pending += raw_chunk
+                    for open_tag, close_tag in _THINK_TAG_PAIRS:
+                        if open_tag in pending:
+                            before, _, after = pending.partition(open_tag)
+                            if before and not in_think:
+                                _emit(before)
+                            pending = after
+                            in_think = True
+                        if close_tag in pending:
+                            _, _, after = pending.partition(close_tag)
+                            pending = after
+                            in_think = False
+
+                    hold = _suffix_prefix_len(pending, all_markers)
+                    if hold > 0:
+                        to_emit = pending[:-hold]
+                        pending = pending[-hold:]
+                    else:
+                        to_emit = pending
+                        pending = ""
+
+                    if to_emit and not in_think:
+                        _emit(to_emit)
+
+                if pending and not in_think and not is_cancelled(epoch):
+                    _emit(pending)
+        except Exception as exc:
+            logger.error(f"[LLM Flash] Errore streaming risposta flash: {exc}")
+            _emit(f"Errore durante l'elaborazione della risposta: {exc}")
+        finally:
+            clear_metal_cache()
+            _touch_model_usage()
+            _emit(None)
+
+    threading.Thread(target=_sync_stream, daemon=True, name="llm-flash-stream").start()
+
+    try:
+        while True:
+            chunk = await queue.get()
+            if chunk is None:
+                break
+            yield chunk
+    finally:
+        stop_flag.set()
+
+
 async def generate_flash_answer(
     question: str,
     context: str,
@@ -859,26 +1133,16 @@ async def generate_flash_answer(
     """
     target = resolve_llm_model(model_id)
     if not is_model_downloaded(target):
-        return (
-            "• Risposta non disponibile: modello LLM non ancora scaricato.\n"
-            "• Scarica Qwen 3.5 4B dalle Impostazioni per attivare le risposte flash.\n"
-            "• Domanda memorizzata per il ripasso e per il Quaderno."
-        )
+        return "Scarica un modello LLM dalle [[action:settings|Impostazioni]] per attivare le risposte rapide."
 
-    system_prompt = (
-        "Sei SbobinAI, assistente universitario locale. "
-        "Rispondi alla domanda del professore in MODO ESTREMAMENTE CONCISO E IMMEDIATO.\n"
-        "REGOLE FERREE:\n"
-        "1. Rispondi con MASSIMO 3 punti elenco chiari ed essenziali (max 40 parole in totale).\n"
-        "2. Nessun preambolo, nessun saluto, nessun tag di ragionamento interno.\n"
-        "3. Basa la risposta sul contesto della spiegazione se pertinente."
+    user_prompt = (
+        f"Contesto della lezione in diretta e materiali del corso:\n{context}\n\n"
+        f"Domanda del docente:\n{question}"
     )
-
-    user_prompt = f"Contesto spiegato a lezione:\n{context}\n\nDomanda del docente:\n{question}"
 
     def _run_inference() -> str:
         messages = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": _FLASH_ANSWER_SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
         ]
         with generation_session("Risposta Flash") as epoch:
@@ -887,15 +1151,15 @@ async def generate_flash_answer(
             full_text = _generate_blocking(
                 messages,
                 model_id=target,
-                max_tokens=180,
-                fallback_str=f"{system_prompt}\n\nDomanda:\n{user_prompt}\n\nRisposta Flash:",
+                max_tokens=200,
+                fallback_str=f"{_FLASH_ANSWER_SYSTEM_PROMPT}\n\nDomanda:\n{user_prompt}\n\nRisposta Flash:",
                 epoch=epoch,
                 temperature=TEMP_STRUCTURED,
-                kv_bits=4,
-                max_kv_size=8192,
+                kv_bits=None,
+                max_kv_size=4096,
                 raise_on_cancel=True,
             )
-        return _clean_thinking_artifacts(full_text)
+        return _deduplicate_repeated_answer(_clean_thinking_artifacts(full_text))
 
     try:
         answer = await asyncio.to_thread(_run_inference)
@@ -916,32 +1180,53 @@ async def stream_chat_response(
     query: str,
     context: str,
     model_id: Optional[str] = None,
+    enable_thinking: bool = False,
+    max_thinking_tokens: int = THINKING_TOKEN_BUDGET,
+    history: Optional[List[dict]] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Genera la spiegazione in streaming token-by-token per la chat live o la vista assistente.
-    Il worker si ferma se il consumatore chiude lo stream (es. disconnessione WebSocket).
+    Supporta `enable_thinking` (con normalizzazione `<think>...</think>` e budget token) e
+    cronologia multi-turno opzionale. Il worker si ferma se il consumatore chiude lo stream.
     """
     target = resolve_llm_model(model_id)
     if not is_model_downloaded(target):
         yield (
-            "Il modello LLM Qwen 3.5 4B non è ancora stato scaricato in locale.\n\n"
+            "Il modello LLM non è ancora stato scaricato in locale.\n\n"
             "Apri le **Impostazioni** (rotellina in basso a sinistra) e premi **Scarica** "
             "per abilitare l'assistente IA 100% offline."
         )
         return
 
+    effective_thinking = bool(enable_thinking) and ai_models.model_supports_thinking(target)
+    thinking_budget = max(64, int(max_thinking_tokens or THINKING_TOKEN_BUDGET))
+
     system_prompt = (
-        "Sei SbobinAI, assistente accademico e tutor universitario personale dello studente.\n"
-        "Rispondi alle domande dello studente basandoti RIGOROSAMENTE sul contesto del corso (trascrizioni, quaderno, materiali e registro domande).\n\n"
+        "Sei SbobinAI, assistente accademico e tutor universitario personale dello studente durante la lezione.\n"
+        "Rispondi basandoti RIGOROSAMENTE sul contesto fornito (trascrizione live della lezione in corso con timestamp [MM:SS | quanto tempo fa], quaderno, slide e materiali del corso).\n\n"
         "LINEE GUIDA INDISPENSABILI:\n"
-        "1. Rispondi DIRETTAMENTE alla richiesta senza convenevoli, saluti o preamboli inutili (NON iniziare MAI con 'Ciao! Sono SbobinAI' o simili).\n"
-        "2. Se lo studente chiede quali domande ha fatto il docente o professore a lezione, elenca ESCLUSIVAMENTE le domande esplicite registrate nel 'REGISTRO DOMANDE RILEVATE A LEZIONE'. Non inventare MAI 'domande implicite' da frasi dichiarative, saluti o presentazioni. Se non risultano domande registrate, comunicalo chiaramente.\n"
-        "3. Usa una formattazione Markdown elegante e chiara (elenchi puntati, grassetti per i concetti chiave, corsivo per citazioni dirette).\n"
-        "4. Se lo studente chiede spiegazioni su un argomento, spiega il concetto con accuratezza accademica e fornisci esempi pratici se utili.\n"
+        "1. Rispondi DIRETTAMENTE alla richiesta senza convenevoli, saluti o preamboli inutili.\n"
+        "2. Se lo studente chiede cosa ha detto il docente poco fa o X minuti fa, usa i timestamp [MM:SS | X min fa] della trascrizione live per rispondere con precisione immediata.\n"
+        "3. Usa una formattazione Markdown elegante e chiara (elenchi puntati, grassetti per i concetti chiave, formule LaTeX se presenti).\n"
+        "4. Spiega i concetti con accuratezza accademica e chiarezza, fornendo esempi pratici se utili.\n"
         "5. Rispondi sempre in lingua italiana."
     )
+    if effective_thinking:
+        system_prompt += (
+            "\n\nMODALITÀ RAGIONAMENTO ATTIVA: "
+            "Ragiona in italiano in modo conciso ed essenziale dentro il blocco di pensiero prima di scrivere la risposta finale."
+        )
 
-    user_prompt = f"Contesto del corso (materiali, appunti e registro domande):\n{context}\n\nRichiesta dello studente:\n{query}"
+    messages: List[dict] = [{"role": "system", "content": system_prompt}]
+    if history:
+        for item in history[-6:]:
+            role = item.get("role")
+            content = str(item.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": _clean_thinking_artifacts(content)[:1200]})
+
+    user_prompt = f"Contesto live e materiali del corso:\n{context}\n\nRichiesta dello studente:\n{query}"
+    messages.append({"role": "user", "content": user_prompt})
 
     queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
     loop = asyncio.get_running_loop()
@@ -959,31 +1244,137 @@ async def stream_chat_response(
                 if stop_flag.is_set() or is_cancelled(epoch):
                     return
                 model, tokenizer = get_or_load_model(target)
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ]
                 prompt_str = _format_chat_prompt(
                     tokenizer,
                     messages,
-                    fallback_str=f"{system_prompt}\n\n{user_prompt}\n\nSpiegazione:"
+                    fallback_str=f"{system_prompt}\n\n{user_prompt}\n\nSpiegazione:",
+                    enable_thinking=effective_thinking,
                 )
 
-                in_think = False
-                for token_text in stream_tokens(model, tokenizer, prompt_str, max_tokens=600,
-                                                temperature=TEMP_CHAT, epoch=epoch,
-                                                stop_event=stop_flag, kv_bits=4, max_kv_size=8192):
-                    # Filtra tag di reasoning interno se presenti
-                    if "<think>" in token_text:
-                        in_think = True
-                        continue
-                    if "</think>" in token_text:
-                        in_think = False
-                        continue
+                all_markers: Tuple[str, ...] = tuple(m for pair in _THINK_TAG_PAIRS for m in pair)
+
+                if not effective_thinking:
+                    in_think = False
+                    pending = ""
+                    for raw_chunk in stream_tokens(
+                        model,
+                        tokenizer,
+                        prompt_str,
+                        max_tokens=700,
+                        temperature=TEMP_CHAT,
+                        epoch=epoch,
+                        stop_event=stop_flag,
+                        kv_bits=4,
+                        max_kv_size=8192,
+                    ):
+                        if not raw_chunk:
+                            continue
+                        pending += raw_chunk
+                        for open_tag, close_tag in _THINK_TAG_PAIRS:
+                            if open_tag in pending:
+                                before, _, after = pending.partition(open_tag)
+                                if before and not in_think:
+                                    _emit(before)
+                                pending = after
+                                in_think = True
+                            if close_tag in pending:
+                                _, _, after = pending.partition(close_tag)
+                                pending = after
+                                in_think = False
+                        hold = _suffix_prefix_len(pending, all_markers)
+                        if hold > 0:
+                            to_emit = pending[:-hold]
+                            pending = pending[-hold:]
+                        else:
+                            to_emit = pending
+                            pending = ""
+                        if to_emit and not in_think:
+                            _emit(to_emit)
+                    if pending and not in_think and not is_cancelled(epoch) and not stop_flag.is_set():
+                        _emit(pending)
+                else:
+                    opened_close = _detect_opened_think_tag(prompt_str)
+                    in_think = opened_close is not None
+                    native_close_tag = opened_close or "</think>"
                     if in_think:
-                        continue
-                    if token_text:
-                        _emit(token_text)
+                        _emit("<think>\n")
+
+                    think_tokens = 0
+                    raw_think_chunks: List[str] = []
+                    pending = ""
+                    budget_exceeded = False
+
+                    for raw_chunk in stream_tokens(
+                        model,
+                        tokenizer,
+                        prompt_str,
+                        max_tokens=1500 + thinking_budget,
+                        temperature=TEMP_CHAT,
+                        epoch=epoch,
+                        stop_event=stop_flag,
+                        kv_bits=None,
+                        max_kv_size=8192,
+                    ):
+                        if is_cancelled(epoch) or stop_flag.is_set():
+                            break
+                        if not raw_chunk:
+                            continue
+                        pending += raw_chunk
+                        for open_tag, close_tag in _THINK_TAG_PAIRS:
+                            if open_tag in pending:
+                                pending = pending.replace(open_tag, "<think>")
+                                native_close_tag = close_tag
+                                in_think = True
+                            if close_tag in pending:
+                                pending = pending.replace(close_tag, "</think>")
+                                in_think = False
+                        hold = _suffix_prefix_len(pending, all_markers)
+                        if hold > 0:
+                            to_emit = pending[:-hold]
+                            pending = pending[-hold:]
+                        else:
+                            to_emit = pending
+                            pending = ""
+
+                        if in_think:
+                            think_tokens += 1
+                            raw_think_chunks.append(raw_chunk)
+                            if to_emit:
+                                _emit(to_emit)
+                            if think_tokens >= thinking_budget:
+                                if pending and not any(m.startswith(pending) for _, m in _THINK_TAG_PAIRS):
+                                    _emit(pending)
+                                pending = ""
+                                _emit("\n</think>\n\n")
+                                budget_exceeded = True
+                                break
+                        else:
+                            if to_emit:
+                                _emit(to_emit)
+
+                    if not budget_exceeded and pending and not is_cancelled(epoch) and not stop_flag.is_set():
+                        _emit(pending)
+
+                    if budget_exceeded and not is_cancelled(epoch) and not stop_flag.is_set():
+                        continued_prompt = (
+                            prompt_str + "".join(raw_think_chunks) + f"\n{native_close_tag}\n\n"
+                        )
+                        for ans_chunk in stream_tokens(
+                            model,
+                            tokenizer,
+                            continued_prompt,
+                            max_tokens=700,
+                            temperature=TEMP_CHAT,
+                            epoch=epoch,
+                            stop_event=stop_flag,
+                            kv_bits=4,
+                            max_kv_size=8192,
+                        ):
+                            if is_cancelled(epoch) or stop_flag.is_set():
+                                break
+                            if ans_chunk:
+                                _emit(ans_chunk)
+
                 if is_cancelled(epoch):
                     logger.warning("[LLM Chat] Streaming chat interrotto dall'utente.")
         except Exception as exc:
@@ -1116,8 +1507,14 @@ def _build_chapter_prompt(
     source_content: str,
     past_references: str,
     bookmarks_summary: str,
+    lecture_id: Optional[int] = None,
 ) -> str:
     """Compone il prompt utente con la struttura obbligatoria a 5 sezioni del capitolo."""
+    audio_hint = (
+        f"- Per collegare passaggi orali della spiegazione o momenti chiave all'audio originale: [[audio:{lecture_id}|SECONDI|TESTO_LINK]] (es. 'approfondito dal docente [[audio:{lecture_id}|120|qui a lezione]]'). Cliccandolo, l'app avvierà subito l'ascolto al secondo indicato nella trascrizione.\n"
+        if lecture_id
+        else "- Per collegare passaggi orali della spiegazione all'audio: [[audio:ID_LEZIONE|SECONDI|TESTO_LINK]]. Cliccandolo, l'app avvierà la riproduzione audio.\n"
+    )
     return f"""Crea il capitolo di studio per la lezione: "{title}".
 
 {source_label}:
@@ -1128,6 +1525,9 @@ RIFERIMENTI A MATERIALI E LEZIONI PRECEDENTI:
 
 SEGNALIBRI ESAME SALVATI DALLO STUDENTE:
 \"\"\"{bookmarks_summary[:1200]}\"\"\"
+
+COLLEGAMENTI IPERTESTUALI INTERATTIVI (usali dove appropriato nel testo per arricchire il capitolo):
+{audio_hint}- Per collegare argomenti alle slide o ai PDF dei materiali: [[slide:ID_MATERIALE#PAGINA|TESTO_LINK]] usando ESCLUSIVAMENTE l'ID reale presente nei materiali del contesto. Non usare nomi inventati.
 
 STRUTTURA OBBLIGATORIA DEL CAPITOLO (in Markdown):
 # {title} — Capitolo di Studio
@@ -1302,6 +1702,7 @@ async def generate_lecture_chapter(
     past_references: str = "",
     bookmarks_summary: str = "",
     model_id: Optional[str] = None,
+    lecture_id: Optional[int] = None,
     *,
     clean_transcript: bool = True,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -1328,13 +1729,13 @@ async def generate_lecture_chapter(
 
     target = resolve_llm_model(model_id)
     if not is_model_downloaded(target):
+        excerpt = cleaned_transcript[:3000] + ("…" if len(cleaned_transcript) > 3000 else "")
         return (
-            f"# {title} — Appunti di Lezione\n\n"
-            "> [!NOTE]\n"
-            "> Il modello IA non è ancora installato. Scarica **Qwen 3.5 4B** dalle Impostazioni "
-            "per generare automaticamente lo schema concettuale strutturato.\n\n"
-            "## Trascrizione Grezza della Lezione\n\n"
-            f"{cleaned_transcript[:3000]}..."
+            f"# {title}\n\n"
+            "> **Modello LLM non installato** — Scarica un modello dalle **Impostazioni** "
+            "per generare automaticamente gli appunti strutturati.\n\n"
+            "## Trascrizione\n\n"
+            f"{excerpt}"
         )
 
     system_prompt = _CHAPTER_SYSTEM_PROMPT
@@ -1366,6 +1767,7 @@ async def generate_lecture_chapter(
                     source_content=cleaned_transcript[:SINGLE_PASS_TRANSCRIPT_CHARS],
                     past_references=past_references,
                     bookmarks_summary=bookmarks_summary,
+                    lecture_id=lecture_id,
                 )
             else:
                 chunks = _split_transcript_chunks(cleaned_transcript)
@@ -1438,6 +1840,7 @@ async def generate_lecture_chapter(
                     source_content=combined_notes,
                     past_references=past_references,
                     bookmarks_summary=bookmarks_summary,
+                    lecture_id=lecture_id,
                 )
 
             _notify({
@@ -1513,38 +1916,90 @@ _CHAT_MODE_INSTRUCTIONS: Dict[str, str] = {
 }
 
 
+_GREETING_FAST_RE = re.compile(
+    r"^(ciao|salve|buongiorno|buonasera|ehi|hey|hello|hi|buondì|come stai|come va)(\s+(a tutti|sbobinai|tutor|tutti))?[!\?\.\s]*$",
+    re.IGNORECASE,
+)
+
+
 def _build_multi_turn_system_prompt(
     subject_name: str,
     context_text: str,
     compacted_summary: str,
     mode: str,
+    *,
+    enable_thinking: bool = False,
+    is_greeting_turn: bool = False,
 ) -> str:
     """Compone il system prompt italiano per la chat multi-turno con citazioni e LaTeX."""
     mode_key = (mode or "auto").strip().lower()
+    summary_clean = (compacted_summary or "").strip()
+    ctx_clean = (context_text or "").strip()
+
+    # Fast-path per semplici saluti senza contesto RAG: riduce il prefill da ~800 a ~45 token
+    if is_greeting_turn and not ctx_clean and not summary_clean and mode_key == "auto":
+        base = (
+            f"Sei SbobinAI, tutor universitario per il corso di '{subject_name}'. "
+            "Rispondi al saluto in italiano naturale, cordiale e conciso (1-2 frasi), "
+            f"presentandoti brevemente come tutor di '{subject_name}' e chiedendo su quale lezione, "
+            "argomento o dubbio desidera concentrarsi oggi."
+        )
+        if enable_thinking:
+            base += " Svolgi il ragionamento interno in italiano in modo conciso."
+        return base
+
     mode_instruction = _CHAT_MODE_INSTRUCTIONS.get(mode_key, _CHAT_MODE_INSTRUCTIONS["auto"])
 
     parts: List[str] = [
         f"Sei SbobinAI, tutor universitario per il corso di '{subject_name}'.",
         "REGOLE INDISPENSABILI:",
-        "1. Rispondi in italiano in modo diretto, senza saluti o preamboli inutili.",
-        "2. Fonda la risposta sui materiali del corso forniti nel contesto; se un dettaglio manca dai materiali, segnalalo con onestà senza inventarlo.",
         (
-            "3. Quando citi una fonte contrassegnata nel contesto come "
-            "[FONTE: ... | REF: SOURCE_ID#PAGE | ETICHETTA: LABEL], inserisci SEMPRE un link inline cliccabile "
-            "con la sintassi ESATTA [[ref:SOURCE_ID#PAGE|LABEL]] "
-            "(esempio: [[ref:Lezione3.pdf#14|Lezione 3, pag. 14]]). "
-            "Non inventare MAI numeri di pagina non presenti nei tag [FONTE: ... | REF: ...]."
+            "1. Per domande sui contenuti e spiegazioni di studio, rispondi in modo diretto ed essenziale, senza convenevoli o preamboli inutili. "
+            "Se l'utente ti invia solo un saluto o messaggio introduttivo (es. 'ciao', 'buongiorno'), rispondi in perfetto italiano, cordiale, naturale e conciso. "
+            f"Presentati brevemente come tutor del corso di '{subject_name}' e chiedi su quale argomento, lezione o dubbio desidera concentrarsi oggi "
+            f"(ad esempio: 'Ciao! Sono SbobinAI, il tuo tutor per il corso di {subject_name}. Di cosa vorresti occuparti oggi? Possiamo approfondire una lezione, chiarire un dubbio o metterti alla prova con un quiz.')."
+        ),
+        "2. Quando spieghi concetti del corso, fonda la risposta sui materiali forniti nel contesto; se un dettaglio manca dai materiali, segnalalo con onestà senza inventarlo.",
+        (
+            "3. CITAZIONI INTERATTIVE E COLLEGAMENTI IPERTESTUALI:\n"
+            "- Quando fai riferimento a spiegazioni orali o lezioni registrate presenti nel contesto [FONTE AUDIO DOCENTE: ... | LEZIONE_ID: id | SECONDI: sec], "
+            "inserisci link interattivi con la sintassi [[audio:LEZIONE_ID|SECONDI|LABEL]] usando l'ID numerico reale e i secondi esatti indicati nella fonte.\n"
+            "- Quando citi una fonte cartacea, slide o documento presente nei materiali del contesto [FONTE: ... | REF: SOURCE_ID#PAGE], "
+            "inserisci link interattivi con la sintassi [[slide:SOURCE_ID#PAGE|LABEL]] usando il SOURCE_ID reale e la pagina esatta indicata nella fonte.\n"
+            "- DIVIETO ASSOLUTO DI ALLUCINAZIONI SULLE FONTI: Non citare o inventare MAI file, slide, dispense o ID fittizi (es. 'dispensa.pdf', 'slide 14') che non siano esplicitamente presenti tra i materiali del contesto 'MATERIALI E APPUNTI DEL CORSO'. "
+            "Se il contesto non contiene materiali o slide, NON inserire NESSUN link [[slide:...]] o [[audio:...]] e non fare riferimento a dispense fittizie.\n"
+            "- Se l'utente ti chiede un riassunto o domande sull'ultima lezione ma nel contesto non risultano trascrizioni di lezioni registrate, "
+            "comunica con trasparenza che non risultano ancora lezioni registrate per questo corso, senza inventare riassunti fittizi da metadati o file di configurazione."
         ),
         "4. Usa la notazione LaTeX ($...$ inline e $$...$$ a blocco) per formule ed espressioni matematiche.",
         f"5. {mode_instruction}",
+        (
+            "6. RISCONTRO SU QUIZ SVOLTI DALLO STUDENTE:\n"
+            "- Quando lo studente ti comunica di aver svolto o completato un quiz (es. 'finito', 'l'ho fatto', 'come sono andato?'), "
+            "rispondi direttamente a lui in 2-3 brevi paragrafi con tono caloroso, incoraggiante e didatticamente chiaro.\n"
+            "- DIVIETO ASSOLUTO DI COPIARE IL QUIZ: Non stampare MAI l'elenco delle domande, le opzioni a/b/c/d, né intestazioni burocratiche (come 'Quiz ID', 'Stato: Completato', 'Verifica Finale').\n"
+            "- DIVIETO DI PROMPT LEAK: Non stampare MAI frasi di regia interna (come 'Istruzione Tutor', 'Istruzione di risposta', 'Linee guida docente').\n"
+            "- Come strutturare la risposta: (1) Un commento caloroso sul punteggio per non demoralizzarlo; (2) La spiegazione discorsiva dei concetti chiave su cui si è confuso; (3) Una domanda amichevole per chiedergli se vuole fare un esempio pratico insieme."
+        ),
+        (
+            "7. GUARDRAIL ERRORI DI TRASCRIZIONE AUDIO:\n"
+            "- Nelle lezioni registrate possono comparire refusi fonetici o parole storpiate dal microfono o dalla trascrizione automatica (ad es. 'pittografia' per 'crittografia', parole inventate come 'fastogeo' per 'FastCGI', ecc.).\n"
+            "- DIVIETO ASSOLUTO DI ALLUCINAZIONI FONETICHE: NON inventare MAI spiegazioni, certificati o teorie basate su parole chiaramente storpiate o prive di senso. "
+            "Riconduci sempre i concetti ai termini tecnici e accademici corretti e scientificamente riconosciuti della materia."
+        ),
     ]
 
-    summary_clean = (compacted_summary or "").strip()
+    if enable_thinking:
+        parts.append(
+            "8. MODALITÀ PENSIERO ATTIVA: Svolgi il tuo ragionamento interno in ITALIANO "
+            "in modo conciso, schematico ed essenziale (pochi passaggi chiari, senza ripetizioni o divagazioni), "
+            "poi fornisci la risposta finale chiara e completa in italiano."
+        )
+
     if summary_clean:
         max_summary_chars = min(2000, max(600, USABLE_CHAT_CONTEXT_TOKENS // 3))
         parts.append(f"\nMEMORIA COMPATTATA DELLA CONVERSAZIONE PRECEDENTE:\n{summary_clean[:max_summary_chars]}")
 
-    ctx_clean = (context_text or "").strip()
     if ctx_clean:
         # Riserva un budget equilibrato per la cronologia anche con finestre di contesto ridotte
         max_ctx_chars = min(10000, max(1600, USABLE_CHAT_CONTEXT_TOKENS * 2))
@@ -1599,6 +2054,18 @@ def _messages_to_fallback_prompt(chat_messages: List[dict]) -> str:
     return "\n\n".join(lines)
 
 
+def _suffix_prefix_len(text: str, markers: Tuple[str, ...]) -> int:
+    """Lunghezza del suffisso più lungo di `text` che è prefisso proprio di uno dei `markers`."""
+    best = 0
+    for marker in markers:
+        max_k = min(len(text), len(marker) - 1)
+        for k in range(max_k, best, -1):
+            if text.endswith(marker[:k]):
+                best = k
+                break
+    return best
+
+
 def stream_multi_turn_chat(
     subject_name: str,
     messages: List[dict],
@@ -1606,10 +2073,14 @@ def stream_multi_turn_chat(
     compacted_summary: str = "",
     mode: str = "auto",
     model_id: Optional[str] = None,
+    enable_thinking: bool = False,
+    max_thinking_tokens: int = THINKING_TOKEN_BUDGET,
 ) -> Iterator[str]:
     """
     Generatore sincrono per la chat multi-turno persistente.
     Adatta i turni al budget di contesto, applica la modalità di studio e streamma i token a TEMP_CHAT.
+    Quando `enable_thinking=True` (e il modello lo supporta), abilita il ragionamento nativo in italiano
+    con budget massimo `max_thinking_tokens` e normalizza i tag in `<think>...</think>`.
     """
     target = resolve_llm_model(model_id)
     if not is_model_downloaded(target):
@@ -1619,11 +2090,23 @@ def stream_multi_turn_chat(
         )
         return
 
+    effective_thinking = bool(enable_thinking) and ai_models.model_supports_thinking(target)
+    thinking_budget = max(64, int(max_thinking_tokens or THINKING_TOKEN_BUDGET))
+
+    last_user_text = ""
+    for msg in reversed(messages):
+        if isinstance(msg, dict) and str(msg.get("role") or "").strip().lower() == "user":
+            last_user_text = str(msg.get("content") or "").strip()
+            break
+    is_greeting_turn = bool(last_user_text and _GREETING_FAST_RE.match(last_user_text))
+
     system_prompt = _build_multi_turn_system_prompt(
         subject_name=subject_name,
         context_text=context_text,
         compacted_summary=compacted_summary,
         mode=mode,
+        enable_thinking=effective_thinking,
+        is_greeting_turn=is_greeting_turn,
     )
     chat_messages = _fit_messages_to_budget(messages, system_prompt)
     fallback_str = _messages_to_fallback_prompt(chat_messages)
@@ -1632,22 +2115,122 @@ def stream_multi_turn_chat(
         if is_cancelled(epoch):
             return
         model, tokenizer = get_or_load_model(target)
-        prompt_str = _format_chat_prompt(tokenizer, chat_messages, fallback_str=fallback_str)
+        prompt_str = _format_chat_prompt(
+            tokenizer,
+            chat_messages,
+            fallback_str=fallback_str,
+            enable_thinking=effective_thinking,
+        )
         try:
-            for chunk in stream_tokens(
+            if not effective_thinking:
+                for chunk in stream_tokens(
+                    model,
+                    tokenizer,
+                    prompt_str,
+                    max_tokens=1200,
+                    temperature=TEMP_CHAT,
+                    epoch=epoch,
+                    kv_bits=None,
+                    max_kv_size=LLM_CONTEXT_TOKENS,
+                ):
+                    if is_cancelled(epoch):
+                        break
+                    if chunk:
+                        yield chunk
+                return
+
+            # Modalità pensiero attiva: normalizza tag Qwen/Gemma in <think>...</think> e rispetta il budget
+            all_markers: Tuple[str, ...] = tuple(m for pair in _THINK_TAG_PAIRS for m in pair)
+            opened_close = _detect_opened_think_tag(prompt_str)
+            in_think = opened_close is not None
+            native_close_tag = opened_close or "</think>"
+
+            if in_think:
+                yield "<think>\n"
+
+            think_tokens = 0
+            raw_think_chunks: List[str] = []
+            pending = ""
+            budget_exceeded = False
+
+            for raw_chunk in stream_tokens(
                 model,
                 tokenizer,
                 prompt_str,
-                max_tokens=1200,
+                max_tokens=2048 + thinking_budget,
                 temperature=TEMP_CHAT,
                 epoch=epoch,
-                kv_bits=4,
+                kv_bits=None,
                 max_kv_size=LLM_CONTEXT_TOKENS,
             ):
                 if is_cancelled(epoch):
                     break
-                if chunk:
-                    yield chunk
+                if not raw_chunk:
+                    continue
+
+                pending += raw_chunk
+
+                # Normalizza eventuali tag completi di apertura/chiusura presenti nel buffer
+                for open_tag, close_tag in _THINK_TAG_PAIRS:
+                    if open_tag in pending:
+                        pending = pending.replace(open_tag, "<think>")
+                        native_close_tag = close_tag
+                        in_think = True
+                    if close_tag in pending:
+                        pending = pending.replace(close_tag, "</think>")
+                        in_think = False
+
+                hold = _suffix_prefix_len(pending, all_markers)
+                if hold > 0:
+                    to_emit = pending[:-hold]
+                    pending = pending[-hold:]
+                else:
+                    to_emit = pending
+                    pending = ""
+
+                if in_think:
+                    think_tokens += 1
+                    raw_think_chunks.append(raw_chunk)
+                    if to_emit:
+                        yield to_emit
+                    if think_tokens >= thinking_budget:
+                        # Budget ragionamento raggiunto: chiude pulito il pensiero e passa alla risposta
+                        if pending and not any(m.startswith(pending) for _, m in _THINK_TAG_PAIRS):
+                            yield pending
+                        pending = ""
+                        yield "\n</think>\n\n"
+                        budget_exceeded = True
+                        break
+                else:
+                    if to_emit:
+                        yield to_emit
+
+            if not budget_exceeded and pending and not is_cancelled(epoch):
+                for open_tag, close_tag in _THINK_TAG_PAIRS:
+                    pending = pending.replace(open_tag, "<think>").replace(close_tag, "</think>")
+                yield pending
+
+            # Fase 2 (solo se il modello ha esaurito il budget senza chiudere </think>): genera la risposta finale
+            if budget_exceeded and not is_cancelled(epoch):
+                logger.info(
+                    f"[LLM Chat] Budget pensiero ({thinking_budget} token) raggiunto per '{subject_name}': "
+                    "chiusura automatica </think> e avvio generazione risposta."
+                )
+                cont_prompt = prompt_str + "".join(raw_think_chunks) + f"\n{native_close_tag}\n\n"
+                for chunk in stream_tokens(
+                    model,
+                    tokenizer,
+                    cont_prompt,
+                    max_tokens=1200,
+                    temperature=TEMP_CHAT,
+                    epoch=epoch,
+                    kv_bits=None,
+                    max_kv_size=LLM_CONTEXT_TOKENS,
+                ):
+                    if is_cancelled(epoch):
+                        break
+                    if chunk:
+                        yield chunk
         finally:
             clear_metal_cache()
             _touch_model_usage()
@@ -1659,7 +2242,7 @@ def _extractive_chat_summary(
     messages: List[dict],
 ) -> str:
     """Fallback deterministico per la compattazione della chat quando l'LLM non è disponibile."""
-    lines: List[str] = [f"### Sintesi Compattata — {subject_name}"]
+    lines: List[str] = [f"### Sintesi — {subject_name}"]
     prev = (previous_summary or "").strip()
     if prev:
         lines.append(prev[:1200])
@@ -1674,13 +2257,13 @@ def _extractive_chat_summary(
             continue
         label = "Studente" if role == "user" else "Assistente"
         refs = re.findall(r"\[\[ref:[^\]]+\]\]", content)
-        snippet = content[:240] + ("…" if len(content) > 240 else "")
+        snippet = content[:280] + ("…" if len(content) > 280 else "")
         if refs:
             missing_refs = [r for r in refs if r not in snippet]
             if missing_refs:
                 snippet = f"{snippet} ({', '.join(missing_refs[:2])})"
         bullet = f"- **{label}**: {snippet}"
-        if total_chars + len(bullet) > 2600:
+        if total_chars + len(bullet) > 3000:
             break
         lines.append(bullet)
         total_chars += len(bullet)
@@ -1712,25 +2295,26 @@ def compact_chat_history(
         role = "Studente" if str(m.get("role") or "").lower() == "user" else "Assistente"
         content = str(m.get("content") or "").strip()
         if content:
-            turns_text_parts.append(f"{role}: {content[:1200]}")
+            turns_text_parts.append(f"{role}: {content[:1500]}")
 
     if not turns_text_parts:
         return (previous_summary or "").strip()
 
-    turns_block = "\n\n".join(turns_text_parts)[:9000]
-    prev_block = (previous_summary or "").strip()[:2500] or "Nessuna sintesi precedente."
+    turns_block = "\n\n".join(turns_text_parts)[:12000]
+    prev_block = (previous_summary or "").strip()[:3500] or "Nessuna sintesi precedente."
 
     sys_prompt = (
         "Sei SbobinAI, assistente accademico universitario. "
-        "Comprimi lo storico di una sessione di studio in una memoria compatta e fedele in italiano. "
-        "Preserva SEMPRE: definizioni formali, formule LaTeX ($...$), dubbi aperti dello studente "
-        "e riferimenti puntuali alle fonti (es. [[ref:...]] o nomi file/pagine)."
+        "Il tuo compito è compattare lo storico della discussione in una sintesi concettuale ad altissima densità informativa in italiano. "
+        "NON inserire introduzioni, saluti o conclusioni decorative. "
+        "Conserva SEMPRE in modo completo e senza troncare: definizioni formali dei concetti discussi, formule ($...$), regole chiave, decisioni prese e riferimenti puntuali a dispense o lezioni. "
+        "Assicurati che ogni punto elenco sia autosufficiente, chiaro e chiuso correttamente."
     )
     usr_prompt = (
         f"Materia: {subject_name}\n\n"
-        f"SINTESI PRECEDENTE:\n{prev_block}\n\n"
-        f"NUOVI TURNI DA INTEGRARE:\n{turns_block}\n\n"
-        "Restituisci una sintesi Markdown concisa e strutturata (punti elenco per concetti, formule, dubbi aperti e riferimenti):"
+        f"MEMORIA PRECEDENTE:\n{prev_block}\n\n"
+        f"NUOVI TURNI DI STUDIO:\n{turns_block}\n\n"
+        "Genera la memoria compattata integrata in Markdown (punti elenco essenziali e strutturati, completi fino all'ultimo concetto):"
     )
     chat_messages = [
         {"role": "system", "content": sys_prompt},
@@ -1742,7 +2326,7 @@ def compact_chat_history(
             raw = _generate_blocking(
                 chat_messages,
                 model_id=target,
-                max_tokens=700,
+                max_tokens=1400,
                 fallback_str=f"{sys_prompt}\n\n{usr_prompt}\n\nSintesi:",
                 epoch=epoch,
                 temperature=TEMP_SUMMARY,
@@ -1782,6 +2366,14 @@ def generate_followup_suggestions(
     """
     combined = f"{user_message or ''} {assistant_reply or ''}".lower()
     mode_key = (mode or "auto").strip().lower()
+
+    clean_user = (user_message or "").strip().lower()
+    if re.match(r"^(ciao|salve|buongiorno|buonasera|ehi|hey|hello|hi|buondì)[!\?\.\s]*$", clean_user):
+        return [
+            "Riassumi i punti chiave dell'ultima lezione",
+            f"Quali sono gli argomenti principali di {subject_name}?",
+            "Preparami un quiz di verifica iniziale",
+        ]
 
     suggestions: List[str] = []
 

@@ -3,7 +3,7 @@ import { BookOpen } from 'lucide-react';
 
 export default function EmptyState() {
   return (
-    <div className="flex-1 flex flex-col items-center justify-center p-8 select-none bg-black/15">
+    <div className="flex-1 flex flex-col items-center justify-center p-8 select-none content-canvas">
       <div className="w-16 h-16 rounded-3xl liquid-glass border border-white/[0.12] flex items-center justify-center mb-4 shadow-liquid">
         <BookOpen size={24} strokeWidth={1.5} className="text-white/40" />
       </div>

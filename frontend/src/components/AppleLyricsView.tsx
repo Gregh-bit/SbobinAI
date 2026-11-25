@@ -1,15 +1,16 @@
-// components/AppleLyricsView.tsx — Unified Continuous Transcript with Apple Music Synchronized Glow
+// components/AppleLyricsView.tsx — Continuous Borderless Transcript with Synchronized Caret
 import React, { useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import clsx from 'clsx';
-import { ArrowDownCircle, Check, Copy, Sparkles, Volume2 } from 'lucide-react';
+import { ArrowDownCircle, Check, Copy } from 'lucide-react';
 import type { KaraokeLine } from '../types';
+import { useDelayedLoading, TranscriptSkeleton } from './Skeleton';
 
 interface AppleLyricsViewProps {
   lines: KaraokeLine[] | null;
   audioRef: React.RefObject<HTMLAudioElement | null>;
+  audioPath?: string;
   isPlaying: boolean;
   onSeek: (seconds: number) => void;
-  subjectColor?: string;
   lectureTitle?: string;
   rawTranscript?: string;
   onCopyTranscript?: (textToCopy?: string) => void;
@@ -17,22 +18,7 @@ interface AppleLyricsViewProps {
   isLoadingTimestamps?: boolean;
 }
 
-// Palette armonica per il mesh gradient basata sul colore del corso
-function extractPalette(baseHex?: string) {
-  const fallback = '#6366f1';
-  const hex = (baseHex && baseHex.startsWith('#') && baseHex.length >= 7) ? baseHex : fallback;
-
-  const r = parseInt(hex.slice(1, 3), 16) || 99;
-  const g = parseInt(hex.slice(3, 5), 16) || 102;
-  const b = parseInt(hex.slice(5, 7), 16) || 241;
-
-  return {
-    c1: `rgba(${r}, ${g}, ${b}, 0.50)`,
-    c2: `rgba(${Math.min(255, b + 25)}, ${Math.max(40, r - 25)}, ${Math.min(255, g + 35)}, 0.40)`,
-    c3: `rgba(${Math.max(30, g - 20)}, ${Math.min(255, b + 30)}, ${Math.max(40, r + 40)}, 0.35)`,
-    c4: `rgba(${Math.min(255, r + 40)}, ${Math.max(20, g - 40)}, ${Math.min(255, b + 60)}, 0.30)`,
-  };
-}
+const TOPIC_SHIFT_RE = /^(allora|quindi\s+passiamo|passiamo\s+(?:a|ora|adesso)|adesso\s+vediamo|ora\s+vediamo|il\s+prossimo\s+argomento|un\s+altro\s+aspetto|cambiamo\s+argomento|in\s+questo\s+capitolo)/i;
 
 function formatTimeMs(ms: number): string {
   const totalSeconds = Math.max(0, Math.floor(ms / 1000));
@@ -57,9 +43,9 @@ interface FlatWord {
 export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
   lines,
   audioRef,
+  audioPath,
   isPlaying,
   onSeek,
-  subjectColor,
   rawTranscript,
   onCopyTranscript,
   copiedTranscript,
@@ -68,8 +54,11 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
   const [currentMs, setCurrentMs] = useState<number>(0);
   const [isAutoScrollLocked, setIsAutoScrollLocked] = useState<boolean>(true);
   const [activeWordId, setActiveWordId] = useState<string | null>(null);
+  const showTranscriptSkeleton = useDelayedLoading(Boolean(isLoadingTimestamps), 180, 220);
 
-  const containerRef = useRef<HTMLDivElement | null>(null);
+  const currentMsRef = useRef<number>(0);
+  currentMsRef.current = currentMs;
+
   const textWrapperRef = useRef<HTMLDivElement | null>(null);
   const caretRef = useRef<HTMLDivElement | null>(null);
   const wordElementsRef = useRef<Map<string, HTMLSpanElement>>(new Map());
@@ -79,12 +68,13 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
   const isProgrammaticScrollRef = useRef<boolean>(false);
   const userScrollTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  const getScrollContainer = useCallback((): HTMLElement | null => {
+    return (textWrapperRef.current?.closest('.overflow-y-auto') as HTMLElement | null) ?? null;
+  }, []);
+
   useEffect(() => {
     isAutoScrollLockedRef.current = isAutoScrollLocked;
   }, [isAutoScrollLocked]);
-
-  // Palette dinamica 3-4 colori mesh
-  const palette = useMemo(() => extractPalette(subjectColor), [subjectColor]);
 
   // Fallback anti-allucinazione Whisper sui timestamp
   const isHallucinatedTimestamps = useMemo(() => {
@@ -178,14 +168,14 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
       }
     }
 
-    // 3. Testo non corrispondente a rawTranscript
-    if (rawWords.length >= 10 && allLinesWords.length > 0) {
+    // 3. Testo non corrispondente a rawTranscript (valutato solo con campioni consistenti per evitare falsi positivi)
+    if (rawWords.length >= 50 && allLinesWords.length >= 50) {
       const rawWordSet = new Set(rawWords);
       const matchingWords = allLinesWords.filter((w) => rawWordSet.has(w));
       const matchRatio = matchingWords.length / allLinesWords.length;
 
-      // Se meno del 35% delle parole dei timestamp compare in rawTranscript
-      if (matchRatio < 0.35) {
+      // Se meno del 20% delle parole dei timestamp compare in rawTranscript
+      if (matchRatio < 0.20) {
         return true;
       }
 
@@ -212,25 +202,32 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
     return 0;
   }, [effectiveLines, rawTranscript]);
 
-  // Raggruppamento naturale in paragrafi per lettura fluida
+  // Testo continuo: niente a capo arbitrari di Whisper, solo su pause molto lunghe o cambi netti d'argomento
   const paragraphs = useMemo(() => {
     if (!effectiveLines || effectiveLines.length === 0) return [];
     const result: ParagraphLine[][] = [];
     let currentPara: ParagraphLine[] = [];
+    let paraWordCount = 0;
 
     effectiveLines.forEach((line, idx) => {
       currentPara.push({ ...line, lineIdx: idx });
+      paraWordCount += line.words.length;
 
       const lastWord = line.words[line.words.length - 1];
       const lastText = lastWord ? lastWord.text : '';
       const hasPunctuation = /[.!?]$/.test(lastText);
       const nextLine = effectiveLines[idx + 1];
-      const pauseBeforeNext = nextLine ? (nextLine.lineStart - line.lineEnd) : 0;
+      if (!nextLine) return;
 
-      // Paragrafo naturale: pausa di respiro o punteggiatura conclusiva
-      if ((hasPunctuation && pauseBeforeNext > 1200) || currentPara.length >= 4) {
+      const pauseBeforeNext = nextLine.lineStart - line.lineEnd;
+      const nextText = nextLine.words.map((w) => w.text).join(' ').trim();
+      const isLongPause = pauseBeforeNext >= 7000 || (hasPunctuation && pauseBeforeNext >= 4500);
+      const isTopicShift = hasPunctuation && pauseBeforeNext >= 2200 && paraWordCount >= 40 && TOPIC_SHIFT_RE.test(nextText);
+
+      if (isLongPause || isTopicShift) {
         result.push(currentPara);
         currentPara = [];
+        paraWordCount = 0;
       }
     });
 
@@ -306,7 +303,8 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
   const findActiveWord = useCallback(
     (ms: number): FlatWord | null => {
       if (flatWords.length === 0) return null;
-      if (ms < flatWords[0].start) return flatWords[0];
+      // Prima che inizi il parlato (silenzio iniziale / intro): nessun cursore attivo
+      if (ms < flatWords[0].start) return null;
       if (ms >= flatWords[flatWords.length - 1].end) return flatWords[flatWords.length - 1];
 
       let low = 0;
@@ -330,7 +328,7 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
       if (high >= 0 && high < flatWords.length) {
         return flatWords[high];
       }
-      return flatWords[0];
+      return null;
     },
     [flatWords]
   );
@@ -347,6 +345,10 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
 
       const word = findActiveWord(ms);
       if (!word) {
+        if (activeWordIdRef.current !== null) {
+          activeWordIdRef.current = null;
+          setActiveWordId(null);
+        }
         caretEl.style.opacity = '0';
         return;
       }
@@ -372,7 +374,7 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
 
       // 2. Coordinata Y e altezza del cursore
       const targetY = wordRect.top - wrapRect.top;
-      const targetHeight = Math.max(20, wordRect.height);
+      const targetHeight = Math.max(18, wordRect.height);
 
       // 3. Gestione cambio riga (line wrap)
       const lastY = lastYRef.current;
@@ -395,13 +397,15 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
       lastYRef.current = targetY;
       caretEl.style.opacity = '1';
 
-      // 4. Auto-scroll fluido al cambio riga per mantenere la lettura centrata
-      if (isAutoScrollLockedRef.current && containerRef.current && isLineChange) {
-        const container = containerRef.current;
-        const targetScrollTop = targetY - (container.clientHeight * 0.38);
-        if (Math.abs(container.scrollTop - targetScrollTop) > 30) {
+      // 4. Auto-scroll fluido sul contenitore pagina al cambio riga
+      const scrollContainer = getScrollContainer();
+      if (isAutoScrollLockedRef.current && scrollContainer && isLineChange) {
+        const containerRect = scrollContainer.getBoundingClientRect();
+        const wrapperTopInScroll = wrapRect.top - containerRect.top + scrollContainer.scrollTop;
+        const targetScrollTop = wrapperTopInScroll + targetY - (scrollContainer.clientHeight * 0.38);
+        if (Math.abs(scrollContainer.scrollTop - targetScrollTop) > 30) {
           isProgrammaticScrollRef.current = true;
-          container.scrollTo({
+          scrollContainer.scrollTo({
             top: Math.max(0, targetScrollTop),
             behavior: 'smooth',
           });
@@ -411,12 +415,13 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
         }
       }
     },
-    [flatWords, findActiveWord]
+    [flatWords, findActiveWord, getScrollContainer]
   );
 
   const handleWordClick = useCallback(
     (word: FlatWord) => {
       onSeek(word.start / 1000);
+      currentMsRef.current = word.start;
       setCurrentMs(word.start);
       lastYRef.current = null; // force snap on seek
       requestAnimationFrame(() => {
@@ -434,6 +439,7 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
       const audio = audioRef.current;
       if (audio && !audio.paused) {
         const ms = Math.round(audio.currentTime * 1000);
+        currentMsRef.current = ms;
         setCurrentMs(ms);
         updateCaretPosition(ms, false);
         animId = requestAnimationFrame(tick);
@@ -453,12 +459,14 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
 
     const syncTime = () => {
       const ms = Math.round(audio.currentTime * 1000);
+      currentMsRef.current = ms;
       setCurrentMs(ms);
       updateCaretPosition(ms, false);
     };
 
     const handleSeeked = () => {
       const ms = Math.round(audio.currentTime * 1000);
+      currentMsRef.current = ms;
       setCurrentMs(ms);
       lastYRef.current = null;
       updateCaretPosition(ms, true);
@@ -477,13 +485,13 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
       audio.removeEventListener('playing', syncTime);
       audio.removeEventListener('pause', syncTime);
     };
-  }, [audioRef, updateCaretPosition]);
+  }, [audioRef, audioPath, updateCaretPosition]);
 
   // Sync iniziale e al ridimensionamento della finestra
   useEffect(() => {
     if (flatWords.length > 0) {
       const timer = setTimeout(() => {
-        updateCaretPosition(currentMs, true);
+        updateCaretPosition(currentMsRef.current, true);
       }, 50);
       return () => clearTimeout(timer);
     }
@@ -491,14 +499,14 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
 
   useEffect(() => {
     const handleResize = () => {
-      updateCaretPosition(currentMs, true);
+      updateCaretPosition(currentMsRef.current, true);
     };
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
-  }, [currentMs, updateCaretPosition]);
+  }, [updateCaretPosition]);
 
-  // ── Gestione Interruzione Manuale Utente (Scroll/Wheel) ─────────────────────
-  const handleUserInteraction = () => {
+  // ── Gestione Interruzione Manuale Utente sul contenitore scrollabile della pagina ──
+  const handleUserInteraction = useCallback(() => {
     if (isProgrammaticScrollRef.current) return;
 
     setIsAutoScrollLocked(false);
@@ -511,9 +519,22 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
     userScrollTimeoutRef.current = setTimeout(() => {
       setIsAutoScrollLocked(true);
       isAutoScrollLockedRef.current = true;
-      updateCaretPosition(currentMs, true);
+      updateCaretPosition(currentMsRef.current, true);
     }, 4500);
-  };
+  }, [updateCaretPosition]);
+
+  useEffect(() => {
+    const scrollContainer = getScrollContainer();
+    if (!scrollContainer) return;
+    scrollContainer.addEventListener('wheel', handleUserInteraction, { passive: true });
+    scrollContainer.addEventListener('touchmove', handleUserInteraction, { passive: true });
+    scrollContainer.addEventListener('scroll', handleUserInteraction, { passive: true });
+    return () => {
+      scrollContainer.removeEventListener('wheel', handleUserInteraction);
+      scrollContainer.removeEventListener('touchmove', handleUserInteraction);
+      scrollContainer.removeEventListener('scroll', handleUserInteraction);
+    };
+  }, [getScrollContainer, handleUserInteraction]);
 
   useEffect(() => {
     return () => {
@@ -526,140 +547,84 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
   const centerOnActiveCaret = useCallback(() => {
     setIsAutoScrollLocked(true);
     isAutoScrollLockedRef.current = true;
-    updateCaretPosition(currentMs, true);
-    if (containerRef.current) {
+    updateCaretPosition(currentMsRef.current, true);
+    const scrollContainer = getScrollContainer();
+    const wrapperEl = textWrapperRef.current;
+    if (scrollContainer && wrapperEl) {
+      const containerRect = scrollContainer.getBoundingClientRect();
+      const wrapRect = wrapperEl.getBoundingClientRect();
+      const wrapperTopInScroll = wrapRect.top - containerRect.top + scrollContainer.scrollTop;
       const caretTop = lastYRef.current ?? 0;
-      const container = containerRef.current;
-      const targetScrollTop = caretTop - (container.clientHeight * 0.38);
-      container.scrollTo({
+      const targetScrollTop = wrapperTopInScroll + caretTop - (scrollContainer.clientHeight * 0.38);
+      isProgrammaticScrollRef.current = true;
+      scrollContainer.scrollTo({
         top: Math.max(0, targetScrollTop),
         behavior: 'smooth',
       });
+      setTimeout(() => {
+        isProgrammaticScrollRef.current = false;
+      }, 450);
     }
-  }, [currentMs, updateCaretPosition]);
+  }, [getScrollContainer, updateCaretPosition]);
 
   const hasSyncData = Boolean(effectiveLines && effectiveLines.length > 0);
+  const hasRawTranscript = Boolean(rawTranscript && rawTranscript.trim().length > 0);
+  const isAtBeginningIdle = !isPlaying && currentMs <= 50;
 
   return (
-    <div className="relative w-full rounded-3xl overflow-hidden bg-[#07080d] border border-white/[0.08] shadow-[0_20px_50px_rgba(0,0,0,0.6)]">
-      {/* ── 1. Dynamic Mesh Gradient / Liquid Blur Canvas ── */}
-      <div className="absolute inset-0 overflow-hidden pointer-events-none z-0" aria-hidden="true">
-        <div
-          className="absolute -top-[10%] -left-[10%] w-[480px] h-[480px] rounded-full mix-blend-screen filter blur-[85px] opacity-65 animate-mesh-drift-1"
-          style={{ background: `radial-gradient(circle at center, ${palette.c1} 0%, transparent 70%)` }}
-        />
-        <div
-          className="absolute -bottom-[15%] -right-[10%] w-[520px] h-[520px] rounded-full mix-blend-screen filter blur-[90px] opacity-60 animate-mesh-drift-2"
-          style={{ background: `radial-gradient(circle at center, ${palette.c2} 0%, transparent 70%)` }}
-        />
-        <div
-          className="absolute top-[35%] right-[20%] w-[420px] h-[420px] rounded-full mix-blend-screen filter blur-[85px] opacity-55 animate-mesh-drift-3"
-          style={{ background: `radial-gradient(circle at center, ${palette.c3} 0%, transparent 70%)` }}
-        />
-        <div
-          className="absolute bottom-[25%] left-[20%] w-[400px] h-[400px] rounded-full mix-blend-screen filter blur-[80px] opacity-45 animate-mesh-drift-1"
-          style={{ background: `radial-gradient(circle at center, ${palette.c4} 0%, transparent 70%)` }}
-        />
-        {/* Heavy Glass Overlay */}
-        <div className="absolute inset-0 backdrop-blur-[90px] bg-gradient-to-b from-[#07080d]/50 via-[#07080d]/70 to-[#07080d]/85" />
-      </div>
-
-      {/* ── 2. Minimalist Apple-like Top Bar ── */}
-      <div className="relative z-20 flex items-center justify-between px-6 sm:px-8 py-3.5 border-b border-white/[0.06] bg-white/[0.02]">
-        <div className="flex items-center gap-2.5">
-          <Volume2 size={15} className="text-amber-300 opacity-90" />
-          <span className="text-xs font-semibold text-white/85 tracking-wide">
-            Trascrizione
-          </span>
-          {totalWords > 0 && (
-            <>
-              <span className="text-white/20">•</span>
-              <span className="text-[11px] font-mono tabular-nums text-white/40">
-                {totalWords} parole
+    <div className="relative w-full">
+      {/* ── 1. Intestazione discreta senza box ── */}
+      {(totalWords > 0 || isLoadingTimestamps || onCopyTranscript || rawTranscript || hasSyncData) && (
+        <div className="flex items-center justify-between mb-5 text-xs text-zinc-400 select-none">
+          <div className="flex items-center gap-2">
+            {totalWords > 0 && (
+              <span className="tabular-nums text-zinc-500">
+                {totalWords} {totalWords === 1 ? 'parola' : 'parole'}
               </span>
-            </>
-          )}
-          {isLoadingTimestamps && (
-            <div className="w-3 h-3 rounded-full border border-white/20 border-t-white/80 animate-spin ml-1.5 opacity-80" />
-          )}
-        </div>
-
-        {/* Pulsante Copia Trascrizione (Cosa vedi a schermo = cosa copi!) */}
-        {(onCopyTranscript || rawTranscript || (effectiveLines && effectiveLines.length > 0)) && (
-          <button
-            type="button"
-            onClick={handleCopy}
-            className="h-7 px-3 rounded-full liquid-glass-pill hover:bg-white/[0.14] text-xs font-medium text-white/85 border border-white/[0.14] transition-all flex items-center justify-center gap-1.5 cursor-pointer shadow-liquid-sm active:scale-95 leading-normal"
-            title="Copia l'intera trascrizione visibile a schermo negli appunti"
-          >
-            {isCopied ? (
-              <>
-                <Check size={12} className="text-emerald-400" />
-                <span className="text-emerald-300 font-semibold text-[11px] leading-normal">Copiato!</span>
-              </>
-            ) : (
-              <>
-                <Copy size={12} className="text-white/60" />
-                <span className="text-[11px] leading-normal">Copia</span>
-              </>
             )}
-          </button>
-        )}
-      </div>
+            {isLoadingTimestamps && (
+              <div className="w-3 h-3 rounded-full border border-white/20 border-t-white/80 animate-spin opacity-80" />
+            )}
+          </div>
 
-      {/* ── 3. Floating Re-Sync Button (Se l'utente ha fatto scroll manuale) ── */}
-      {!isAutoScrollLocked && hasSyncData && (
-        <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-30 animate-fade-in pointer-events-auto">
-          <button
-            type="button"
-            onClick={centerOnActiveCaret}
-            className="px-4 py-2 rounded-full liquid-glass text-xs font-semibold text-white/95 hover:text-white hover:bg-white/[0.16] border border-white/[0.22] shadow-[0_8px_30px_rgba(0,0,0,0.5)] backdrop-blur-2xl flex items-center gap-2 cursor-pointer transition-all active:scale-95 group"
-          >
-            <ArrowDownCircle size={15} className="text-amber-300 group-hover:translate-y-0.5 transition-transform" />
-            <span>Torna all'audio in riproduzione</span>
-          </button>
+          {(onCopyTranscript || rawTranscript || hasSyncData) && (
+            <button
+              type="button"
+              onClick={handleCopy}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs text-zinc-400 hover:text-zinc-100 hover:bg-white/[0.06] transition-colors cursor-pointer"
+              title="Copia l'intera trascrizione negli appunti"
+            >
+              {isCopied ? (
+                <>
+                  <Check size={12} className="text-emerald-400" />
+                  <span className="text-emerald-300 font-medium">Copiato</span>
+                </>
+              ) : (
+                <>
+                  <Copy size={12} />
+                  <span>Copia</span>
+                </>
+              )}
+            </button>
+          )}
         </div>
       )}
 
-      {/* ── 4. Continuous Flowing Transcript Viewport ── */}
-      <div
-        ref={containerRef}
-        onWheel={handleUserInteraction}
-        onTouchMove={handleUserInteraction}
-        onScroll={handleUserInteraction}
-        className="relative z-10 max-h-[calc(100vh-280px)] min-h-[380px] overflow-y-auto px-6 sm:px-12 py-10 space-y-7 scroll-smooth focus:outline-none select-text"
-        tabIndex={0}
-      >
-        {isLoadingTimestamps && !hasSyncData ? (
-          <div className="py-24 px-8 max-w-md mx-auto flex flex-col items-center justify-center space-y-5 text-center animate-fade-in">
-            <div className="w-10 h-10 rounded-2xl bg-white/[0.04] border border-white/[0.08] flex items-center justify-center shadow-liquid-sm">
-              <div className="w-4 h-4 border-2 border-white/20 border-t-white/80 rounded-full animate-spin" />
-            </div>
-            <div className="space-y-1">
-              <h4 className="text-sm font-semibold text-white/85 tracking-tight">Caricamento trascrizione...</h4>
-              <p className="text-xs text-white/40">Sincronizzazione dei passaggi audio in corso</p>
-            </div>
-            <div className="w-full space-y-2.5 pt-4 opacity-40">
-              <div className="h-2.5 bg-white/[0.12] rounded-full w-4/5 mx-auto animate-pulse" />
-              <div className="h-2.5 bg-white/[0.08] rounded-full w-full animate-pulse" />
-              <div className="h-2.5 bg-white/[0.10] rounded-full w-3/4 mx-auto animate-pulse" />
-            </div>
-          </div>
-        ) : hasSyncData ? (
-          <div ref={textWrapperRef} className="relative select-text space-y-7">
-            {/* ── Playhead Caret Cursor (Barra verticale text-caret) ── */}
+      {/* ── 2. Testo continuo appoggiato direttamente sulla tela dell'app ── */}
+      <div className="focus:outline-none select-text" tabIndex={0}>
+        {hasSyncData ? (
+          <div ref={textWrapperRef} className="relative select-text space-y-5">
+            {/* ── Cursore verticale bianco (Caret) ── */}
             <div
               ref={caretRef}
               className={clsx(
-                "pointer-events-none absolute z-20 rounded-full",
-                !isPlaying && "animate-caret-blink"
+                'pointer-events-none absolute z-20 rounded-full',
+                !isPlaying && 'animate-caret-blink'
               )}
               style={{
-                width: '2.5px',
-                background: subjectColor
-                  ? `linear-gradient(180deg, #ffffff 0%, ${subjectColor} 100%)`
-                  : 'linear-gradient(180deg, #ffffff 0%, #38bdf8 100%)',
-                boxShadow: `0 0 8px ${subjectColor || '#38bdf8'}, 0 0 16px ${subjectColor || '#38bdf8'}80`,
+                width: '2px',
+                backgroundColor: '#ffffff',
+                borderRadius: '1px',
                 top: 0,
                 left: 0,
                 transform: 'translate3d(0, 0, 0)',
@@ -672,7 +637,7 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
             {paragraphs.map((paragraph, pIdx) => (
               <p
                 key={pIdx}
-                className="leading-[2.2] text-lg sm:text-[1.28rem] font-normal tracking-tight text-white/90 select-text"
+                className="text-[15.5px] sm:text-base leading-[1.9] font-normal text-zinc-200/90 select-text"
               >
                 {paragraph.map((line) =>
                   line.words.map((word, wIdx) => {
@@ -699,12 +664,14 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
                             });
                           }}
                           className={clsx(
-                            "inline cursor-pointer select-text transition-colors duration-150",
-                            isWordActive
-                              ? "text-white font-semibold drop-shadow-[0_0_10px_rgba(255,255,255,0.7)]"
-                              : isWordPast
-                              ? "text-white/95"
-                              : "text-white/45 hover:text-white/80"
+                            'inline cursor-pointer select-text transition-colors duration-150',
+                            isAtBeginningIdle
+                              ? 'text-zinc-200/90 hover:text-white'
+                              : isWordActive
+                                ? 'text-white font-medium'
+                                : isWordPast
+                                  ? 'text-zinc-100'
+                                  : 'text-zinc-400/75 hover:text-zinc-100'
                           )}
                           title={`[${formatTimeMs(word.start)}] Clicca per ascoltare`}
                         >
@@ -718,27 +685,44 @@ export const AppleLyricsView: React.FC<AppleLyricsViewProps> = ({
               </p>
             ))}
           </div>
-        ) : rawTranscript ? (
-          <div className="space-y-4">
-            {rawTranscript.split(/\n\n+/).map((para, idx) => (
+        ) : hasRawTranscript ? (
+          <div className="space-y-5">
+            {rawTranscript!.split(/\n\n+/).map((para, idx) => (
               <p
                 key={idx}
-                className="leading-[2.2] text-lg sm:text-[1.28rem] font-medium tracking-tight text-white/85"
+                className="text-[15.5px] sm:text-base leading-[1.9] font-normal text-zinc-200/90"
               >
                 {para}
               </p>
             ))}
           </div>
+        ) : showTranscriptSkeleton ? (
+          <TranscriptSkeleton />
+        ) : isLoadingTimestamps ? (
+          <div className="min-h-[260px]" aria-busy="true" />
         ) : (
-          <div className="py-20 text-center space-y-3">
-            <Sparkles size={24} className="text-amber-300 mx-auto opacity-70" />
-            <h4 className="text-sm font-semibold text-white/80">Nessun testo trascritto</h4>
+          <div className="py-20 text-center space-y-2">
+            <h4 className="text-sm font-semibold text-white/75">Nessuna trascrizione</h4>
             <p className="text-xs text-white/40 max-w-sm mx-auto">
-              Nessuna trascrizione disponibile per questa lezione.
+              Non è stato rilevato alcun parlato in questa registrazione.
             </p>
           </div>
         )}
       </div>
+
+      {/* ── 3. Pillola discreta in basso per riallinearsi all'audio durante lo scroll manuale ── */}
+      {!isAutoScrollLocked && hasSyncData && isPlaying && (
+        <div className="sticky bottom-24 z-30 flex justify-center mt-6 pointer-events-none animate-fade-in">
+          <button
+            type="button"
+            onClick={centerOnActiveCaret}
+            className="pointer-events-auto px-3.5 py-1.5 rounded-full bg-[#121622]/90 hover:bg-[#1a2033] text-xs font-medium text-zinc-200 hover:text-white border border-white/[0.14] shadow-lg backdrop-blur-xl flex items-center gap-1.5 cursor-pointer transition-colors"
+          >
+            <ArrowDownCircle size={13} className="text-amber-300" />
+            <span>Torna all&apos;audio</span>
+          </button>
+        </div>
+      )}
     </div>
   );
 };

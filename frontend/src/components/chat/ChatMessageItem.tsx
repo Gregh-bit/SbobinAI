@@ -1,5 +1,4 @@
 import { useState, useRef, useEffect } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
 import {
   Copy,
   Check,
@@ -7,17 +6,31 @@ import {
   BookmarkPlus,
   Trash2,
   ChevronDown,
-  ChevronRight,
   BookOpen,
   Brain,
   Pencil,
-  CheckCircle2,
   Sparkles,
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import type { PersistentChatMessage } from '../../types';
 import MarkdownContent from '../MarkdownContent';
 import ChatActionCard from './ChatActionCard';
+import { getStudyModeMeta } from './ChatComposer';
+import Text3DFlip from './Text3DFlip';
+
+// Passaggi dinamici stile ChatGPT 2026 per la consultazione RAG e il ragionamento
+const RAG_SEARCH_STEPS = [
+  'Analisi delle fonti...',
+  'Consultazione degli appunti...',
+  'Ricerca nei materiali del corso...',
+  'Sintesi delle spiegazioni...',
+];
+
+const THINKING_REASONING_STEPS = [
+  'Ragionamento sui materiali...',
+  'Elaborazione dei concetti...',
+  'Strutturazione della risposta...',
+];
 
 export interface ParsedThinkingResult {
   thinking: string;
@@ -76,13 +89,18 @@ export interface ChatMessageItemProps {
   isSavedToQuaderno?: boolean;
   isSavingNote?: boolean;
   isDeleting?: boolean;
+  compact?: boolean;
   onOpenCitation?: (sourceId: string, page?: number) => void;
+  onOpenAudioSnippet?: (lectureId: number, seconds: number, autoPlay?: boolean) => void;
+  onOpenSettings?: () => void;
   onOpenQuiz?: (quizId: number) => void;
   onOpenOralQuestion?: (question: string, topic?: string) => void;
+  onOpenQuadernoLecture?: (lectureId: number) => void;
   onRegenerate?: (messageId: number) => void;
   onSaveNote?: (messageId: number) => void;
   onDelete?: (messageId: number) => void;
-  onEdit?: (messageId: number, newText: string) => void;
+  hasSubsequentQuizActions?: boolean;
+  onEdit?: (messageId: number, newText: string, rollbackQuiz?: boolean) => void;
   onSelectFollowup?: (text: string) => void;
 }
 
@@ -99,24 +117,30 @@ export default function ChatMessageItem({
   isSavedToQuaderno = false,
   isSavingNote = false,
   isDeleting = false,
+  compact = false,
+  hasSubsequentQuizActions = false,
   onOpenCitation,
+  onOpenAudioSnippet,
+  onOpenSettings,
   onOpenQuiz,
   onOpenOralQuestion,
+  onOpenQuadernoLecture,
   onRegenerate,
   onSaveNote,
   onDelete,
   onEdit,
 }: ChatMessageItemProps) {
   const [copied, setCopied] = useState(false);
-  const [thinkingExpanded, setThinkingExpanded] = useState(false);
-  const [sourcesExpanded, setSourcesExpanded] = useState(false);
+  const [traceExpanded, setTraceExpanded] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
   const [editText, setEditText] = useState(message.content);
+  const [revertQuiz, setRevertQuiz] = useState(true);
   const [showEditConfirmModal, setShowEditConfirmModal] = useState(false);
   const [showDeleteConfirmModal, setShowDeleteConfirmModal] = useState(false);
 
   const copyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isMountedRef = useRef(true);
+  const thinkingContainerRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -164,16 +188,64 @@ export default function ChatMessageItem({
   if (message.role === 'user') {
     const canDelete = message.id > 0 && !isAnyStreaming && !isDeleting && Boolean(onDelete);
     const canEdit = message.id > 0 && !isAnyStreaming && Boolean(onEdit);
+    const modeMeta = getStudyModeMeta(message.mode);
+
+    const actionButtons = (
+      <>
+        <button
+          type="button"
+          onClick={() => {
+            const fullText = modeMeta
+              ? (message.content ? `[${modeMeta.label}] ${message.content}` : `[${modeMeta.label}]`)
+              : message.content;
+            handleCopy(fullText);
+          }}
+          title="Copia messaggio"
+          className="p-1 rounded-lg text-zinc-500 hover:text-zinc-200 hover:bg-white/[0.06] transition-colors cursor-pointer"
+        >
+          {copied ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
+        </button>
+        {canEdit && (
+          <button
+            type="button"
+            onClick={() => {
+              setEditText(message.content);
+              setIsEditing(true);
+            }}
+            title="Modifica messaggio"
+            className="p-1 rounded-lg text-zinc-500 hover:text-indigo-300 hover:bg-indigo-500/10 transition-colors cursor-pointer"
+          >
+            <Pencil size={12} />
+          </button>
+        )}
+        {canDelete && (
+          <button
+            type="button"
+            onClick={() => setShowDeleteConfirmModal(true)}
+            title="Elimina messaggio"
+            className="p-1 rounded-lg text-zinc-500 hover:text-rose-400 hover:bg-rose-500/10 transition-colors cursor-pointer"
+          >
+            <Trash2 size={12} />
+          </button>
+        )}
+      </>
+    );
 
     return (
-      <div className="group flex flex-col items-end gap-1 animate-fade-in relative w-full">
+      <div
+        className={clsx(
+          'group flex flex-col items-end relative w-full',
+          compact ? 'gap-0' : 'gap-1',
+          message.id < 0 && 'animate-fade-in'
+        )}
+      >
         {isEditing ? (
-          <div className="w-full max-w-[85%] bg-zinc-800/95 border border-white/15 rounded-2xl p-3 shadow-lg flex flex-col gap-2">
+          <div className="w-full max-w-[85%] bg-[#121622]/95 border border-white/[0.14] rounded-2xl p-3 shadow-lg flex flex-col gap-2">
             <textarea
               value={editText}
               onChange={(e) => setEditText(e.target.value)}
               rows={Math.min(8, Math.max(2, editText.split('\n').length))}
-              className="w-full bg-zinc-900/90 border border-white/10 rounded-xl p-2.5 text-zinc-100 text-[13px] leading-relaxed resize-y focus:outline-none focus:ring-1 focus:ring-indigo-400/50"
+              className="w-full bg-black/30 border border-white/[0.10] rounded-xl p-2.5 text-white/95 text-[13px] leading-relaxed resize-y focus:outline-none focus:border-white/[0.24]"
               placeholder="Modifica il tuo messaggio..."
               autoFocus
             />
@@ -184,7 +256,7 @@ export default function ChatMessageItem({
                   setIsEditing(false);
                   setEditText(message.content);
                 }}
-                className="px-3 py-1 rounded-xl text-xs text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06] transition-colors cursor-pointer"
+                className="px-3.5 py-1.5 rounded-full bg-white/[0.06] hover:bg-white/[0.12] text-xs font-medium text-zinc-300 hover:text-white transition-colors cursor-pointer"
               >
                 Annulla
               </button>
@@ -192,49 +264,48 @@ export default function ChatMessageItem({
                 type="button"
                 disabled={!editText.trim() || editText.trim() === message.content.trim()}
                 onClick={() => setShowEditConfirmModal(true)}
-                className="px-3.5 py-1 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                className="px-3.5 py-1.5 rounded-full bg-white text-[#0d1017] hover:bg-white/90 text-xs font-semibold transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 Conferma e Invia
               </button>
             </div>
           </div>
+        ) : compact ? (
+          <div className="flex items-center justify-end gap-1 w-full">
+            <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 pointer-events-none group-hover:pointer-events-auto focus-within:pointer-events-auto transition-opacity flex-shrink-0">
+              {actionButtons}
+            </div>
+            <div className="bg-white/[0.08] border border-white/[0.11] rounded-3xl text-white/95 leading-relaxed shadow-sm select-text px-3.5 py-2 max-w-[88%] text-[12.5px]">
+              <div className="flex flex-wrap items-center gap-2">
+                {modeMeta && (
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-sky-500/15 border border-sky-400/30 text-sky-300 text-xs font-medium select-none shadow-sm flex-shrink-0">
+                    <modeMeta.icon size={12} className={clsx(modeMeta.colorClass, 'flex-shrink-0')} />
+                    <span>{modeMeta.label}</span>
+                  </span>
+                )}
+                {message.content && (
+                  <span className="whitespace-pre-wrap break-words">{message.content}</span>
+                )}
+              </div>
+            </div>
+          </div>
         ) : (
           <>
-            <div className="bg-zinc-800/80 border border-white/10 rounded-3xl px-4 py-2.5 max-w-[80%] text-zinc-100 text-[13px] leading-relaxed shadow-sm select-text">
-              <p className="whitespace-pre-wrap break-words">{message.content}</p>
+            <div className="bg-white/[0.08] border border-white/[0.11] rounded-3xl text-white/95 leading-relaxed shadow-sm select-text px-4 py-2.5 max-w-[80%] text-[13px]">
+              <div className="flex flex-wrap items-center gap-2">
+                {modeMeta && (
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-sky-500/15 border border-sky-400/30 text-sky-300 text-xs font-medium select-none shadow-sm flex-shrink-0">
+                    <modeMeta.icon size={12} className={clsx(modeMeta.colorClass, 'flex-shrink-0')} />
+                    <span>{modeMeta.label}</span>
+                  </span>
+                )}
+                {message.content && (
+                  <span className="whitespace-pre-wrap break-words">{message.content}</span>
+                )}
+              </div>
             </div>
             <div className="flex items-center gap-1 pr-2 opacity-0 group-hover:opacity-100 transition-opacity">
-              <button
-                type="button"
-                onClick={() => handleCopy(message.content)}
-                title="Copia messaggio"
-                className="p-1 rounded-lg text-zinc-500 hover:text-zinc-200 hover:bg-white/[0.06] transition-colors cursor-pointer"
-              >
-                {copied ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
-              </button>
-              {canEdit && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setEditText(message.content);
-                    setIsEditing(true);
-                  }}
-                  title="Modifica messaggio"
-                  className="p-1 rounded-lg text-zinc-500 hover:text-indigo-300 hover:bg-indigo-500/10 transition-colors cursor-pointer"
-                >
-                  <Pencil size={12} />
-                </button>
-              )}
-              {canDelete && (
-                <button
-                  type="button"
-                  onClick={() => setShowDeleteConfirmModal(true)}
-                  title="Elimina messaggio"
-                  className="p-1 rounded-lg text-zinc-500 hover:text-rose-400 hover:bg-rose-500/10 transition-colors cursor-pointer"
-                >
-                  <Trash2 size={12} />
-                </button>
-              )}
+              {actionButtons}
             </div>
           </>
         )}
@@ -247,16 +318,34 @@ export default function ChatMessageItem({
             }}
             className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-fade-in"
           >
-            <div className="w-full max-w-sm rounded-2xl bg-zinc-900 border border-white/10 p-5 shadow-2xl flex flex-col gap-3 text-left">
+            <div className="w-full max-w-sm rounded-3xl liquid-modal p-5 flex flex-col gap-3.5 text-left">
               <div className="text-sm font-semibold text-zinc-100">Modifica messaggio</div>
               <p className="text-xs text-zinc-300 leading-relaxed">
-                Modificare questo messaggio cancellerà tutte le risposte successive e l&apos;IA ne genererà una nuova con il testo aggiornato. Continuare?
+                Le risposte successive verranno cancellate per generare una nuova risposta aggiornata.
               </p>
-              <div className="flex items-center justify-end gap-2 pt-2">
+
+              {hasSubsequentQuizActions && (
+                <label className="flex items-start gap-2.5 p-3 rounded-2xl bg-white/[0.04] border border-white/[0.08] cursor-pointer hover:bg-white/[0.07] transition-colors select-none">
+                  <input
+                    type="checkbox"
+                    checked={revertQuiz}
+                    onChange={(e) => setRevertQuiz(e.target.checked)}
+                    className="mt-0.5 rounded border-zinc-600 text-indigo-500 focus:ring-indigo-500/30"
+                  />
+                  <div className="flex flex-col text-left">
+                    <span className="text-xs font-medium text-zinc-200">Ripristina quiz allo stato precedente</span>
+                    <span className="text-[11px] text-zinc-400 leading-normal">
+                      Annulla le modifiche alle domande effettuate dai messaggi successivi
+                    </span>
+                  </div>
+                </label>
+              )}
+
+              <div className="flex items-center justify-end gap-2 pt-1">
                 <button
                   type="button"
                   onClick={() => setShowEditConfirmModal(false)}
-                  className="px-3.5 py-1.5 rounded-xl bg-white/[0.06] hover:bg-white/[0.1] text-zinc-300 text-xs font-medium transition-colors cursor-pointer"
+                  className="px-4 py-1.5 rounded-full bg-white/[0.06] hover:bg-white/[0.12] text-zinc-300 hover:text-white text-xs font-medium transition-colors cursor-pointer"
                 >
                   Annulla
                 </button>
@@ -265,9 +354,9 @@ export default function ChatMessageItem({
                   onClick={() => {
                     setShowEditConfirmModal(false);
                     setIsEditing(false);
-                    onEdit?.(message.id, editText.trim());
+                    onEdit?.(message.id, editText.trim(), revertQuiz);
                   }}
-                  className="px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium transition-colors cursor-pointer"
+                  className="px-4 py-1.5 rounded-full bg-white text-[#0d1017] hover:bg-white/90 text-xs font-semibold transition-colors cursor-pointer"
                 >
                   Conferma
                 </button>
@@ -284,7 +373,7 @@ export default function ChatMessageItem({
             }}
             className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-fade-in"
           >
-            <div className="w-full max-w-sm rounded-2xl bg-zinc-900 border border-white/10 p-5 shadow-2xl flex flex-col gap-3 text-left">
+            <div className="w-full max-w-sm rounded-3xl liquid-modal p-5 flex flex-col gap-3 text-left">
               <div className="text-sm font-semibold text-zinc-100">Elimina messaggio</div>
               <p className="text-xs text-zinc-300 leading-relaxed">
                 Eliminare questo messaggio e tutta la conversazione successiva?
@@ -293,7 +382,7 @@ export default function ChatMessageItem({
                 <button
                   type="button"
                   onClick={() => setShowDeleteConfirmModal(false)}
-                  className="px-3.5 py-1.5 rounded-xl bg-white/[0.06] hover:bg-white/[0.1] text-zinc-300 text-xs font-medium transition-colors cursor-pointer"
+                  className="px-4 py-1.5 rounded-full bg-white/[0.06] hover:bg-white/[0.12] text-zinc-300 hover:text-white text-xs font-medium transition-colors cursor-pointer"
                 >
                   Annulla
                 </button>
@@ -303,7 +392,7 @@ export default function ChatMessageItem({
                     setShowDeleteConfirmModal(false);
                     onDelete?.(message.id);
                   }}
-                  className="px-3.5 py-1.5 rounded-xl bg-rose-600 hover:bg-rose-500 text-white text-xs font-medium transition-colors cursor-pointer"
+                  className="px-4 py-1.5 rounded-full bg-red-500/20 hover:bg-red-500/30 text-red-200 border border-red-500/35 text-xs font-medium transition-colors cursor-pointer"
                 >
                   Elimina
                 </button>
@@ -322,153 +411,258 @@ export default function ChatMessageItem({
   const isThinkingStreaming = isStreamingThis && parsed.isThinkingStreaming;
   const waitingFirstToken = isStreamingThis && !visibleContent && !isThinkingStreaming;
 
-  const hasCitations = Array.isArray(message.citations) && message.citations.length > 0;
-  const hasContextUsed = Boolean(message.context_used && message.context_used.trim());
   const isPersisted = message.id > 0;
-  const showActions = !isStreamingThis && isPersisted;
+  const isMissingLlmNotice =
+    !isStreamingThis &&
+    (visibleContent.includes('modello LLM non è ancora stato scaricato') ||
+      visibleContent.includes('Nessun modello LLM scaricato'));
+  const showActions = !isStreamingThis && isPersisted && !isMissingLlmNotice;
 
-  // ChatGPT 2026 dynamic status header
+  // Rendi "Impostazioni" un link sottolineato cliccabile anche nei messaggi già salvati
+  const renderedContent =
+    isMissingLlmNotice && onOpenSettings
+      ? visibleContent.replace(/\*\*(Impostazioni)\*\*/gi, '[[action:settings|$1]]')
+      : visibleContent;
+
+  // ChatGPT 2026 dynamic status header con roll continuo tra fasi successive
   const isBusy = isStreamingThis && !visibleContent;
-  let headerLabel = 'Fonti ed elaborazione del corso';
-  if (isThinkingStreaming) {
-    headerLabel = 'Ragionamento sui materiali in corso...';
-  } else if (waitingFirstToken) {
-    headerLabel = 'Analisi delle fonti e appunti del corso...';
-  }
+  const [stepIndex, setStepIndex] = useState(0);
+
+  useEffect(() => {
+    if (!isBusy) {
+      setStepIndex(0);
+      return;
+    }
+    const timer = setInterval(() => {
+      setStepIndex((prev) => prev + 1);
+    }, 3500);
+    return () => clearInterval(timer);
+  }, [isBusy]);
+
+  useEffect(() => {
+    if (isThinkingStreaming && traceExpanded && thinkingContainerRef.current) {
+      thinkingContainerRef.current.scrollTop = thinkingContainerRef.current.scrollHeight;
+    }
+  }, [combinedThinking, isThinkingStreaming, traceExpanded]);
+
+  // Approccio A + Antigravity hierarchical timeline: visibile solo con dati reali
+  const hasRealSources = Array.isArray(message.citations) && message.citations.length > 0;
+  const hasThinking = Boolean(combinedThinking && combinedThinking.trim().length > 0);
+  const showTrace = !isBusy && (hasThinking || hasRealSources);
+
+  const traceHeaderLabel =
+    hasThinking && hasRealSources
+      ? 'Fonti e ragionamento del corso'
+      : hasThinking
+        ? 'Ragionamento del modello'
+        : `${message.citations.length} ${message.citations.length === 1 ? 'fonte consultata' : 'fonti consultate'}`;
 
   return (
-    <div className="group flex flex-col items-start w-full max-w-full animate-fade-in">
-      {/* Assistant Header: ChatGPT 2026 unified status & collapsible sources (Apple Dynamic Island Slide & Blur) */}
-      <div className="w-full mb-1">
-        <motion.button
-          layout="position"
-          type="button"
-          onClick={() => setSourcesExpanded((prev) => !prev)}
-          className="inline-flex items-center gap-1.5 py-1 text-xs sm:text-[13px] font-normal text-zinc-400 hover:text-zinc-200 transition-colors cursor-pointer group select-none"
-          title="Mostra fonti ed elaborazione del corso"
-        >
-          <div className="relative overflow-hidden inline-flex items-center min-h-[20px]">
-            <AnimatePresence mode="wait" initial={false}>
-              <motion.div
-                key={headerLabel}
-                initial={{ y: 8, opacity: 0, filter: 'blur(4px)' }}
-                animate={{ y: 0, opacity: 1, filter: 'blur(0px)' }}
-                exit={{ y: -8, opacity: 0, filter: 'blur(4px)' }}
-                transition={{
-                  duration: 0.24,
-                  ease: [0.16, 1, 0.3, 1],
-                }}
-                className="inline-flex items-center gap-1.5"
+    <div
+      className={clsx(
+        'group flex flex-col items-start w-full max-w-full',
+        (isStreamingThis || message.id < 0 || isMissingLlmNotice) && 'animate-fade-in'
+      )}
+    >
+      {/* 1. Stato durante lo streaming attivo */}
+      {isBusy && (
+        <div className="w-full mb-1">
+          {isThinkingStreaming ? (
+            <div>
+              <button
+                type="button"
+                onClick={() => setTraceExpanded((prev) => !prev)}
+                className={clsx(
+                  'inline-flex items-center py-1 font-normal text-zinc-400 hover:text-zinc-200 transition-colors group select-none cursor-pointer',
+                  compact ? 'text-[11.5px]' : 'text-xs sm:text-[13px]'
+                )}
+                title={traceExpanded ? 'Nascondi passaggi' : 'Mostra ragionamento in tempo reale'}
               >
-                {isBusy ? (
-                  <Sparkles size={14} className="text-zinc-400 animate-pulse flex-shrink-0" />
-                ) : (
-                  <BookOpen size={14} className="text-zinc-400 group-hover:text-zinc-200 transition-colors flex-shrink-0" />
-                )}
-                <span className={clsx(isBusy && 'chat-shimmer-text font-medium')}>
-                  {headerLabel}
-                </span>
-              </motion.div>
-            </AnimatePresence>
-          </div>
-          <ChevronDown
-            size={13}
-            className={clsx(
-              'text-zinc-500 group-hover:text-zinc-300 transition-transform duration-200 flex-shrink-0',
-              sourcesExpanded && 'rotate-180'
-            )}
-          />
-        </motion.button>
-
-        <AnimatePresence>
-          {sourcesExpanded && (
-            <motion.div
-              initial={{ opacity: 0, height: 0, y: -4 }}
-              animate={{ opacity: 1, height: 'auto', y: 0 }}
-              exit={{ opacity: 0, height: 0, y: -4 }}
-              transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
-              className="overflow-hidden"
-            >
-              <div className="mt-1.5 pl-3.5 border-l border-white/10 flex flex-col w-full max-w-xl space-y-1.5">
-                {hasCitations ? (
-                  message.citations.map((cit, idx) => {
-                    const isLecture = cit.source_type === 'lecture';
-                    const isQuaderno = cit.source_type === 'quaderno' || cit.source_type === 'note';
-                    const title = cit.title || cit.label || 'materiale del corso';
-
-                    let description = '';
-                    if (isLecture) {
-                      description =
-                        typeof cit.page === 'number'
-                          ? `Consultata la trascrizione di "${title}" al min. ${cit.page}`
-                          : `Consultata la trascrizione di "${title}"`;
-                    } else if (isQuaderno) {
-                      description = title ? `Esaminati gli appunti del Quaderno: "${title}"` : 'Esaminati gli appunti del Quaderno';
-                    } else {
-                      description =
-                        typeof cit.page === 'number'
-                          ? `Verificate le slide di "${title}" a pag. ${cit.page}`
-                          : `Verificate le slide di "${title}"`;
-                    }
-
-                    return (
-                      <div
-                        key={`${cit.source_id}-${cit.page ?? 'x'}-${idx}`}
-                        onClick={() => onOpenCitation?.(cit.source_id, cit.page ?? undefined)}
-                        className="text-zinc-400 text-xs py-0.5 leading-relaxed hover:text-zinc-100 transition-colors cursor-pointer select-text"
-                      >
-                        {description}
-                      </div>
-                    );
-                  })
-                ) : hasContextUsed ? (
-                  <div className="text-zinc-400 text-xs py-0.5 leading-relaxed select-text">
-                    Esaminati i materiali del corso: {message.context_used}
-                  </div>
-                ) : (
-                  <div className="text-zinc-400 text-xs py-0.5 leading-relaxed select-text">
-                    Analisi diretta dei documenti e del contesto del corso
-                  </div>
-                )}
-
-                {/* Embedded Reasoning step inside sources if present */}
-                {combinedThinking && (
-                  <div className="mt-1 pt-1.5 border-t border-white/[0.06] space-y-1">
-                    <button
-                      type="button"
-                      onClick={() => setThinkingExpanded((prev) => !prev)}
-                      className="text-[11px] font-medium text-zinc-400 hover:text-zinc-200 flex items-center gap-1.5 transition-colors cursor-pointer"
-                    >
-                      <Brain size={12} className="text-zinc-400" />
-                      <span>Passaggi di ragionamento</span>
-                      {thinkingExpanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-                    </button>
-                    {thinkingExpanded && (
-                      <div className="text-xs text-zinc-400/90 leading-relaxed whitespace-pre-wrap pl-2 border-l border-white/10 max-h-56 overflow-y-auto select-text font-mono text-[11px] mt-1">
-                        {combinedThinking}
-                      </div>
+                <div className="relative inline-flex items-center min-h-[20px] gap-1.5 whitespace-nowrap">
+                  <Brain size={compact ? 13 : 14} className="text-indigo-400 animate-pulse flex-shrink-0" />
+                  <Text3DFlip
+                    text={THINKING_REASONING_STEPS[stepIndex % THINKING_REASONING_STEPS.length]}
+                    rotateDirection="top"
+                    wordClassName="chat-shimmer-text font-medium"
+                  />
+                  <ChevronDown
+                    size={compact ? 12 : 13}
+                    className={clsx(
+                      'text-zinc-500 hover:text-zinc-300 transition-transform duration-200 ml-0.5',
+                      traceExpanded && 'rotate-180'
                     )}
+                  />
+                </div>
+              </button>
+              <div
+                aria-hidden={!traceExpanded}
+                className={clsx(
+                  'grid w-full min-w-0 transition-[grid-template-rows,opacity] duration-200 ease-out',
+                  traceExpanded
+                    ? 'grid-rows-[1fr] opacity-100'
+                    : 'grid-rows-[0fr] opacity-0 pointer-events-none'
+                )}
+              >
+                <div className="overflow-hidden min-h-0 w-full min-w-0">
+                  <div className="pl-3.5 border-l border-white/10 flex flex-col w-full py-1.5 mb-1">
+                    <div className="inline-flex items-center gap-1.5 text-[12px] font-medium text-zinc-300 mb-1 select-none">
+                      <Brain size={13} className="text-indigo-400 flex-shrink-0" />
+                      <span>Ragionamento in corso...</span>
+                    </div>
+                    <div
+                      ref={thinkingContainerRef}
+                      className="ml-5 text-xs sm:text-[12.5px] text-zinc-400/90 leading-relaxed whitespace-pre-wrap select-text max-h-72 overflow-y-auto"
+                    >
+                      {combinedThinking || <span className="text-zinc-500 italic">Avvio del ragionamento del modello...</span>}
+                      <span className="inline-block w-1.5 h-3.5 ml-1 bg-indigo-400 animate-pulse align-middle" />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : waitingFirstToken ? (
+            <div className="inline-flex items-center py-1 font-normal text-zinc-400 text-xs sm:text-[13px] gap-1.5 select-none">
+              <Sparkles size={compact ? 13 : 14} className="text-zinc-400 animate-pulse flex-shrink-0" />
+              <Text3DFlip
+                text={RAG_SEARCH_STEPS[stepIndex % RAG_SEARCH_STEPS.length]}
+                rotateDirection="top"
+                wordClassName="chat-shimmer-text font-medium"
+              />
+            </div>
+          ) : null}
+        </div>
+      )}
+
+      {/* 2. Badge unificato stile timeline Antigravity (visibile SOLO se ci sono dati reali) */}
+      {showTrace && (
+        <div className="w-full min-w-0 mb-1.5 flex flex-col items-start">
+          <button
+            type="button"
+            onClick={() => setTraceExpanded((prev) => !prev)}
+            className={clsx(
+              'inline-flex items-center py-0.5 gap-1.5 font-normal text-zinc-400 hover:text-zinc-200 transition-colors group select-none cursor-pointer',
+              compact ? 'text-[11.5px]' : 'text-xs sm:text-[13px]'
+            )}
+            title={traceExpanded ? 'Nascondi dettagli' : 'Mostra passaggi ed elaborazione'}
+          >
+            {hasThinking ? (
+              <Brain size={compact ? 13 : 14} className="text-zinc-400 group-hover:text-indigo-300 transition-colors flex-shrink-0" />
+            ) : (
+              <BookOpen size={compact ? 13 : 14} className="text-zinc-400 group-hover:text-zinc-200 transition-colors flex-shrink-0" />
+            )}
+            <span>{traceHeaderLabel}</span>
+            <ChevronDown
+              size={compact ? 12 : 13}
+              className={clsx(
+                'text-zinc-500 group-hover:text-zinc-300 transition-transform duration-200 ml-0.5',
+                traceExpanded && 'rotate-180'
+              )}
+            />
+          </button>
+
+          {/* Timeline / Roadmap gerarchica espansa stile Antigravity (CSS Grid, zero layout shift) */}
+          <div
+            aria-hidden={!traceExpanded}
+            className={clsx(
+              'grid w-full min-w-0 max-w-2xl transition-[grid-template-rows,opacity] duration-200 ease-out',
+              traceExpanded
+                ? 'grid-rows-[1fr] opacity-100'
+                : 'grid-rows-[0fr] opacity-0 pointer-events-none'
+            )}
+          >
+            <div className="overflow-hidden min-h-0 w-full min-w-0">
+              <div className="pl-3.5 border-l border-white/10 flex flex-col w-full space-y-3.5 py-1.5">
+                {/* Step 1: Fonti e materiali consultati (se presenti) */}
+                {hasRealSources && (
+                  <div className="flex flex-col space-y-1.5">
+                    <div className="inline-flex items-center gap-1.5 text-[12px] font-medium text-zinc-300 select-none">
+                      <BookOpen size={13} className="text-zinc-400 flex-shrink-0" />
+                      <span>Materiali e fonti consultate</span>
+                    </div>
+                    <div className="flex flex-col space-y-1 ml-5">
+                      {message.citations.map((cit, idx) => {
+                        const isLiveLecture = cit.source_type === 'live_lecture';
+                        const isLecture = cit.source_type === 'lecture';
+                        const isQuaderno = cit.source_type === 'quaderno' || cit.source_type === 'note';
+                        const title = cit.title || cit.label || 'materiale del corso';
+
+                        let description = '';
+                        if (isLiveLecture) {
+                          description = 'Trascrizione in diretta della lezione';
+                        } else if (isLecture) {
+                          description =
+                            typeof cit.page === 'number'
+                              ? `Trascrizione di "${title}" · min. ${cit.page}`
+                              : `Trascrizione di "${title}"`;
+                        } else if (isQuaderno) {
+                          description = title ? `Appunti del Quaderno · "${title}"` : 'Appunti del Quaderno';
+                        } else {
+                          description =
+                            typeof cit.page === 'number'
+                              ? `Slide di "${title}" · pag. ${cit.page}`
+                              : `Slide di "${title}"`;
+                        }
+
+                        return (
+                          <div
+                            key={`${cit.source_id}-${cit.page ?? 'x'}-${idx}`}
+                            onClick={
+                              isLiveLecture
+                                ? undefined
+                                : isLecture && onOpenAudioSnippet && typeof cit.page === 'number'
+                                  ? () => onOpenAudioSnippet(Number(cit.source_id), Number(cit.page) * 60)
+                                  : isQuaderno && onOpenQuadernoLecture && typeof cit.source_id === 'number'
+                                    ? () => onOpenQuadernoLecture(Number(cit.source_id))
+                                    : onOpenCitation
+                                      ? () => onOpenCitation(cit.source_id, cit.page ?? undefined)
+                                      : undefined
+                            }
+                            className={clsx(
+                              'text-[11.5px] text-zinc-400 hover:text-zinc-200 transition-colors flex items-center gap-2 py-0.5 select-none',
+                              (onOpenCitation || (isLecture && onOpenAudioSnippet) || (isQuaderno && onOpenQuadernoLecture)) &&
+                                !isLiveLecture
+                                ? 'cursor-pointer group/cit'
+                                : 'cursor-default'
+                            )}
+                          >
+                            <span className="w-1 h-1 rounded-full bg-zinc-600 group-hover/cit:bg-zinc-400 flex-shrink-0" />
+                            <span className="truncate">{description}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
                   </div>
                 )}
 
-                {!isStreamingThis && (
-                  <div className="text-zinc-400 text-xs py-1 leading-relaxed flex items-center gap-2 border-t border-white/[0.06] mt-1 pt-1.5 font-medium">
-                    <CheckCircle2 size={13} className="text-zinc-400 flex-shrink-0" />
-                    <span>Consultazione materiali completata</span>
+                {/* Step 2: Ragionamento del modello (se presente, testo libero senza box e senza tasto copia) */}
+                {hasThinking && (
+                  <div className="flex flex-col space-y-1.5">
+                    <div className="inline-flex items-center gap-1.5 text-[12px] font-medium text-zinc-300 select-none">
+                      <Brain size={13} className="text-indigo-400 flex-shrink-0" />
+                      <span>Ragionamento del modello</span>
+                    </div>
+                    <div
+                      ref={thinkingContainerRef}
+                      className="ml-5 text-xs sm:text-[12.5px] text-zinc-400/90 leading-relaxed whitespace-pre-wrap select-text max-h-80 overflow-y-auto"
+                    >
+                      {combinedThinking}
+                    </div>
                   </div>
                 )}
               </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-      </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Borderless Flowing Markdown + KaTeX + Citations Prose */}
-      {visibleContent && (
+      {renderedContent && (
         <div className="w-full max-w-full text-zinc-100 select-text mt-1.5">
           <MarkdownContent
-            content={visibleContent}
+            content={renderedContent}
             onOpenCitation={onOpenCitation}
+            onOpenAudioSnippet={onOpenAudioSnippet}
+            onOpenSettings={onOpenSettings}
             className="chat-prose"
           />
         </div>
@@ -481,6 +675,7 @@ export default function ChatMessageItem({
             action={message.action}
             onOpenQuiz={onOpenQuiz}
             onOpenOralQuestion={onOpenOralQuestion}
+            onOpenQuadernoLecture={onOpenQuadernoLecture}
           />
         </div>
       )}

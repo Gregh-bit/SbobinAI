@@ -5,6 +5,7 @@ import Sidebar from './components/Sidebar';
 import SubjectDashboard from './components/SubjectDashboard';
 import EmptyState from './components/EmptyState';
 import ErrorBoundary from './components/ErrorBoundary';
+import { QuadernoSkeleton, useDelayedLoading } from './components/Skeleton';
 import { SettingsProvider, useSettings, isAutoUpdateEnabled } from './lib/SettingsContext';
 import { checkAndAutoInstall, type BootUpdateEvent } from './lib/useUpdater';
 import { getBackendStatus, relaunchApp } from './lib/tauri';
@@ -57,15 +58,6 @@ function BackendLoadingGate({ children }: { children: React.ReactNode }) {
       cancelled = true;
     };
   }, []);
-
-  // Pulizia automatica file orfani, vacuum DB e ottimizzazione storage ad ogni avvio dell'app
-  useEffect(() => {
-    if (isReady) {
-      void api.settings.cleanOrphans().catch((err) => {
-        console.warn('[Startup] Ottimizzazione e pulizia automatica saltata:', err);
-      });
-    }
-  }, [isReady]);
 
   useEffect(() => {
     let cancelled = false;
@@ -258,6 +250,12 @@ function MainApp() {
   const [loadingSubjects, setLoadingSubjects] = useState(true);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
+  const [lastMovedLectureId, setLastMovedLectureId] = useState<number | null>(null);
+  const showSubjectsSkeleton = useDelayedLoading(
+    settings.setupComplete && loadingSubjects && subjects.length === 0,
+    140,
+    220
+  );
 
   const loadSubjects = useCallback(async (retries = 5) => {
     setLoadingSubjects(true);
@@ -342,6 +340,55 @@ function MainApp() {
     setActiveLecture(lecture);
   };
 
+  const handleMoveLecture = useCallback(async (lectureId: number, targetSubjectId: number) => {
+    try {
+      await api.lectures.move(lectureId, targetSubjectId);
+      const currentSubId = selectedSubject?.id;
+      setSubjects((prev) =>
+        prev.map((s) => {
+          if (s.id === currentSubId) {
+            return { ...s, lecture_count: Math.max(0, (s.lecture_count || 1) - 1) };
+          }
+          if (s.id === targetSubjectId) {
+            return { ...s, lecture_count: (s.lecture_count || 0) + 1 };
+          }
+          return s;
+        })
+      );
+      setSelectedSubject((prev) =>
+        prev
+          ? {
+              ...prev,
+              lecture_count: Math.max(0, (prev.lecture_count || 1) - 1),
+            }
+          : prev
+      );
+      setLastMovedLectureId(lectureId);
+    } catch (err) {
+      console.error('[App] Errore spostamento lezione:', err);
+      throw err;
+    }
+  }, [selectedSubject]);
+
+  const handleLectureCountChange = useCallback((subjectId: number, count: number) => {
+    setSubjects((prev) => {
+      let changed = false;
+      const next = prev.map((s) => {
+        if (s.id === subjectId && s.lecture_count !== count) {
+          changed = true;
+          return { ...s, lecture_count: count };
+        }
+        return s;
+      });
+      return changed ? next : prev;
+    });
+    setSelectedSubject((prev) =>
+      prev && prev.id === subjectId && prev.lecture_count !== count
+        ? { ...prev, lecture_count: count }
+        : prev
+    );
+  }, []);
+
   return (
     <>
       {/* Onboarding Wizard a tutto schermo se setupComplete è false */}
@@ -359,6 +406,7 @@ function MainApp() {
             onAdd={handleAddSubject}
             onUpdate={handleUpdateSubject}
             onDelete={handleDeleteSubject}
+            onMoveLecture={handleMoveLecture}
             isLoading={loadingSubjects}
             isRecording={isRecording}
             onOpenSettings={() => setShowSettingsModal(true)}
@@ -369,10 +417,20 @@ function MainApp() {
               <SubjectDashboard
                 key={selectedSubject.id}
                 subject={selectedSubject}
+                allSubjects={subjects}
                 onRecordingChange={setIsRecording}
                 onStartLecture={handleStartLecture}
+                onLectureCountChange={handleLectureCountChange}
+                onMoveLecture={handleMoveLecture}
+                lastMovedLectureId={lastMovedLectureId}
                 onOpenSettings={() => setShowSettingsModal(true)}
               />
+            ) : (loadingSubjects || showSubjectsSkeleton) && subjects.length === 0 ? (
+              showSubjectsSkeleton ? (
+                <QuadernoSkeleton />
+              ) : (
+                <div className="flex-1 flex flex-col overflow-hidden" />
+              )
             ) : (
               <EmptyState />
             )}

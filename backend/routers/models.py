@@ -966,6 +966,12 @@ def delete_all_models():
     with _lock:
         for ev in _cancel_events.values():
             ev.set()
+        threads_to_join = [th for th in _download_threads.values() if th is not None]
+
+    for th in threads_to_join:
+        if th.is_alive():
+            th.join(timeout=2.0)
+
     _release_engines()
 
     repos = ai_models.all_known_repo_ids()
@@ -1038,8 +1044,11 @@ def delete_single_model(model_name: str):
 
     with _lock:
         ev = _cancel_events.get(spec.id)
+        th = _download_threads.get(spec.id)
     if ev is not None:
         ev.set()
+    if th is not None and th.is_alive():
+        th.join(timeout=2.0)
 
     _release_engines()
     freed_mb = _delete_repos(spec.all_repo_ids())

@@ -11,8 +11,9 @@ import { pickFolder, isTauri } from '../lib/tauri';
 import { isMac, fileManagerName, normalizeDisplayPath } from '../lib/platform';
 import { useUpdater } from '../lib/useUpdater';
 import { api } from '../lib/api';
-import type { ModelsStatusResponse, ModelInfo } from '../types';
+import type { ModelInfo, ModelsStatusResponse } from '../types';
 import { motion, AnimatePresence } from 'framer-motion';
+import { useDelayedLoading, StorageStatsSkeleton, SkeletonPill } from './Skeleton';
 
 interface Props {
   isOpen: boolean;
@@ -55,7 +56,7 @@ const defaultLlms: ModelInfo[] = [
 ];
 
 export default function SettingsModal({ isOpen, onClose }: Props) {
-  const { settings, updateSettings, resetSetup } = useSettings();
+  const { settings, modelsStatus, setModelsStatus, updateSettings, resetSetup } = useSettings();
   // Ref per leggere le impostazioni correnti senza far ri-eseguire gli effetti a ogni aggiornamento
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
@@ -78,8 +79,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
   const [isUninstalling, setIsUninstalling] = useState(false);
   const [deleteStorageFolder, setDeleteStorageFolder] = useState(false);
 
-  // Stato Modelli Reali dal Backend
-  const [modelsStatus, setModelsStatus] = useState<ModelsStatusResponse | null>(null);
+  // Stato Modelli Reali dal Backend (condiviso con SettingsContext per evitare flash all'apertura)
   const [loadingModels, setLoadingModels] = useState(false);
   const [actionInProgress, setActionInProgress] = useState<string | null>(null);
   const [notification, setNotification] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
@@ -92,6 +92,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
     lancedb_mb: number;
     total_mb: number;
   } | null>(null);
+  const [loadingStorageStats, setLoadingStorageStats] = useState(true);
   const [isCleaningOrphans, setIsCleaningOrphans] = useState(false);
   const [copyTooltip, setCopyTooltip] = useState<{ x: number; y: number } | null>(null);
 
@@ -121,11 +122,14 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
   };
 
   const fetchStorageStats = useCallback(async () => {
+    setLoadingStorageStats(true);
     try {
       const stats = await api.settings.getStorageStats();
       setStorageStats(stats);
     } catch {
       // Ignora silenziosamente
+    } finally {
+      setLoadingStorageStats(false);
     }
   }, []);
 
@@ -150,29 +154,32 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
     }
   };
 
-  const fetchModelsStatus = useCallback(async (quiet = false) => {
+  const fetchModelsStatus = useCallback(async (quiet = false): Promise<ModelsStatusResponse | null> => {
     try {
       if (!quiet) setLoadingModels(true);
       const res = await api.models.status();
       setModelsStatus(res);
-      const hasReal = res.whisper?.some((m: any) => m.id !== 'mock_mode' && m.downloaded);
-      if (hasReal && !settingsRef.current.modelsDownloaded) {
-        updateSettingsRef.current({ modelsDownloaded: true });
+      const hasRealWhisper = Boolean(res.whisper?.some((m: any) => m.id !== 'mock_mode' && m.downloaded));
+      const hasRealLLM = Boolean(res.llm?.some((m: any) => m.downloaded));
+      const activeLlm = res.llm?.find((m: any) => m.id === settingsRef.current.llmModel) || res.llm?.find((m: any) => m.is_default) || res.llm?.[0];
+      const llmSupportsThinking = activeLlm?.supports_thinking !== false;
+      const patch: Record<string, any> = {};
+      if (hasRealWhisper !== Boolean(settingsRef.current.modelsDownloaded)) patch.modelsDownloaded = hasRealWhisper;
+      if (hasRealLLM !== Boolean(settingsRef.current.llmDownloaded)) patch.llmDownloaded = hasRealLLM;
+      if (llmSupportsThinking !== (settingsRef.current.llmSupportsThinking !== false)) patch.llmSupportsThinking = llmSupportsThinking;
+      if (Object.keys(patch).length > 0) {
+        updateSettingsRef.current(patch);
       }
+      return res;
     } catch (err) {
       console.warn('[SettingsModal] Errore verifica modelli:', err);
+      return null;
     } finally {
       if (!quiet) setLoadingModels(false);
     }
-  }, []);
+  }, [setModelsStatus]);
 
-  // Pre-caricamento in background all'avvio per eliminare layout shift e attese all'apertura
-  useEffect(() => {
-    fetchModelsStatus(true);
-    fetchStorageStats();
-  }, [fetchModelsStatus, fetchStorageStats]);
-
-  // Sincronizza lo stato solo all'apertura del modale (non a ogni modifica delle impostazioni)
+  // Sincronizza lo stato all'apertura del modale (i modelli arrivano già pronti dal SettingsContext)
   useEffect(() => {
     if (isOpen) {
       const current = settingsRef.current;
@@ -378,21 +385,39 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       const res = await api.models.delete(modelId);
       showNotification(res.message || `Modello rimosso con successo (${res.freed_mb} MB liberati).`, 'success');
       setConfirmDeleteModelId(null);
-      
-      // Se il modello eliminato era quello attivo, ripristina il default
+
+      const freshStatus = await fetchModelsStatus();
+      const hasRealLLM = freshStatus
+        ? Boolean(freshStatus.llm?.some((m) => m.downloaded))
+        : undefined;
+      const hasRealWhisper = freshStatus
+        ? Boolean(freshStatus.whisper?.some((m) => m.id !== 'mock_mode' && m.downloaded))
+        : undefined;
+
+      // Se il modello eliminato era quello attivo, ripristina il default e aggiorna subito llmDownloaded/modelsDownloaded
+      const patch: Record<string, any> = {};
       if (whisperModel === modelId) {
         setWhisperModel('mock_mode');
-        updateSettings({ whisperModel: 'mock_mode' });
+        patch.whisperModel = 'mock_mode';
       }
       if (llmModel === modelId) {
         setLlmModel('mlx-community/Qwen3.5-4B-MLX-4bit');
-        updateSettings({ llmModel: 'mlx-community/Qwen3.5-4B-MLX-4bit', ollamaModel: 'mlx-community/Qwen3.5-4B-MLX-4bit' });
+        patch.llmModel = 'mlx-community/Qwen3.5-4B-MLX-4bit';
+        patch.ollamaModel = 'mlx-community/Qwen3.5-4B-MLX-4bit';
       }
       if (embeddingModel === modelId) {
         setEmbeddingModel('mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ');
-        updateSettings({ embeddingModel: 'mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ' });
+        patch.embeddingModel = 'mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ';
       }
-      await fetchModelsStatus();
+      if (hasRealLLM !== undefined) {
+        patch.llmDownloaded = hasRealLLM;
+      }
+      if (hasRealWhisper !== undefined) {
+        patch.modelsDownloaded = hasRealWhisper;
+      }
+      if (Object.keys(patch).length > 0) {
+        await updateSettings(patch);
+      }
       await fetchStorageStats();
     } catch (err: any) {
       showNotification(`Errore eliminazione: ${err?.message || err}`, 'error');
@@ -409,7 +434,11 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       showNotification(res.message || `Tutti i modelli sono stati eliminati (${res.freed_mb} MB liberati).`, 'success');
       setConfirmDeleteAll(false);
       setWhisperModel('mock_mode');
-      updateSettings({ whisperModel: 'mock_mode', modelsDownloaded: false });
+      await updateSettings({
+        whisperModel: 'mock_mode',
+        modelsDownloaded: false,
+        llmDownloaded: false,
+      });
       await fetchModelsStatus();
       await fetchStorageStats();
     } catch (err: any) {
@@ -499,6 +528,9 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
     }
   };
 
+  const isInitialStorageLoading = isOpen && storageStats === null && loadingStorageStats;
+  const showStorageSkeleton = useDelayedLoading(isInitialStorageLoading, 140, 220);
+
   if (!isOpen) return null;
 
   const totalInstalledMb = modelsStatus?.total_installed_mb ?? 0;
@@ -547,7 +579,12 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       icon: Cpu,
       path: '~/.cache/huggingface/hub',
       desc: 'Pesi neurali locali per trascrizione, riassunti e ricerca.',
-      details: `${downloadedModelsCount} ${downloadedModelsCount === 1 ? 'modello' : 'modelli'}`,
+      details: (() => {
+        const hasLLM = Boolean(modelsStatus?.llm?.some((m) => m.downloaded));
+        if (downloadedModelsCount === 0) return 'Nessun modello scaricato';
+        if (hasLLM) return `${downloadedModelsCount} ${downloadedModelsCount === 1 ? 'modello' : 'modelli'} · Chat pronta`;
+        return `${downloadedModelsCount} ${downloadedModelsCount === 1 ? 'modello' : 'modelli'} base · Manca LLM per chat`;
+      })(),
     },
     {
       id: 'audio',
@@ -566,8 +603,8 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
     },
     {
       id: 'sqlite',
-      label: 'Database & Appunti',
-      shortLabel: 'Database',
+      label: 'Appunti & Lezioni',
+      shortLabel: 'Appunti',
       sizeMb: sqliteMb,
       color: 'bg-[#30D158]',
       dotColor: 'bg-[#30D158]',
@@ -577,12 +614,12 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       icon: Database,
       path: normalizeDisplayPath(`${storagePath}/sqlite/sbobinai.db`),
       desc: 'Trascrizioni, sbobine, quiz, flashcard e note dei corsi.',
-      details: 'Dati e appunti',
+      details: 'Appunti e note',
     },
     {
       id: 'lancedb',
       label: 'Memoria Semantica',
-      shortLabel: 'Memoria RAG',
+      shortLabel: 'Memoria IA',
       sizeMb: lancedbMb,
       color: 'bg-[#FF9F0A]',
       dotColor: 'bg-[#FF9F0A]',
@@ -592,11 +629,11 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       icon: Layers,
       path: normalizeDisplayPath(`${storagePath}/lancedb`),
       desc: 'Indice concettuale per la ricerca intelligente.',
-      details: 'Indice vettoriale',
+      details: 'Indice di ricerca',
     },
     {
       id: 'uploads',
-      label: 'Materiali di Studio',
+      label: 'Materiali',
       shortLabel: 'Materiali',
       sizeMb: uploadsMb,
       color: 'bg-[#FF375F]',
@@ -617,7 +654,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
       onClick={() => { if (!isUninstalling) onClose(); }}
     >
       <div 
-        className="relative w-[880px] max-w-[94vw] h-[640px] max-h-[90vh] rounded-3xl liquid-glass border border-white/[0.14] shadow-liquid-lg overflow-hidden flex flex-col"
+        className="relative w-[880px] max-w-[94vw] h-[640px] max-h-[90vh] rounded-3xl liquid-modal border border-white/[0.14] shadow-liquid-lg overflow-hidden flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
         {/* ── Modal Header ── */}
@@ -746,84 +783,94 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
 
                 {/* ── Apple-style Storage Overview Card ── */}
                 <div className="p-5 rounded-3xl liquid-glass border border-white/[0.12] shadow-liquid-sm space-y-4">
-                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                    <div>
-                      <span className="text-[11px] font-semibold uppercase tracking-wider text-white/45 block">
-                        Spazio occupato
-                      </span>
-                      <div className="flex items-baseline gap-2 mt-0.5 whitespace-nowrap">
-                        <h4 className="text-3xl font-bold font-mono text-white tracking-tight">
-                          {combinedTotalMb >= 1024 ? (combinedTotalMb / 1024).toFixed(2) : combinedTotalMb.toFixed(1)}
-                        </h4>
-                        <span className="text-base font-semibold font-mono text-white/70">
-                          {combinedTotalMb >= 1024 ? 'GB' : 'MB'}
-                        </span>
-                        <span className="text-xs text-white/40 ml-1 hidden sm:inline">
-                          totali su disco ({isMac ? 'Mac' : 'PC'})
-                        </span>
-                      </div>
-                    </div>
-
-                    {/* Tasto Azione Unificato: Ottimizza e Ricalcola */}
-                    <div className="flex items-center gap-2 self-start sm:self-center">
-                      <button
-                        type="button"
-                        onClick={handleRecalculateAndOptimize}
-                        disabled={isCleaningOrphans || loadingModels}
-                        className={clsx(
-                          "px-3.5 py-2 rounded-xl border text-xs font-semibold transition-all flex items-center gap-2 cursor-pointer shadow-liquid-sm whitespace-nowrap disabled:opacity-50",
-                          isCleaningOrphans
-                            ? "bg-blue-500/20 text-blue-200 border-blue-500/30 cursor-wait"
-                            : "bg-white/[0.08] hover:bg-white/[0.14] border-white/14 text-white/80 hover:text-white"
-                        )}
-                        title="Pulisce i file temporanei, deframmenta il database ed aggiorna lo spazio su disco"
-                      >
-                        <RefreshCw size={13} className={clsx((isCleaningOrphans || loadingModels) && "animate-spin text-blue-400")} />
-                        <span>{isCleaningOrphans ? "Ottimizzazione in corso..." : "Ricalcola spazio"}</span>
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* ── Barra Orizzontale Multicolore Stile Apple ── */}
-                  <div className="space-y-3">
-                    <div className="w-full h-3 rounded-full bg-white/[0.06] p-0.5 flex gap-1 overflow-hidden border border-white/[0.12]">
-                      {combinedTotalMb === 0 ? (
-                        <div className="h-full w-full bg-white/10 rounded-full animate-pulse" />
-                      ) : (
-                        storageCategories
-                          .filter((cat) => cat.sizeMb > 0)
-                          .map((cat) => (
-                            <div
-                              key={cat.id}
-                              className={clsx('h-full rounded-full transition-all duration-500', cat.color)}
-                              style={{ width: `${getBarWidth(cat.sizeMb)}%` }}
-                              title={`${cat.shortLabel}: ${formatSize(cat.sizeMb)} (${formatPct(cat.sizeMb)})`}
-                            />
-                          ))
-                      )}
-                    </div>
-
-                    {/* ── Legenda Ordinata a Griglia Stile macOS Storage ── */}
-                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-2 pt-2 border-t border-white/[0.06] text-xs">
-                      {storageCategories.map((cat) => {
-                        const hasData = cat.sizeMb > 0;
-                        return (
-                          <div
-                            key={cat.id}
-                            className={clsx(
-                              "flex items-center gap-1.5 whitespace-nowrap transition-opacity",
-                              hasData ? "opacity-100" : "opacity-45"
-                            )}
-                          >
-                            <span className={clsx('w-2 h-2 rounded-full flex-shrink-0 shadow-sm', cat.dotColor)} />
-                            <span className="text-white/80 font-medium text-[11px] truncate">{cat.shortLabel}:</span>
-                            <span className="font-mono text-[11px] text-white/70">{formatSize(cat.sizeMb)}</span>
-                            <span className="text-[10px] text-white/40 font-mono">({formatPct(cat.sizeMb)})</span>
+                  {isInitialStorageLoading || showStorageSkeleton ? (
+                    showStorageSkeleton ? (
+                      <StorageStatsSkeleton />
+                    ) : (
+                      <div className="min-h-[152px]" aria-busy="true" />
+                    )
+                  ) : (
+                    <>
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                        <div>
+                          <span className="text-[11px] font-semibold uppercase tracking-wider text-white/45 block">
+                            Spazio occupato
+                          </span>
+                          <div className="flex items-baseline gap-2 mt-0.5 whitespace-nowrap">
+                            <h4 className="text-3xl font-bold font-mono text-white tracking-tight">
+                              {combinedTotalMb >= 1024 ? (combinedTotalMb / 1024).toFixed(2) : combinedTotalMb.toFixed(1)}
+                            </h4>
+                            <span className="text-base font-semibold font-mono text-white/70">
+                              {combinedTotalMb >= 1024 ? 'GB' : 'MB'}
+                            </span>
+                            <span className="text-xs text-white/40 ml-1 hidden sm:inline">
+                              totali su disco ({isMac ? 'Mac' : 'PC'})
+                            </span>
                           </div>
-                        );
-                      })}
-                    </div>
-                  </div>
+                        </div>
+
+                        {/* Tasto Azione Unificato: Ottimizza e Ricalcola */}
+                        <div className="flex items-center gap-2 self-start sm:self-center">
+                          <button
+                            type="button"
+                            onClick={handleRecalculateAndOptimize}
+                            disabled={isCleaningOrphans || loadingModels}
+                            className={clsx(
+                              "px-3.5 py-2 rounded-full border text-xs font-semibold transition-all flex items-center gap-2 cursor-pointer shadow-liquid-sm whitespace-nowrap disabled:opacity-50",
+                              isCleaningOrphans
+                                ? "bg-blue-500/20 text-blue-200 border-blue-500/30 cursor-wait"
+                                : "bg-white/[0.08] hover:bg-white/[0.14] border-white/[0.14] text-white/80 hover:text-white"
+                            )}
+                            title="Pulisce i file temporanei ed ottimizza lo spazio su disco"
+                          >
+                            <RefreshCw size={13} className={clsx((isCleaningOrphans || loadingModels) && "animate-spin text-blue-400")} />
+                            <span>{isCleaningOrphans ? "Ottimizzazione in corso..." : "Ricalcola spazio"}</span>
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* ── Barra Orizzontale Multicolore Stile Apple ── */}
+                      <div className="space-y-3">
+                        <div className="w-full h-3 rounded-full bg-white/[0.06] p-0.5 flex gap-1 overflow-hidden border border-white/[0.12]">
+                          {combinedTotalMb === 0 ? (
+                            <div className="h-full w-full bg-white/[0.04] rounded-full" />
+                          ) : (
+                            storageCategories
+                              .filter((cat) => cat.sizeMb > 0)
+                              .map((cat) => (
+                                <div
+                                  key={cat.id}
+                                  className={clsx('h-full rounded-full transition-all duration-500', cat.color)}
+                                  style={{ width: `${getBarWidth(cat.sizeMb)}%` }}
+                                  title={`${cat.shortLabel}: ${formatSize(cat.sizeMb)} (${formatPct(cat.sizeMb)})`}
+                                />
+                              ))
+                          )}
+                        </div>
+
+                        {/* ── Legenda Ordinata a Griglia Stile macOS Storage ── */}
+                        <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-2 pt-2 border-t border-white/[0.06] text-xs">
+                          {storageCategories.map((cat) => {
+                            const hasData = cat.sizeMb > 0;
+                            return (
+                              <div
+                                key={cat.id}
+                                className={clsx(
+                                  "flex items-center gap-1.5 whitespace-nowrap transition-opacity",
+                                  hasData ? "opacity-100" : "opacity-45"
+                                )}
+                              >
+                                <span className={clsx('w-2 h-2 rounded-full flex-shrink-0 shadow-sm', cat.dotColor)} />
+                                <span className="text-white/80 font-medium text-[11px] truncate">{cat.shortLabel}:</span>
+                                <span className="font-mono text-[11px] text-white/70">{formatSize(cat.sizeMb)}</span>
+                                <span className="text-[10px] text-white/40 font-mono">({formatPct(cat.sizeMb)})</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </>
+                  )}
                 </div>
 
                 {/* ── Griglia Dati: Categorie di Archiviazione ── */}
@@ -897,7 +944,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                                           e.stopPropagation();
                                           setConfirmDeleteAll(false);
                                         }}
-                                        className="px-3.5 py-1.5 rounded-xl text-xs font-medium text-white/70 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer whitespace-nowrap"
+                                        className="px-3.5 py-1.5 rounded-full text-xs font-medium text-white/70 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer whitespace-nowrap"
                                       >
                                         Annulla
                                       </button>
@@ -908,9 +955,9 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                                           handleDeleteAllModels();
                                         }}
                                         disabled={actionInProgress === 'delete-all'}
-                                        className="px-4 py-1.5 rounded-xl text-xs font-semibold bg-red-500 hover:bg-red-600 text-white transition-colors cursor-pointer shadow-liquid-sm disabled:opacity-50 whitespace-nowrap flex items-center gap-1.5"
+                                        className="px-4 py-1.5 rounded-full text-xs font-semibold bg-red-500/20 hover:bg-red-500/30 text-red-200 border border-red-500/35 transition-colors cursor-pointer shadow-liquid-sm disabled:opacity-50 whitespace-nowrap flex items-center gap-1.5"
                                       >
-                                        {actionInProgress === 'delete-all' && <Loader2 size={12} className="animate-spin text-white" />}
+                                        {actionInProgress === 'delete-all' && <Loader2 size={12} className="animate-spin text-red-200" />}
                                         <span>{actionInProgress === 'delete-all' ? 'Eliminazione...' : 'Sì, elimina tutto'}</span>
                                       </button>
                                     </div>
@@ -1060,7 +1107,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                     <button
                       type="button"
                       onClick={handlePickFolder}
-                      className="px-4 py-2.5 rounded-2xl liquid-glass-pill border border-white/18 hover:border-white/28 hover:bg-white/[0.10] text-xs font-semibold text-white transition-all flex items-center gap-2 flex-shrink-0 cursor-pointer shadow-liquid-sm whitespace-nowrap"
+                      className="px-4 py-2.5 rounded-full liquid-glass-pill border border-white/[0.18] hover:border-white/[0.28] hover:bg-white/[0.10] text-xs font-semibold text-white transition-all flex items-center gap-2 flex-shrink-0 cursor-pointer shadow-liquid-sm whitespace-nowrap"
                     >
                       <Folder size={14} className="text-white/70" />
                       <span>Sfoglia in {fileManagerName}...</span>
@@ -1144,7 +1191,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                               'p-3.5 rounded-2xl border transition-all space-y-2.5',
                               m.downloaded
                                 ? 'liquid-glass border-white/[0.12] shadow-liquid-sm'
-                                : 'liquid-glass-subtle border-white/[0.08] hover:border-white/16'
+                                : 'liquid-glass-subtle border-white/[0.08] hover:border-white/[0.16]'
                             )}
                           >
                             <div className="flex items-center justify-between gap-3">
@@ -1178,7 +1225,9 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                               </div>
 
                               <div className="flex items-center gap-2 flex-shrink-0">
-                                {m.downloaded ? (
+                                {!modelsStatus ? (
+                                  <SkeletonPill className="h-7 w-20" />
+                                ) : m.downloaded ? (
                                   <>
                                     <span className="text-[11px] font-medium text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2.5 py-1 rounded-full flex items-center gap-1.5">
                                       <Check size={11} strokeWidth={2.5} />
@@ -1280,14 +1329,30 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
 
                 {/* ── SEZIONE 2: MODELLI LINGUISTICI (LLM) ── */}
                 <div className="space-y-3 pt-2">
-                  <div>
-                    <span className="text-xs font-semibold uppercase tracking-wider text-white/50 block">
-                      Modelli Linguistici (LLM)
-                    </span>
-                    <p className="text-[11px] text-white/40 mt-0.5">
-                      Generano capitoli di studio, sintesi e rispondono sul quaderno delle lezioni.
-                    </p>
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <span className="text-xs font-semibold uppercase tracking-wider text-white/50 block">
+                        Modelli Linguistici (LLM)
+                      </span>
+                      <p className="text-[11px] text-white/40 mt-0.5">
+                        Necessari per chattare con l'Assistente, generare capitoli e creare quiz.
+                      </p>
+                    </div>
+                    {modelsStatus && !modelsStatus.llm?.some((m) => m.downloaded) && (
+                      <span className="text-[10px] font-medium text-amber-300/90 bg-amber-500/10 border border-amber-500/25 px-2.5 py-1 rounded-full whitespace-nowrap">
+                        Nessun LLM scaricato
+                      </span>
+                    )}
                   </div>
+
+                  {modelsStatus && !modelsStatus.llm?.some((m) => m.downloaded) && (
+                    <div className="p-3 rounded-2xl bg-amber-500/10 border border-amber-500/20 text-xs text-amber-200/90 flex items-start gap-2.5 leading-relaxed">
+                      <AlertCircle size={15} className="text-amber-400 flex-shrink-0 mt-0.5" />
+                      <span>
+                        I modelli di base sopra consentono solo di trascrivere audio e ricercare nei documenti. Per usare la chat con l'Assistente e generare riassunti automatici, installa uno dei modelli qui sotto.
+                      </span>
+                    </div>
+                  )}
 
                   <div className="space-y-2.5">
                     {(() => {
@@ -1308,7 +1373,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                               'p-3.5 rounded-2xl border transition-all space-y-2.5',
                               m.downloaded
                                 ? 'liquid-glass border-white/[0.12] shadow-liquid-sm'
-                                : 'liquid-glass-subtle border-white/[0.08] hover:border-white/16'
+                                : 'liquid-glass-subtle border-white/[0.08] hover:border-white/[0.16]'
                             )}
                           >
                             <div className="flex items-center justify-between gap-3">
@@ -1336,7 +1401,9 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                               </div>
 
                               <div className="flex items-center gap-2 flex-shrink-0">
-                                {m.downloaded ? (
+                                {!modelsStatus ? (
+                                  <SkeletonPill className="h-7 w-20" />
+                                ) : m.downloaded ? (
                                   <>
                                     {isCurrentActive ? (
                                       <span className="text-[11px] font-medium text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2.5 py-1 rounded-full flex items-center gap-1.5">
@@ -1347,26 +1414,28 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                                       <button
                                         type="button"
                                         onClick={() => handleSelectActiveLlm(m.id)}
-                                        className="px-3 py-1 rounded-xl text-xs font-medium bg-white/[0.10] hover:bg-white/[0.18] text-white border border-white/12 transition-all cursor-pointer"
+                                        className="px-3 py-1 rounded-xl text-xs font-medium bg-white/[0.10] hover:bg-white/[0.18] text-white border border-white/[0.12] transition-all cursor-pointer"
                                       >
                                         Attiva
                                       </button>
                                     )}
 
                                     {confirmDeleteModelId === m.id ? (
-                                      <div className="flex items-center gap-1.5 animate-fade-in">
+                                      <div className="flex items-center gap-1.5 animate-fade-in" data-delete-model-btn={m.id}>
                                         <button
                                           type="button"
+                                          data-delete-model-btn={m.id}
                                           onClick={() => setConfirmDeleteModelId(null)}
-                                          className="px-2 py-0.5 rounded-lg text-[10px] text-white/60 hover:text-white"
+                                          className="px-2.5 py-0.5 rounded-full text-[10px] text-white/60 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer"
                                         >
                                           Annulla
                                         </button>
                                         <button
                                           type="button"
+                                          data-delete-model-btn={m.id}
                                           onClick={() => handleDeleteModel(m.id)}
                                           disabled={isDeletingThis}
-                                          className="px-2 py-0.5 rounded-lg text-[10px] font-semibold bg-red-500 text-white hover:bg-red-600 cursor-pointer"
+                                          className="px-2.5 py-0.5 rounded-full text-[10px] font-semibold bg-red-500/20 hover:bg-red-500/30 text-red-200 border border-red-500/35 transition-colors cursor-pointer"
                                         >
                                           {isDeletingThis ? '...' : 'Elimina'}
                                         </button>
@@ -1374,6 +1443,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                                     ) : (
                                       <button
                                         type="button"
+                                        data-delete-model-btn={m.id}
                                         onClick={() => setConfirmDeleteModelId(m.id)}
                                         disabled={isDeletingThis}
                                         className="p-1.5 rounded-lg text-white/40 hover:text-red-300 hover:bg-red-500/15 transition-all cursor-pointer"
@@ -1398,7 +1468,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                                     type="button"
                                     onClick={() => handleDownloadModel(m.id)}
                                     disabled={actionInProgress === m.id || actionInProgress === `cancel-${m.id}`}
-                                    className="flex items-center gap-1.5 px-3 py-1 rounded-xl text-xs font-medium bg-white/[0.10] hover:bg-white/[0.18] text-white border border-white/12 transition-all cursor-pointer shadow-liquid-sm disabled:opacity-50"
+                                    className="flex items-center gap-1.5 px-3 py-1 rounded-xl text-xs font-medium bg-white/[0.10] hover:bg-white/[0.18] text-white border border-white/[0.12] transition-all cursor-pointer shadow-liquid-sm disabled:opacity-50"
                                   >
                                     <Download size={12} />
                                     <span>Scarica</span>
@@ -1497,15 +1567,9 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                           Ampia
                         </span>
                         <p className="text-[11px] text-white/50 leading-relaxed">
-                          Sensibilità alta per cattedre distanti o aule grandi. Cattura anche spiegazioni a voce moderata.
+                          Sensibilità alta per aule grandi o cattedre distanti. Cattura anche spiegazioni a voce moderata.
                         </p>
                       </div>
-                    </div>
-
-                    <div className="mt-4 pt-3 border-t border-white/[0.06]">
-                      <span className="text-[10px] text-white/40 block">
-                        Per aule grandi o docente distante
-                      </span>
                     </div>
                   </button>
 
@@ -1545,12 +1609,6 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                         </p>
                       </div>
                     </div>
-
-                    <div className="mt-4 pt-3 border-t border-white/[0.06]">
-                      <span className="text-[10px] text-white/40 block">
-                        Per la maggior parte delle lezioni
-                      </span>
-                    </div>
                   </button>
 
                   {/* Opzione 3: Diretta */}
@@ -1588,12 +1646,6 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                           Filtro rigoroso per prime file o microfoni vicini. Esclude mormorii e voci dei compagni.
                         </p>
                       </div>
-                    </div>
-
-                    <div className="mt-4 pt-3 border-t border-white/[0.06]">
-                      <span className="text-[10px] text-white/40 block">
-                        Per prime file o microfoni vicini
-                      </span>
                     </div>
                   </button>
                 </div>
@@ -1747,13 +1799,13 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                     data-reset-wizard-btn="true"
                     onClick={handleResetWizard}
                     className={clsx(
-                      "flex items-center gap-2 px-4 h-9 rounded-2xl text-xs font-semibold border transition-all cursor-pointer whitespace-nowrap select-none",
+                      "flex items-center gap-2 px-4 h-9 rounded-full text-xs font-semibold border transition-all cursor-pointer whitespace-nowrap select-none",
                       confirmReset
-                        ? "bg-red-500 text-white border-red-500 shadow-liquid-sm"
-                        : "bg-white/[0.08] hover:bg-white/[0.16] text-white/80 border-white/14"
+                        ? "bg-red-500/20 hover:bg-red-500/30 text-red-200 border-red-500/35 shadow-liquid-sm"
+                        : "bg-white/[0.08] hover:bg-white/[0.16] text-white/80 border-white/[0.14]"
                     )}
                   >
-                    <RotateCcw size={13} className={clsx("flex-shrink-0", confirmReset && "animate-spin text-white")} />
+                    <RotateCcw size={13} className={clsx("flex-shrink-0", confirmReset && "animate-spin text-red-200")} />
                     <span>{confirmReset ? 'Sei sicuro? Clicca per riavviare' : 'Riavvia configurazione guidata'}</span>
                   </button>
                 </div>
@@ -1776,7 +1828,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       setDeleteStorageFolder(false);
                       setShowUninstallModal(true);
                     }}
-                    className="flex items-center gap-2 px-4 py-2 rounded-2xl text-xs font-semibold bg-red-500/15 hover:bg-red-500/25 border border-red-500/30 text-red-200 hover:text-white transition-all shadow-liquid-sm cursor-pointer"
+                    className="flex items-center gap-2 px-4 py-2 rounded-full text-xs font-semibold bg-red-500/20 hover:bg-red-500/30 border border-red-500/35 text-red-200 hover:text-white transition-all shadow-liquid-sm cursor-pointer"
                   >
                     <Trash2 size={13} />
                     <span>Disinstalla SbobinAI</span>
@@ -1797,7 +1849,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
           <div>
             <button
               onClick={onClose}
-              className="px-5 py-1.5 rounded-2xl text-xs font-semibold bg-white/[0.12] hover:bg-white/[0.20] border border-white/[0.18] text-white transition-all shadow-liquid-sm cursor-pointer"
+              className="px-5 py-1.5 rounded-full text-xs font-semibold bg-white/[0.12] hover:bg-white/[0.20] border border-white/[0.18] text-white transition-all shadow-liquid-sm cursor-pointer"
             >
               Chiudi
             </button>
@@ -1920,7 +1972,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                     <button
                       type="button"
                       onClick={() => setShowUninstallModal(false)}
-                      className="px-4 py-2 rounded-2xl text-xs font-semibold bg-white/[0.08] hover:bg-white/[0.14] border border-white/12 text-white/80 transition-all cursor-pointer"
+                      className="px-4 py-2 rounded-full text-xs font-semibold bg-white/[0.08] hover:bg-white/[0.14] border border-white/[0.12] text-white/80 transition-all cursor-pointer"
                     >
                       Annulla
                     </button>
@@ -1928,10 +1980,10 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       type="button"
                       onClick={handleUninstallApp}
                       className={clsx(
-                        "flex items-center gap-2 px-5 py-2 rounded-2xl text-xs font-semibold text-white shadow-liquid-sm transition-all cursor-pointer",
+                        "flex items-center gap-2 px-5 py-2 rounded-full text-xs font-semibold shadow-liquid-sm transition-all cursor-pointer border",
                         deleteStorageFolder
-                          ? "bg-red-600 hover:bg-red-700 border border-red-400/50"
-                          : "bg-red-500 hover:bg-red-600 border border-red-400/30"
+                          ? "bg-red-500/25 hover:bg-red-500/35 text-red-100 border-red-500/45"
+                          : "bg-red-500/20 hover:bg-red-500/30 text-red-200 border-red-500/35"
                       )}
                     >
                       {deleteStorageFolder ? <AlertTriangle size={13} /> : <Trash2 size={13} />}

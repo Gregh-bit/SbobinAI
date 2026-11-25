@@ -115,6 +115,18 @@ def update_settings(payload: SettingsUpdateRequest):
         # Se un modello Whisper reale è fisicamente presente su disco, models_downloaded deve rimanere True
         _normalize_whisper_state(current)
         saved = save_settings(current)
+
+    # Se c'è una registrazione live in corso, aggiorna la sensibilità VAD del microfono in tempo reale
+    if "vad_sensitivity" in data:
+        try:
+            from live_session import get_all_sessions
+            new_v = int(data["vad_sensitivity"])
+            for sess in get_all_sessions().values():
+                if sess.is_active:
+                    sess.update_vad_sensitivity(new_v)
+        except Exception:
+            pass
+
     return saved
 
 

@@ -88,6 +88,7 @@ def mock_chat_ai(monkeypatch):
         compacted_summary: str = "",
         mode: str = "auto",
         model_id: str | None = None,
+        enable_thinking: bool = False,
         stop_event=None,
     ):
         turn_counter["n"] += 1
@@ -99,6 +100,7 @@ def mock_chat_ai(monkeypatch):
                 "context_text": context_text,
                 "compacted_summary": compacted_summary,
                 "mode": mode,
+                "enable_thinking": enable_thinking,
             }
         )
         yield f"<think>Analizzo la domanda {idx}</think>"
@@ -560,3 +562,163 @@ def test_edit_chat_message_stream_cascade_and_compaction(client, subject, mock_c
     assert len(detail_empty["messages"]) == 0
     assert detail_empty["compacted_up_to_message_id"] == 0
     assert detail_empty["compacted_summary"] == ""
+
+
+def test_quiz_mode_with_user_instruction_and_empty_prompt(client, subject, mock_chat_ai):
+    """Verifica che il chip Quiz inviato con istruzioni ('fallo complicato') o vuoto persista mode e topic_hint."""
+    # 1. Crea chat
+    c_res = client.post(f"/api/v1/chats/subject/{subject['id']}", json={"title": "Quiz Test"})
+    assert c_res.status_code == 200
+    chat_id = c_res.json()["id"]
+
+    # 2. Invia messaggio con chip quiz e istruzione custom ("fallo complicato!!!")
+    r1 = client.post(
+        f"/api/v1/chats/{chat_id}/stream",
+        json={"message": "fallo complicato!!!", "mode": "quiz"},
+    )
+    assert r1.status_code == 200
+    evs1 = _parse_ndjson(r1.text)
+    meta1 = [e for e in evs1 if e["type"] == "meta"][0]
+    user_msg1 = meta1["user_message"]
+
+    assert user_msg1["mode"] == "quiz"
+    assert user_msg1["content"] == "fallo complicato!!!"
+
+    # 3. Invia messaggio con chip quiz senza testo aggiuntivo (message="")
+    r2 = client.post(
+        f"/api/v1/chats/{chat_id}/stream",
+        json={"message": "", "mode": "quiz"},
+    )
+    assert r2.status_code == 200
+    evs2 = _parse_ndjson(r2.text)
+    meta2 = [e for e in evs2 if e["type"] == "meta"][0]
+    user_msg2 = meta2["user_message"]
+
+    assert user_msg2["mode"] == "quiz"
+    assert user_msg2["content"] == ""
+
+
+def test_thinking_toggle_propagation_and_model_capability(client, subject, mock_chat_ai):
+    """Verifica propagazione enable_thinking su stream/edit/regenerate e flag supports_thinking su /models/status."""
+    import ai_models
+
+    # 1. Verifica capabilities dei modelli
+    assert ai_models.model_supports_thinking(ai_models.LLM_DEFAULT_ID) is True
+    assert ai_models.model_supports_thinking(ai_models.LLM_ALT_ID) is True
+    assert ai_models.model_supports_thinking("meta-llama/Llama-3.1-8B-Instruct") is False
+
+    status_res = client.get("/api/v1/models/status")
+    assert status_res.status_code == 200
+    llms = status_res.json().get("llm") or []
+    assert len(llms) > 0
+    assert all("supports_thinking" in m for m in llms)
+
+    # 2. Verifica enable_thinking=False di default e True quando richiesto
+    chat_id = client.post(f"/api/v1/chats/subject/{subject['id']}", json={"title": "Thinking Test"}).json()["id"]
+
+    r_off = client.post(f"/api/v1/chats/{chat_id}/stream", json={"message": "Domanda veloce"})
+    assert r_off.status_code == 200
+    assert mock_chat_ai[-1]["enable_thinking"] is False
+
+    r_on = client.post(
+        f"/api/v1/chats/{chat_id}/stream",
+        json={"message": "Dimostra il teorema di Green", "enable_thinking": True},
+    )
+    assert r_on.status_code == 200
+    assert mock_chat_ai[-1]["enable_thinking"] is True
+    evs_on = _parse_ndjson(r_on.text)
+    done_ev = [e for e in evs_on if e["type"] == "done"][0]
+    assistant_id = done_ev["assistant_message"]["id"]
+
+    # 3. Rigenerazione con enable_thinking=True
+    r_regen = client.post(
+        f"/api/v1/chats/{chat_id}/messages/{assistant_id}/regenerate-stream",
+        json={"enable_thinking": True},
+    )
+    assert r_regen.status_code == 200
+    assert mock_chat_ai[-1]["enable_thinking"] is True
+
+
+def test_stream_multi_turn_thinking_budget_and_gemma_normalization(monkeypatch):
+    """Verifica enforcement del budget token di pensiero e normalizzazione tag Gemma 4 / Qwen 3.5."""
+    class DummyTokenizer:
+        def __init__(self, style: str = "qwen"):
+            self.style = style
+            self.last_enable_thinking = None
+
+        def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, enable_thinking=False):
+            self.last_enable_thinking = enable_thinking
+            if self.style == "qwen" and enable_thinking:
+                return "PROMPT\n<|im_start|>assistant\n<think>\n"
+            if self.style == "gemma" and enable_thinking:
+                return "PROMPT\n<|turn>model\n<|channel>thought\n"
+            return "PROMPT\n<|im_start|>assistant\n"
+
+    # Caso A: Qwen apre <think> nel prompt ma il modello sfora il budget senza chiuderlo -> chiusura automatica + fase 2
+    tok_qwen = DummyTokenizer("qwen")
+    calls = {"n": 0}
+
+    def fake_stream_overbudget(model, tokenizer, prompt, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            for i in range(120):
+                yield f"passo{i} "
+        else:
+            assert "</think>" in prompt
+            yield "Risposta finale chiara in italiano."
+
+    monkeypatch.setattr(llm_engine, "is_model_downloaded", lambda *_: True)
+    monkeypatch.setattr(llm_engine, "get_or_load_model", lambda *_: (object(), tok_qwen))
+    monkeypatch.setattr(llm_engine, "stream_tokens", fake_stream_overbudget)
+    monkeypatch.setattr(llm_engine, "clear_metal_cache", lambda: None)
+
+    out_qwen = "".join(
+        llm_engine.stream_multi_turn_chat(
+            subject_name="Analisi",
+            messages=[{"role": "user", "content": "Spiega il teorema"}],
+            model_id="mlx-community/Qwen3.5-4B-MLX-4bit",
+            enable_thinking=True,
+            max_thinking_tokens=64,
+        )
+    )
+    assert tok_qwen.last_enable_thinking is True
+    assert calls["n"] == 2
+    assert out_qwen.startswith("<think>\n")
+    assert "</think>" in out_qwen
+    assert "Risposta finale chiara in italiano." in out_qwen
+
+    # Caso B: Gemma 4 apre <|channel>thought e chiude <channel|> -> normalizzato in <think>...</think>
+    tok_gemma = DummyTokenizer("gemma")
+
+    def fake_stream_gemma(model, tokenizer, prompt, **kw):
+        for piece in ["Ragiono ", "in italiano.", "<channel", "|>", "Ecco la risposta."]:
+            yield piece
+
+    monkeypatch.setattr(llm_engine, "get_or_load_model", lambda *_: (object(), tok_gemma))
+    monkeypatch.setattr(llm_engine, "stream_tokens", fake_stream_gemma)
+
+    out_gemma = "".join(
+        llm_engine.stream_multi_turn_chat(
+            subject_name="Fisica",
+            messages=[{"role": "user", "content": "Cos'è l'entropia?"}],
+            model_id="unsloth/gemma-4-E4B-it-UD-MLX-4bit",
+            enable_thinking=True,
+        )
+    )
+    assert out_gemma == "<think>\nRagiono in italiano.</think>Ecco la risposta."
+
+    # Caso C: Modello non-thinking -> forza enable_thinking=False anche se richiesto True
+    tok_non_think = DummyTokenizer("qwen")
+    monkeypatch.setattr(llm_engine, "get_or_load_model", lambda *_: (object(), tok_non_think))
+    monkeypatch.setattr(llm_engine, "stream_tokens", lambda *a, **kw: iter(["Risposta diretta."]))
+
+    out_non_think = "".join(
+        llm_engine.stream_multi_turn_chat(
+            subject_name="Storia",
+            messages=[{"role": "user", "content": "Riassumi"}],
+            model_id="meta-llama/Llama-3.1-8B-Instruct",
+            enable_thinking=True,
+        )
+    )
+    assert tok_non_think.last_enable_thinking is False
+    assert out_non_think == "Risposta diretta."

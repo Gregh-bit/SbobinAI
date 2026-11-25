@@ -143,7 +143,7 @@ def _decode_audio_file(path: str, sample_rate: int = 16000) -> np.ndarray:
     return audio
 
 
-FILE_CHUNK_SECONDS = 240.0
+FILE_CHUNK_SECONDS = 30.0
 FILE_CHUNK_OVERLAP_SECONDS = 2.0
 
 
@@ -458,25 +458,91 @@ class Transcriber:
         if not words:
             return ""
 
-        # 4. Rileva loop di ripetizione di parole (es. "aria, aria, aria...")
-        if len(words) >= 4:
+        # 4. Rileva loop estremi di parole ripetute allucinate (es. "aria aria aria aria...")
+        if len(words) >= 6:
             unique_ratio = len(set(words)) / len(words)
-            if unique_ratio < 0.45:
-                logger.info(f"[Transcriber Filter] Scartata ripetizione ({unique_ratio:.2f}): '{text[:45]}...'")
+            if unique_ratio < 0.28:
+                logger.info(f"[Transcriber Filter] Scartato loop estremo ({unique_ratio:.2f}): '{text[:45]}...'")
                 return ""
+        elif len(words) >= 4 and len(set(words)) == 1:
+            logger.info(f"[Transcriber Filter] Scartata singola parola in loop: '{text[:45]}...'")
+            return ""
 
-        # 5. Rileva loop di n-gram ripetuti
-        for n in (1, 2, 3, 4):
-            if len(words) >= n * 2:
-                ngrams = [" ".join(words[i:i+n]) for i in range(len(words) - n + 1)]
+        # 5. Rileva loop reali di n-gram ripetuti (evitando falsi positivi su articoli/preposizioni come 'la', 'il', 'di', 'più' in frasi lunghe!)
+        lower_words = [w.lower() for w in words]
+
+        # 5a. Parola singola ripetuta consecutivamente >= 4 volte (es. "aria aria aria aria")
+        consec_count = 1
+        for i in range(1, len(lower_words)):
+            if lower_words[i] == lower_words[i - 1]:
+                consec_count += 1
+                if consec_count >= 4:
+                    logger.info(f"[Transcriber Filter] Scartata parola ripetuta consecutivamente ({lower_words[i]} x{consec_count}): '{text[:45]}...'")
+                    return ""
+            else:
+                consec_count = 1
+
+        # 5b. Frasi di 2..4 parole ripetute in loop (es. "vedete come sono vedete come sono...")
+        for n in (2, 3, 4):
+            if len(lower_words) >= n * 2:
+                ngrams = [" ".join(lower_words[i:i+n]) for i in range(len(lower_words) - n + 1)]
                 counts = collections.Counter(ngrams)
                 if counts:
                     most_common_phrase, count = counts.most_common(1)[0]
-                    if count >= 3 or (count >= 2 and (count * n) >= len(words) * 0.5):
+                    # Controlla se è un vero loop (ripetuto >= 3 volte con alta copertura, o >= 2 volte coprendo >= 50% del blocco)
+                    coverage = (count * n) / max(1, len(lower_words))
+                    if (count >= 3 and coverage >= 0.30) or (count >= 2 and coverage >= 0.50):
                         logger.info(f"[Transcriber Filter] Scartato n-gram ripetuto ({most_common_phrase} x{count}): '{text[:45]}...'")
                         return ""
 
         return text
+
+    @staticmethod
+    def _extract_reliable_mlx_text(result: dict) -> str:
+        """
+        Estrae il testo dai segmenti di mlx-whisper, preservando integralmente il parlato reale
+        e scartando solo allucinazioni palesi da silenzio prolungato (no_speech >= 0.75) o loop di compressione.
+        """
+        segments = result.get("segments")
+        if not isinstance(segments, list) or not segments:
+            return str(result.get("text") or "").strip()
+
+        kept_parts: list[str] = []
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            seg_text = str(seg.get("text") or "").strip()
+            if not seg_text:
+                continue
+            no_speech = float(seg.get("no_speech_prob", 0.0) or 0.0)
+            avg_logprob = float(seg.get("avg_logprob", 0.0) or 0.0)
+            comp_ratio = float(seg.get("compression_ratio", 0.0) or 0.0)
+            seg_words = [w for w in seg_text.split() if w.strip(".,!?:;\"'()[]{}")]
+
+            # Scarta segmenti composti da 1-2 parole isolate su silenzio o confidenza pessima
+            if no_speech >= 0.70 and len(seg_words) <= 2:
+                logger.info(
+                    f"[Transcriber Filter] Scartato segmento silenzio (no_speech={no_speech:.2f}): '{seg_text[:45]}'"
+                )
+                continue
+            if no_speech >= 0.40 and avg_logprob < -0.70 and len(seg_words) <= 2:
+                logger.info(
+                    f"[Transcriber Filter] Scartato segmento incerto (no_speech={no_speech:.2f}, logprob={avg_logprob:.2f}): '{seg_text[:45]}'"
+                )
+                continue
+            if avg_logprob < -1.15 and len(seg_words) <= 2:
+                logger.info(
+                    f"[Transcriber Filter] Scartato frammento bassa confidenza (logprob={avg_logprob:.2f}): '{seg_text[:45]}'"
+                )
+                continue
+            if comp_ratio > 2.2:
+                logger.info(
+                    f"[Transcriber Filter] Scartato segmento compresso/loop (cr={comp_ratio:.2f}): '{seg_text[:45]}'"
+                )
+                continue
+            kept_parts.append(seg_text)
+
+        return " ".join(kept_parts).strip()
 
     def _sync_transcribe(
         self,
@@ -484,7 +550,7 @@ class Transcriber:
         model_target: str,
         initial_prompt: Optional[str] = None,
     ) -> str:
-        """Esecuzione sincrona con Greedy Decoding puro (anti-fallback e zero calore superfluo)."""
+        """Esecuzione sincrona con parametri Whisper calibrati per non perdere parole nel parlato reale."""
         with _transcription_lock:
             try:
                 if USE_MLX:
@@ -494,15 +560,15 @@ class Transcriber:
                         path_or_hf_repo=model_target,
                         language="it",
                         initial_prompt=initial_prompt,
-                        temperature=(0.0,),  # Greedy rigido a passaggio singolo: evita fallback ricorsivi
-                        compression_ratio_threshold=1.8,
-                        no_speech_threshold=0.5,
-                        logprob_threshold=-0.8,
+                        temperature=(0.0,),
+                        compression_ratio_threshold=2.4,
+                        no_speech_threshold=0.6,
+                        logprob_threshold=-1.0,
                         condition_on_previous_text=False,
                         fp16=True,
                         word_timestamps=False,
                     )
-                    raw_text = result.get("text", "")
+                    raw_text = self._extract_reliable_mlx_text(result)
                 else:
                     raw_text, _ = _faster_whisper_run(model_target, audio_np, live=True, initial_prompt=initial_prompt)
                 return self._clean_transcript(raw_text)
@@ -568,6 +634,28 @@ class Transcriber:
     def release_memory(self) -> None:
         """Libera la cache Metal e le risorse allocate in RAM."""
         release_transcriber_memory()
+
+    def preload_model_background(self, delay: float = 0.05) -> None:
+        """
+        Pre-riscalda Whisper in un thread daemon in background non appena si avvia la registrazione.
+        """
+        if self.mock_mode:
+            return
+        if not self.local_model_path:
+            self.local_model_path = _resolve_model_path(self.repo_id)
+        if not self.local_model_path:
+            return
+
+        def _worker():
+            try:
+                if delay > 0:
+                    time.sleep(delay)
+                warm_up_whisper()
+            except Exception as e:
+                logger.debug(f"[Transcriber] Pre-riscaldamento background non completato: {e}")
+
+        t = threading.Thread(target=_worker, daemon=True, name="whisper-prewarm")
+        t.start()
 
 
 _BOUNDARY_PUNCT_STRIP = " .,!?:;\"'()[]{}«»…—–-"
@@ -774,9 +862,9 @@ def is_speech_spectral(audio_np: np.ndarray, sample_rate: int = 16000) -> bool:
     """
     Pre-filtro spettrale ultra-rapido (BLAS dot product, nessuna allocazione intermedia).
     Verifica se il segnale contiene caratteristiche di fonemi/voce umana:
-    - Livello RMS minimo (esclude silenzi e fruscii impercettibili)
+    - Livello RMS minimo (esclude silenzi digitali e fruscii microscopici <0.0002)
     - Zero-Crossing Rate (ZCR) coerente con le formanti vocali
-    - Concentrazione di energia spettrale nella banda vocale umana (200Hz - 3800Hz)
+    - Concentrazione di energia spettrale nella banda vocale umana (180Hz - 4000Hz)
     """
     total_samples = len(audio_np)
     if total_samples < 800:
@@ -784,12 +872,12 @@ def is_speech_spectral(audio_np: np.ndarray, sample_rate: int = 16000) -> bool:
 
     energy = float(np.dot(audio_np, audio_np))
     rms = float(np.sqrt(energy / total_samples))
-    if rms < 0.001:
+    if rms < 0.0007:
         return False
 
     # Zero Crossing Rate (ZCR)
     zero_crossings = np.sum(np.abs(np.diff(np.sign(audio_np)))) / (2.0 * total_samples)
-    if zero_crossings < 0.002 or zero_crossings > 0.70:
+    if zero_crossings < 0.0005 or zero_crossings > 0.85:
         return False
 
     # Analisi spettrale rapida FFT sulla finestra a massima energia (evita falsi negativi su pause/respiro iniziale)
@@ -810,13 +898,13 @@ def is_speech_spectral(audio_np: np.ndarray, sample_rate: int = 16000) -> bool:
 
     fft_vals = np.abs(np.fft.rfft(fft_samples))
     freqs = np.fft.rfftfreq(len(fft_samples), d=1.0 / sample_rate)
-    speech_band = (freqs >= 200) & (freqs <= 3800)
+    speech_band = (freqs >= 120) & (freqs <= 4200)
     total_energy = float(np.dot(fft_vals, fft_vals))
     if total_energy <= 1e-9:
         return False
     speech_vals = fft_vals[speech_band]
     speech_energy = float(np.dot(speech_vals, speech_vals))
-    return (speech_energy / total_energy) >= 0.08
+    return (speech_energy / total_energy) >= 0.025
 
 
 def release_metal_cache() -> None:
@@ -830,7 +918,7 @@ def release_metal_cache() -> None:
             import mlx.core as mx
             if hasattr(mx, "clear_cache"):
                 mx.clear_cache()
-            if hasattr(mx.metal, "clear_cache"):
+            elif hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
                 mx.metal.clear_cache()
         except Exception:
             pass
@@ -861,7 +949,7 @@ def release_transcriber_memory() -> None:
                 import mlx.core as mx
                 if hasattr(mx, "clear_cache"):
                     mx.clear_cache()
-                if hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
+                elif hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
                     mx.metal.clear_cache()
             except Exception as e:
                 logger.debug(f"[Transcriber] Errore pulizia memoria: {e}")

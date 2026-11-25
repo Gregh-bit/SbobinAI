@@ -7,14 +7,20 @@ import os
 import json
 import threading
 import re
+from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
+import logging
+import shutil
+
 from database import Bookmark, Lecture, Subject, get_db
-from schemas import BookmarkCreate, BookmarkOut, LectureCreate, LectureOut, LectureUpdate
+from schemas import BookmarkCreate, BookmarkOut, LectureCreate, LectureOut, LectureUpdate, LectureMove
 from rag import delete_lecture_vectors
+
+logger = logging.getLogger("sbobinai.lectures")
 from transcript_cleaner import clean_transcript_for_llm
 
 router = APIRouter(prefix="/lectures", tags=["Lectures"])
@@ -85,6 +91,126 @@ def update_lecture(lecture_id: int, payload: LectureUpdate, db: Session = Depend
             )
         except Exception as reindex_err:
             logger.debug(f"[Lectures] Reindex LanceDB post-update: {reindex_err}")
+
+    return lecture
+
+
+@router.post("/{lecture_id}/move", response_model=LectureOut)
+def move_lecture(lecture_id: int, payload: LectureMove, db: Session = Depends(get_db)):
+    """Sposta una lezione da un corso a un altro.
+
+    1. Verifica esistenza della lezione e del corso di destinazione.
+    2. Rimuove i vettori semantici LanceDB dal vecchio corso e reindicizza per il nuovo corso.
+    3. Sposta eventuali file fisici presenti nella cartella uploads del vecchio corso.
+    4. Pulisce lo scope delle sessioni di chat del vecchio corso (rimuove la lezione dai filtri RAG).
+    5. Aggiorna `lecture.subject_id` su SQLite.
+    """
+    lecture = db.query(Lecture).filter(Lecture.id == lecture_id).first()
+    if not lecture:
+        raise HTTPException(status_code=404, detail="Lezione non trovata.")
+
+    target_subject = db.query(Subject).filter(Subject.id == payload.target_subject_id).first()
+    if not target_subject:
+        raise HTTPException(status_code=404, detail="Corso di destinazione non trovato.")
+
+    old_subject_id = lecture.subject_id
+    new_subject_id = payload.target_subject_id
+
+    if old_subject_id == new_subject_id:
+        return lecture
+
+    # 1. Rimuove vettori LanceDB dal vecchio corso
+    try:
+        from rag import delete_lecture_vectors
+        delete_lecture_vectors(subject_id=old_subject_id, lecture_id=lecture.id)
+    except Exception as e:
+        logger.warning(f"[Move Lecture] Rimozione vettori LanceDB per materia {old_subject_id}: {e}")
+
+    # 2. Sposta file fisici se presenti nella cartella uploads del vecchio corso
+    try:
+        from config import get_uploads_dir
+        uploads_root = os.path.abspath(get_uploads_dir())
+        old_dir = os.path.join(uploads_root, f"subject_{old_subject_id}")
+        new_dir = os.path.join(uploads_root, f"subject_{new_subject_id}")
+
+        if lecture.audio_path:
+            abs_audio = os.path.abspath(lecture.audio_path)
+            # startswith() considera erroneamente subject_10 contenuta in subject_1.
+            # Confrontiamo il path normalizzato per componenti, non per prefisso testuale.
+            try:
+                abs_audio_relative = os.path.relpath(abs_audio, old_dir)
+                is_in_old_dir = (
+                    abs_audio_relative != os.pardir
+                    and not abs_audio_relative.startswith(os.pardir + os.sep)
+                    and not os.path.isabs(abs_audio_relative)
+                )
+            except ValueError:
+                is_in_old_dir = False
+            if is_in_old_dir:
+                os.makedirs(new_dir, exist_ok=True)
+                fname = os.path.basename(abs_audio)
+                new_audio_path = os.path.join(new_dir, fname)
+                if os.path.exists(abs_audio) and abs_audio != new_audio_path:
+                    shutil.move(abs_audio, new_audio_path)
+                    lecture.audio_path = new_audio_path
+
+                # Sposta anche i timestamp e metadati collegati se presenti
+                for extra_ext in (".timestamps.json", ".meta.json"):
+                    old_extra = abs_audio + extra_ext
+                    new_extra = new_audio_path + extra_ext
+                    if os.path.exists(old_extra):
+                        try:
+                            shutil.move(old_extra, new_extra)
+                        except Exception:
+                            pass
+    except Exception as e:
+        logger.error(f"[Move Lecture] Errore spostamento file su disco: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Impossibile spostare i file audio della lezione sul disco: {e}",
+        )
+
+    # 3. Pulisce lo scope delle sessioni di chat del vecchio corso
+    try:
+        from database import ChatSession
+        sessions = db.query(ChatSession).filter(ChatSession.subject_id == old_subject_id).all()
+        for s in sessions:
+            if not s.scope_json:
+                continue
+            try:
+                s_scope = json.loads(s.scope_json)
+                if isinstance(s_scope, dict):
+                    lecs = s_scope.get("lecture_ids") or []
+                    if lecture.id in lecs:
+                        s_scope["lecture_ids"] = [lid for lid in lecs if lid != lecture.id]
+                        s.scope_json = json.dumps(s_scope, ensure_ascii=False)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"[Move Lecture] Errore pulizia scope chat vecchio corso: {e}")
+
+    # 4. Aggiorna la lezione su SQLite
+    lecture.subject_id = new_subject_id
+    db.commit()
+    db.refresh(lecture)
+
+    # 5. Reindicizza i vettori nel nuovo corso se ci sono contenuti
+    if lecture.raw_transcript or lecture.processed_notes or lecture.title:
+        try:
+            from rag import index_lecture, unload_embedding_model, clear_metal_cache
+            try:
+                index_lecture(
+                    subject_id=new_subject_id,
+                    lecture_id=lecture.id,
+                    title=lecture.title,
+                    transcript=lecture.raw_transcript or "",
+                    notes=lecture.processed_notes,
+                )
+            finally:
+                unload_embedding_model()
+                clear_metal_cache()
+        except Exception as e:
+            logger.warning(f"[Move Lecture] Errore indicizzazione LanceDB nuovo corso {new_subject_id}: {e}")
 
     return lecture
 
@@ -568,9 +694,11 @@ def get_lecture_timestamps(
                 _pending_timestamp_tasks.add(lecture_id)
                 background_tasks.add_task(_bg_compute_timestamps, lecture_id)
 
-    # Restituisce immediatamente la stima proporzionale pulita e salvala se cache assente
+    # Restituisce immediatamente la stima proporzionale pulita a zero latenza.
+    # Non salviamo la stima temporanea in cache_path se l'audio è presente,
+    # altrimenti il task Whisper in background la scambierebbe per cache definitiva.
     result = compute_proportional_timestamps(lecture)
-    if cache_path and result.get("lines"):
+    if not (audio_path and os.path.isfile(audio_path)) and cache_path and result.get("lines"):
         try:
             with open(cache_path, "w", encoding="utf-8") as f:
                 json.dump(result["lines"], f, ensure_ascii=False)
@@ -596,8 +724,18 @@ def delete_lecture(lecture_id: int, db: Session = Depends(get_db)):
     except Exception:
         pass
 
-    # 2. Eliminazione file audio fisico registrato e relativa cache
+    # 2. Elimina file e cache solo se appartengono allo storage dell'app.
+    # audio_path è modificabile via API e non va trattato come trusted path.
+    managed_path = False
     if audio_path:
+        try:
+            from cleaner import get_all_audio_directories, get_all_uploads_directories
+            candidate = Path(audio_path).resolve()
+            managed_roots = get_all_audio_directories() + get_all_uploads_directories()
+            managed_path = any(candidate.is_relative_to(Path(root).resolve()) for root in managed_roots)
+        except (OSError, ValueError):
+            managed_path = False
+    if audio_path and managed_path:
         cache_ts = audio_path + ".timestamps.json"
         if os.path.isfile(cache_ts):
             try:

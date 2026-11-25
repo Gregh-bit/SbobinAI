@@ -29,8 +29,14 @@ async function request<T>(
   if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
   let signal = options?.signal;
   let timer: ReturnType<typeof setTimeout> | null = null;
-  if (!signal && timeoutMs !== null && timeoutMs > 0 && typeof AbortController !== 'undefined') {
+  let onCallerAbort: (() => void) | null = null;
+  if (timeoutMs !== null && timeoutMs > 0 && typeof AbortController !== 'undefined') {
     const controller = new AbortController();
+    if (signal?.aborted) controller.abort(signal.reason);
+    else if (signal) {
+      onCallerAbort = () => controller.abort(signal?.reason);
+      signal.addEventListener('abort', onCallerAbort, { once: true });
+    }
     timer = setTimeout(() => controller.abort(), timeoutMs);
     signal = controller.signal;
   }
@@ -47,6 +53,7 @@ async function request<T>(
     return res.json();
   } finally {
     if (timer) clearTimeout(timer);
+    if (onCallerAbort) options?.signal?.removeEventListener('abort', onCallerAbort);
   }
 }
 
@@ -218,6 +225,15 @@ export const api = {
       }
       return res.json();
     },
+    updateMaterialTag: (subjectId: number, filename: string, tag: string) =>
+      request<import('../types').CourseMaterial>(
+        `/subjects/${subjectId}/materials/${encodeURIComponent(filename)}/tag`,
+        {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tag }),
+        }
+      ),
   },
   lectures: {
     listBySubject: (subjectId: number) =>
@@ -226,6 +242,12 @@ export const api = {
       request<import('../types').Lecture>('/lectures/', { method: 'POST', body: JSON.stringify(data) }),
     update: (id: number, data: Partial<{ title: string; date: string; raw_transcript: string; processed_notes: string; duration_seconds: number; source_type: string; in_quaderno: boolean; detected_questions: string | null }>) =>
       request<import('../types').Lecture>(`/lectures/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+    move: (lectureId: number, targetSubjectId: number) =>
+      request<import('../types').Lecture>(`/lectures/${lectureId}/move`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target_subject_id: targetSubjectId }),
+      }),
     delete: (id: number) => request<void>(`/lectures/${id}`, { method: 'DELETE' }),
     generateSummary: (lectureId: number, options?: { signal?: AbortSignal }) =>
       request<{ status: string; lecture_id: number; processed_notes: string }>(`/lectures/${lectureId}/generate-summary`, {
@@ -263,26 +285,27 @@ export const api = {
       const processLine = (rawLine: string) => {
         const trimmed = rawLine.trim();
         if (!trimmed || trimmed.startsWith(':')) return; // ignora commenti keep-alive (: keep-alive)
+        let parsed: any;
         try {
-          const parsed = JSON.parse(trimmed);
-          onProgress(parsed);
-          if (parsed.stage === 'done' && parsed.processed_notes) {
-            finalResult = {
-              status: parsed.status || 'success',
-              lecture_id: parsed.lecture_id || lectureId,
-              processed_notes: parsed.processed_notes,
-            };
-          } else if (parsed.stage === 'cancelled') {
-            finalResult = {
-              status: 'cancelled',
-              lecture_id: lectureId,
-              processed_notes: parsed.processed_notes || '',
-            };
-          } else if (parsed.stage === 'error') {
-            throw new Error(parsed.message || 'Errore durante la generazione del capitolo');
-          }
-        } catch (e: any) {
-          if (e?.message && e.message.includes('Errore durante la generazione')) throw e;
+          parsed = JSON.parse(trimmed);
+        } catch {
+          return; // ignora righe NDJSON parziali/malformate
+        }
+        onProgress(parsed);
+        if (parsed.stage === 'done' && parsed.processed_notes) {
+          finalResult = {
+            status: parsed.status || 'success',
+            lecture_id: parsed.lecture_id || lectureId,
+            processed_notes: parsed.processed_notes,
+          };
+        } else if (parsed.stage === 'cancelled') {
+          finalResult = {
+            status: 'cancelled',
+            lecture_id: lectureId,
+            processed_notes: parsed.processed_notes || '',
+          };
+        } else if (parsed.stage === 'error') {
+          throw new Error(parsed.message || 'Errore durante la generazione del capitolo');
         }
       };
 
@@ -482,6 +505,34 @@ export const api = {
       request<import('../types').QuizSetOut[]>(`/study/${subjectId}/quiz-sets`),
     getQuizSet: (quizId: number) =>
       request<import('../types').QuizSetOut>(`/study/quiz-sets/${quizId}`),
+    deleteQuizSet: (quizId: number) =>
+      request<{ ok: boolean; quiz_id: number }>(`/study/quiz-sets/${quizId}`, {
+        method: 'DELETE',
+      }),
+    submitQuizResults: (quizId: number, data: { score_percent: number; results: import('../types').QuizResultItem[] }) =>
+      request<import('../types').QuizSetOut>(`/study/quiz-sets/${quizId}/results`, {
+        method: 'PATCH',
+        body: JSON.stringify(data),
+      }),
+    expandQuizSet: (quizId: number, numQuestions: number = 5) =>
+      request<import('../types').QuizSetOut>(`/study/quiz-sets/${quizId}/expand?num_questions=${numQuestions}`, {
+        method: 'POST',
+      }),
+    getMasterySummary: (subjectId: number) =>
+      request<import('../types').StudentMasterySummary>(`/study/${subjectId}/mastery`),
+    markConcept: (subjectId: number, data: { topic: string; status: 'consolidato' | 'da_consolidare' }) =>
+      request<import('../types').StudentConcept>(`/study/${subjectId}/concepts/mark`, {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
+    deleteConcept: (subjectId: number, conceptId: number) =>
+      request<{ ok: boolean; concept_id: number }>(`/study/${subjectId}/concepts/${conceptId}`, {
+        method: 'DELETE',
+      }),
+    clearAllConcepts: (subjectId: number) =>
+      request<{ ok: boolean; deleted_count: number }>(`/study/${subjectId}/concepts`, {
+        method: 'DELETE',
+      }),
   },
   chats: {
     list: (subjectId: number) =>
@@ -544,6 +595,7 @@ export const api = {
         message: string;
         mode?: import('../types').ChatStudyMode;
         scope?: import('../types').ChatScope;
+        enable_thinking?: boolean;
       },
       onEvent: (ev: import('../types').ChatStreamEvent) => void,
       signal?: AbortSignal
@@ -561,12 +613,16 @@ export const api = {
       chatId: number,
       messageId: number,
       onEvent: (ev: import('../types').ChatStreamEvent) => void,
-      signal?: AbortSignal
+      signal?: AbortSignal,
+      enableThinking?: boolean
     ): Promise<void> =>
       streamNdjson(
         `/chats/${chatId}/messages/${messageId}/regenerate-stream`,
         {
           method: 'POST',
+          ...(enableThinking !== undefined
+            ? { body: JSON.stringify({ enable_thinking: enableThinking }) }
+            : {}),
           signal,
         },
         onEvent

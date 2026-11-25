@@ -94,6 +94,7 @@ class Subject(Base):
     lectures = relationship("Lecture", back_populates="subject", cascade="all, delete-orphan")
     chat_sessions = relationship("ChatSession", back_populates="subject", cascade="all, delete-orphan")
     quiz_sets = relationship("QuizSet", back_populates="subject", cascade="all, delete-orphan")
+    concepts = relationship("StudentConcept", back_populates="subject", cascade="all, delete-orphan")
 
 
 class Lecture(Base):
@@ -190,10 +191,31 @@ class QuizSet(Base):
     title = Column(String, nullable=False)
     source_label = Column(String, default="")
     questions_json = Column(Text, nullable=False)
+    completed = Column(Boolean, default=False)
+    score_percent = Column(Integer, nullable=True)
+    results_json = Column(Text, default="[]")
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     subject = relationship("Subject", back_populates="quiz_sets")
     chat_session = relationship("ChatSession", back_populates="quiz_sets")
+
+
+class StudentConcept(Base):
+    """Tracciamento della padronanza dello studente su singoli argomenti ('da_consolidare' | 'consolidato')."""
+    __tablename__ = "student_concepts"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    subject_id = Column(Integer, ForeignKey("subjects.id", ondelete="CASCADE"), nullable=False, index=True)
+    topic = Column(String(255), nullable=False, index=True)
+    status = Column(String(50), default="da_consolidare", index=True)  # "da_consolidare" | "consolidato"
+    error_count = Column(Integer, default=0)
+    correct_count = Column(Integer, default=0)
+    last_context = Column(Text, default="")
+    last_tested_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    subject = relationship("Subject", back_populates="concepts")
 
 
 # ── Init DB ────────────────────────────────────────────────────────────────────
@@ -238,6 +260,16 @@ def init_db() -> None:
         "quiz_sets": [
             ("chat_session_id", "INTEGER"),
             ("source_label", "VARCHAR DEFAULT ''"),
+            ("completed", "BOOLEAN DEFAULT 0"),
+            ("score_percent", "INTEGER"),
+            ("results_json", "TEXT DEFAULT '[]'"),
+        ],
+        "student_concepts": [
+            ("status", "VARCHAR DEFAULT 'da_consolidare'"),
+            ("error_count", "INTEGER DEFAULT 0"),
+            ("correct_count", "INTEGER DEFAULT 0"),
+            ("last_context", "TEXT DEFAULT ''"),
+            ("last_tested_at", "DATETIME"),
         ],
     }
     with engine.connect() as conn:

@@ -20,25 +20,13 @@ import transcriber
 from transcript_cleaner import clean_transcript_for_llm
 
 
-# ── 1. Endpoint Utility Salvataggio File ───────────────────────────────────────
+# ── 1. Protezione Sicurezza Endpoint di Sistema ────────────────────────────────
 
-def test_save_file_endpoint_creates_file_and_parent_dirs(client):
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        target_path = os.path.join(tmp_dir, "sub", "dir", "test_file.txt")
-        test_content = "Contenuto di prova per salvataggio file su disco."
-
-        res = client.post("/api/v1/utils/save-file", json={
-            "path": target_path,
-            "content": test_content,
-        })
-        assert res.status_code == 200
-        data = res.json()
-        assert data["success"] is True
-        assert data["path"] == target_path
-
-        assert os.path.isfile(target_path)
-        with open(target_path, "r", encoding="utf-8") as f:
-            assert f.read() == test_content
+def test_system_shutdown_blocks_cross_origin_requests(client):
+    """Verifica che /api/v1/system/shutdown rifiuti richieste cross-site esterne con HTTP 403."""
+    res = client.post("/api/v1/system/shutdown", headers={"Origin": "https://malicious-website.com"})
+    assert res.status_code == 403
+    assert "Origine non consentita" in res.json().get("detail", "")
 
 
 # ── 2. Filtro Anti-Allucinazione Transcriber & Cleaner ──────────────────────────
@@ -130,14 +118,18 @@ def _recv_until(ws, wanted: str, limit: int = 50):
 
 
 def test_ws_live_chat_streaming_concurrency(client, subject, monkeypatch):
-    """Verifica che la chat live invii chat_chunk e chat_response senza bloccare il WS né crashare."""
-    async def fake_stream_chat_response(query, context, model_id=None):
+    """Verifica che la chat live invii chat_meta, chat_chunk e chat_response senza bloccare il WS né crashare."""
+    async def fake_stream_chat_response(query, context, model_id=None, **kwargs):
         yield "Risposta "
         yield "di "
         yield "test."
 
     monkeypatch.setattr("llm_engine.stream_chat_response", fake_stream_chat_response)
-    monkeypatch.setattr("rag.query_context", lambda **kw: "Contesto RAG fittizio")
+    monkeypatch.setattr("llm_engine.is_model_downloaded", lambda *a, **k: True)
+    monkeypatch.setattr(
+        "rag.query_context_structured",
+        lambda **kw: {"context_text": "Contesto RAG fittizio", "citations": []},
+    )
 
     with client.websocket_connect(f"/ws/live-lecture/{subject['id']}") as ws:
         ws.send_text(json.dumps({"type": "start", "payload": {"model": "mock_mode"}}))
@@ -172,6 +164,7 @@ def test_ws_live_chat_error_does_not_kill_websocket(client, subject, monkeypatch
         yield "non arriva mai"
 
     monkeypatch.setattr("llm_engine.stream_chat_response", failing_stream_chat_response)
+    monkeypatch.setattr("llm_engine.is_model_downloaded", lambda *a, **k: True)
     monkeypatch.setattr("rag.query_context", lambda **kw: "Contesto")
 
     with client.websocket_connect(f"/ws/live-lecture/{subject['id']}") as ws:

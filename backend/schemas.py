@@ -46,6 +46,7 @@ class LectureCreate(BaseModel):
     date: Optional[datetime] = None
     raw_transcript: Optional[str] = None
     processed_notes: Optional[str] = None
+    audio_path: Optional[str] = None
     duration_seconds: Optional[float] = None
     source_type: str = "recorded"
     in_quaderno: bool = True
@@ -57,10 +58,15 @@ class LectureUpdate(BaseModel):
     date: Optional[datetime] = None
     raw_transcript: Optional[str] = None
     processed_notes: Optional[str] = None
+    audio_path: Optional[str] = None
     duration_seconds: Optional[float] = None
     source_type: Optional[str] = None
     in_quaderno: Optional[bool] = None
     detected_questions: Optional[str] = None
+
+
+class LectureMove(BaseModel):
+    target_subject_id: int
 
 
 class LectureOut(BaseModel):
@@ -213,6 +219,13 @@ class ChatMessageSend(BaseModel):
     message: str
     mode: Optional[str] = "auto"
     scope: Optional[ChatScope] = None
+    enable_thinking: bool = False
+    rollback_quiz: bool = True
+
+
+class ChatRegenerateRequest(BaseModel):
+    """Payload opzionale per rigenerazione risposta assistente."""
+    enable_thinking: bool = False
 
 
 ChatStreamRequest = ChatMessageSend
@@ -254,9 +267,27 @@ class LegacyChatImportRequest(BaseModel):
 class QuizSetQuestion(BaseModel):
     """Singola domanda a risposta multipla di un QuizSet."""
     question: str
+    concept: str = ""
     options: list[str]
     correct_index: int
     explanation: str = ""
+
+
+class QuizResultItem(BaseModel):
+    """Risposta fornita dallo studente a una singola domanda del quiz."""
+    question: str
+    concept: str = ""
+    options: list[str] = Field(default_factory=list)
+    selected_index: int
+    correct_index: int
+    is_correct: bool
+    explanation: str = ""
+
+
+class QuizResultsSubmitRequest(BaseModel):
+    """Payload di completamento del quiz con punteggio e risposte dettagliate."""
+    score_percent: int
+    results: list[QuizResultItem] = Field(default_factory=list)
 
 
 class QuizSetOut(BaseModel):
@@ -267,6 +298,9 @@ class QuizSetOut(BaseModel):
     title: str
     source_label: str = ""
     questions: list[QuizSetQuestion] = Field(default_factory=list)
+    completed: bool = False
+    score_percent: Optional[int] = None
+    results_json: Optional[str] = "[]"
     created_at: datetime
 
 
@@ -279,6 +313,36 @@ class MaterialPageOut(BaseModel):
     image_data_url: Optional[str] = None
     text: str = ""
     title: str = ""
+
+
+class StudentConceptOut(BaseModel):
+    """Singolo concetto o argomento monitorato nel percorso di studio dello studente."""
+    id: int
+    subject_id: int
+    topic: str
+    status: str  # "da_consolidare" | "consolidato"
+    error_count: int
+    correct_count: int
+    last_context: str = ""
+    last_tested_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class StudentMasterySummaryOut(BaseModel):
+    """Quadro riassuntivo della padronanza accademica per materia."""
+    subject_id: int
+    total_tracked: int = 0
+    consolidated_count: int
+    to_consolidate_count: int
+    concepts: list[StudentConceptOut] = Field(default_factory=list)
+
+
+class ConceptMarkRequest(BaseModel):
+    """Richiesta per aggiornare lo stato di un concetto ('da_consolidare' | 'consolidato')."""
+    topic: str
+    status: str
+
 
 
 

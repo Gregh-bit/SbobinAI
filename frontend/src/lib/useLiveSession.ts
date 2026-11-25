@@ -3,7 +3,7 @@ import { api } from './api';
 import { isTauri, acquireWakeLock, releaseWakeLock } from './tauri';
 import { useSettings } from './SettingsContext';
 import type { 
-  ChatMessage, DetectedQuestion, Lecture, Subject, 
+  ChatMessage, CitationRef, DetectedQuestion, Lecture, Subject, 
   TranscriptChunk, WSMessage 
 } from '../types';
 
@@ -78,9 +78,16 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
   const cancelledChatResponsesRef = useRef(0);
   const chatChunkBufferRef = useRef<string>('');
   const chatChunkTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const chatMessagesRef = useRef<ChatMessage[]>(chatMessages);
+  chatMessagesRef.current = chatMessages;
   // Attesa del messaggio 'stopped' dopo l'invio di 'stop'
   const stopResolverRef = useRef<((acknowledged: boolean) => void) | null>(null);
   const isStoppingRef = useRef(false);
+  const settingsRef = useRef(settings);
+
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
 
   const stopTimer = () => {
     if (timerRef.current) {
@@ -139,15 +146,23 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
     switch (msg.type) {
       case 'started': {
         void acquireWakeLock(`SbobinAI - Registrazione lezione "${lectureRef.current?.title || subject.name}" in corso`);
-        const startedAtSec = (msg.payload?.session_started_at as number) || (Date.now() / 1000);
+        setElapsed(0);
+        elapsedRef.current = 0;
+        let lastTickMs = Date.now();
+        let activeMs = 0;
         if (timerRef.current) clearInterval(timerRef.current);
         timerRef.current = setInterval(() => {
+          const now = Date.now();
           if (!isPausedRef.current) {
-            const currentSec = Math.max(1, Math.round(Date.now() / 1000 - startedAtSec));
-            elapsedRef.current = currentSec;
-            setElapsed(currentSec);
+            activeMs += Math.max(0, now - lastTickMs);
+            const currentSec = Math.floor(activeMs / 1000);
+            if (currentSec !== elapsedRef.current) {
+              elapsedRef.current = currentSec;
+              setElapsed(currentSec);
+            }
           }
-        }, 1000);
+          lastTickMs = now;
+        }, 500);
         setConnectionError(null);
         setIsConnected(true);
         isConnectedRef.current = true;
@@ -205,6 +220,41 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
         setLastBookmarkPinned(Date.now());
         break;
 
+      case 'chat_meta': {
+        if (cancelledChatResponsesRef.current > 0 || activeChatQueryRef.current === null) break;
+        const metaQuery = msg.payload.query as string | undefined;
+        if (metaQuery !== undefined && metaQuery !== activeChatQueryRef.current) break;
+        const citations = Array.isArray(msg.payload.citations)
+          ? (msg.payload.citations as CitationRef[])
+          : undefined;
+        const contextUsed = msg.payload.context_used as string | undefined;
+        setChatMessages((prev) => {
+          if (prev.length > 0 && prev[prev.length - 1].role === 'assistant') {
+            const last = prev[prev.length - 1];
+            return [
+              ...prev.slice(0, -1),
+              {
+                ...last,
+                citations: citations ?? last.citations,
+                contextUsed: contextUsed ?? last.contextUsed,
+              },
+            ];
+          }
+          return [
+            ...prev,
+            {
+              id: generateId(),
+              role: 'assistant',
+              content: '',
+              timestamp: Date.now(),
+              citations,
+              contextUsed,
+            },
+          ];
+        });
+        break;
+      }
+
       case 'chat_chunk': {
         const chunk = (msg.payload.chunk as string) || '';
         if (!chunk) break;
@@ -239,7 +289,7 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
               };
               return [...prev.slice(0, -1), updatedLast];
             });
-          }, 60);
+          }, 45);
         }
         break;
       }
@@ -258,8 +308,11 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
         }
         if (activeChatQueryRef.current === null) break;
         activeChatQueryRef.current = null;
-        const fullAnswer = (msg.payload.answer as string) || '';
+        const fullAnswer = (msg.payload.answer as string) || (msg.payload.text as string) || '';
         const contextUsed = msg.payload.context_used as string | undefined;
+        const citations = Array.isArray(msg.payload.citations)
+          ? (msg.payload.citations as CitationRef[])
+          : undefined;
         setChatMessages((prev) => {
           if (prev.length > 0 && prev[prev.length - 1].role === 'assistant') {
             const last = prev[prev.length - 1];
@@ -267,6 +320,7 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
               ...last,
               content: fullAnswer || last.content,
               contextUsed: contextUsed || last.contextUsed,
+              citations: citations ?? last.citations,
             };
             return [...prev.slice(0, -1), updatedLast];
           }
@@ -276,6 +330,7 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
             content: fullAnswer,
             timestamp: Date.now(),
             contextUsed: contextUsed,
+            citations,
           };
           return [...prev, answer];
         });
@@ -296,15 +351,21 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
         setElapsed(restoredElapsed);
         elapsedRef.current = restoredElapsed;
 
-        const startedAtSec = (msg.payload?.session_started_at as number) || (Date.now() / 1000 - restoredElapsed);
+        let lastTickMs = Date.now();
+        let activeMs = restoredElapsed * 1000;
         if (timerRef.current) clearInterval(timerRef.current);
         timerRef.current = setInterval(() => {
+          const now = Date.now();
           if (!isPausedRef.current) {
-            const currentSec = Math.max(1, Math.round(Date.now() / 1000 - startedAtSec));
-            elapsedRef.current = currentSec;
-            setElapsed(currentSec);
+            activeMs += Math.max(0, now - lastTickMs);
+            const currentSec = Math.max(restoredElapsed, Math.floor(activeMs / 1000));
+            if (currentSec !== elapsedRef.current) {
+              elapsedRef.current = currentSec;
+              setElapsed(currentSec);
+            }
           }
-        }, 1000);
+          lastTickMs = now;
+        }, 500);
 
         if (Array.isArray(msg.payload?.chunks)) {
           const restoredChunks: TranscriptChunk[] = (msg.payload.chunks as unknown[]).map((c: any) => {
@@ -357,6 +418,20 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
         if (qId) {
           setAnsweringQuestionIds((prev) => new Set(prev).add(String(qId)));
         }
+        break;
+      }
+
+      case 'question_answer_chunk': {
+        const qId = (msg.payload?.question_id as string) || (msg.payload?.id as string);
+        const token = (msg.payload?.chunk as string) || '';
+        if (!qId || !token) break;
+        setDetectedQuestions((prev) =>
+          prev.map((item) => {
+            if (item.id !== String(qId)) return item;
+            const nextText = (item.answer || item.suggestedAnswer || '') + token;
+            return { ...item, answer: nextText, suggestedAnswer: nextText };
+          })
+        );
         break;
       }
 
@@ -434,6 +509,7 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
       case 'resumed':
         setIsPaused(false);
         isPausedRef.current = false;
+        setConnectionError(null);
         break;
 
       case 'stopped':
@@ -460,10 +536,20 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
             payload: {
               title: lectureRef.current.title,
               lecture_id: lectureRef.current.id,
-              model: settings.whisperModel,
-              vad_sensitivity: settings.vadSensitivity,
+              model: settingsRef.current.whisperModel,
+              vad_sensitivity: settingsRef.current.vadSensitivity,
             }
           }));
+          break;
+        }
+
+        const failedQId = (msg.payload?.question_id as string) || (msg.payload?.id as string);
+        if (failedQId) {
+          setAnsweringQuestionIds((prev) => {
+            const next = new Set(prev);
+            next.delete(String(failedQId));
+            return next;
+          });
           break;
         }
 
@@ -472,14 +558,6 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
         if (activeChatQueryRef.current !== null) {
           activeChatQueryRef.current = null;
           setIsSendingChat(false);
-        }
-        const failedQId = (msg.payload?.question_id as string) || (msg.payload?.id as string);
-        if (failedQId) {
-          setAnsweringQuestionIds((prev) => {
-            const next = new Set(prev);
-            next.delete(String(failedQId));
-            return next;
-          });
         }
         break;
       }
@@ -536,8 +614,8 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
             payload: {
               lecture_id: currentLecture.id,
               title: currentLecture.title,
-              model: settings.whisperModel,
-              vad_sensitivity: settings.vadSensitivity,
+              model: settingsRef.current.whisperModel,
+              vad_sensitivity: settingsRef.current.vadSensitivity,
             }
           }));
         } catch (err) {
@@ -550,8 +628,8 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
             payload: {
               title: currentLecture.title,
               lecture_id: currentLecture.id,
-              model: settings.whisperModel,
-              vad_sensitivity: settings.vadSensitivity,
+              model: settingsRef.current.whisperModel,
+              vad_sensitivity: settingsRef.current.vadSensitivity,
             }
           }));
         } catch (err) {
@@ -575,12 +653,20 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
       isConnectedRef.current = false;
       stopTimer();
 
-      // Sblocca un'eventuale attesa di 'stopped' e una richiesta chat in corso
+      // Sblocca un'eventuale attesa di 'stopped', richieste chat e domande in corso
       if (stopResolverRef.current) stopResolverRef.current(false);
+      cancelledChatResponsesRef.current = 0;
       if (activeChatQueryRef.current !== null) {
         activeChatQueryRef.current = null;
         setIsSendingChat(false);
+        setChatMessages((prev) => {
+          if (prev.length > 0 && prev[prev.length - 1].role === 'assistant' && !prev[prev.length - 1].content.trim()) {
+            return prev.slice(0, -1);
+          }
+          return prev;
+        });
       }
+      setAnsweringQuestionIds((prev) => (prev.size > 0 ? new Set() : prev));
 
       if (!isStoppingRef.current && lectureRef.current) {
         // Mostra stato di riconnessione automatica a intervalli crescenti (1s, 2s, 3s...)
@@ -601,7 +687,21 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
         isConnectedRef.current = false;
       }
     };
-  }, [sessionSubjectId, settings.whisperModel, settings.vadSensitivity]);
+  }, [sessionSubjectId]);
+
+  // ── Aggiornamento VAD dinamico in tempo reale (senza chiudere WebSocket o fermare timer) ──
+  useEffect(() => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      try {
+        wsRef.current.send(JSON.stringify({
+          type: 'update_vad',
+          payload: { vad_sensitivity: settings.vadSensitivity }
+        }));
+      } catch (err) {
+        console.warn('[LiveSession] Errore invio update_vad in diretta:', err);
+      }
+    }
+  }, [settings.vadSensitivity]);
 
   useEffect(() => {
     if (!lecture) return;
@@ -656,18 +756,14 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
     }
   }, []);
 
-  // ── Riconoscimento Chiusura Schermo / Sleep / Minimizzazione ─────────────────
+  // ── Riconoscimento Ritorno da Background / Sleep (senza mai auto-mettere in pausa) ────────
   useEffect(() => {
     if (!lecture) return;
 
     const handleVisibilityChange = () => {
-      if (document.visibilityState === 'hidden') {
-        if (isConnectedRef.current && !isPausedRef.current && !isStoppingRef.current) {
-          console.log('[LiveSession] Schermo chiuso / minimizzato: auto-pausa automatica attivata');
-          wasAutoPausedBySleepRef.current = true;
-          togglePause();
-        }
-      } else if (document.visibilityState === 'visible') {
+      // Quando la finestra o scheda va in background, NON mettiamo in pausa:
+      // la registrazione deve continuare ininterrottamente anche mentre lo studente consulta slide/note.
+      if (document.visibilityState === 'visible') {
         if (!isStoppingRef.current) {
           const isSocketOpen = wsRef.current && wsRef.current.readyState === WebSocket.OPEN;
           if (!isSocketOpen) {
@@ -686,7 +782,7 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
     return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [lecture, togglePause, connectWebSocket]);
+  }, [lecture, connectWebSocket]);
 
   // ── Actions ─────────────────────────────────────────────────────────────────
   const lastBookmarkTimeRef = useRef(0);
@@ -750,14 +846,19 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
           // ignore
         }
       }
+      // Stacca gli handler prima di chiudere così ws.onclose non innesca banner "Riconnessione..." durante la chiusura
+      if (wsRef.current) {
+        wsRef.current.onclose = null;
+        wsRef.current.onerror = null;
+      }
       onStop();
     } finally {
+      // Mantiene isStoppingRef=true finché lecture?.id non si azzera nel reset effect
       setIsStopping(false);
-      isStoppingRef.current = false;
     }
   }, [lecture, onStop, detectedQuestions, chunks]);
 
-  const handleChatSend = useCallback((textToSend?: string) => {
+  const handleChatSend = useCallback((textToSend?: string, options?: { enableThinking?: boolean }) => {
     const q = (textToSend || chatInput).trim();
     if (!q || isSendingChat) return;
     const ws = wsRef.current;
@@ -766,13 +867,25 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
       return;
     }
 
+    const recentHistory = chatMessagesRef.current
+      .filter((m) => m.content.trim().length > 0)
+      .slice(-6)
+      .map((m) => ({ role: m.role, content: m.content }));
+
     const userMsg: ChatMessage = {
       id: generateId(),
       role: 'user',
       content: q,
       timestamp: Date.now(),
     };
-    setChatMessages((prev) => [...prev, userMsg]);
+    // Inserisce subito il placeholder assistente per mostrare l'animazione ChatGPT 2026 a 0ms
+    const pendingAssistant: ChatMessage = {
+      id: generateId(),
+      role: 'assistant',
+      content: '',
+      timestamp: Date.now() + 1,
+    };
+    setChatMessages((prev) => [...prev, userMsg, pendingAssistant]);
     setChatInput('');
     setIsSendingChat(true);
     activeChatQueryRef.current = q;
@@ -780,7 +893,12 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
     try {
       ws.send(JSON.stringify({
         type: 'chat',
-        payload: { query: q, context_minutes: 5 }
+        payload: {
+          query: q,
+          context_minutes: 15,
+          enable_thinking: Boolean(options?.enableThinking),
+          history: recentHistory,
+        }
       }));
     } catch (err) {
       console.warn('Errore invio chat WebSocket:', err);
@@ -801,6 +919,12 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
       cancelledChatResponsesRef.current += 1;
       activeChatQueryRef.current = null;
     }
+    setChatMessages((prev) => {
+      if (prev.length > 0 && prev[prev.length - 1].role === 'assistant' && !prev[prev.length - 1].content.trim()) {
+        return prev.slice(0, -1);
+      }
+      return prev;
+    });
     setIsSendingChat(false);
     try {
       await api.ai.stop(true);
@@ -810,13 +934,12 @@ export function useLiveSession({ subject, lecture, onStop }: UseLiveSessionProps
   }, []);
 
   const handleAnswerQuestion = useCallback((questionId: string) => {
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
     setAnsweringQuestionIds((prev) => new Set(prev).add(questionId));
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({
-        type: 'answer_question',
-        payload: { question_id: questionId }
-      }));
-    }
+    wsRef.current.send(JSON.stringify({
+      type: 'answer_question',
+      payload: { question_id: questionId }
+    }));
   }, []);
 
   const handleDeleteQuestion = useCallback((questionId: string) => {

@@ -113,7 +113,7 @@ def clear_metal_cache() -> None:
             import mlx.core as mx
             if hasattr(mx, "clear_cache"):
                 mx.clear_cache()
-            if hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
+            elif hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
                 mx.metal.clear_cache()
         except Exception:
             pass
@@ -127,6 +127,11 @@ def is_embedding_downloaded(model_id: Optional[str] = None) -> bool:
     """Verifica se il modello di embedding è scaricato in locale (snapshot completa)."""
     spec = ai_models.resolve(model_id, kind="embedding") or ai_models.CATALOG[DEFAULT_EMBEDDING_MODEL]
     return ai_models.is_downloaded(spec)[0]
+
+
+def is_embedding_loaded() -> bool:
+    """True se il modello di embedding è già caldo in RAM (zero latenza di caricamento)."""
+    return _loaded_embed_model is not None
 
 
 def reset_connection() -> None:
@@ -204,13 +209,44 @@ def get_lancedb_table():
             if cur_dim is not None and cur_dim != EMBEDDING_DIM:
                 logger.warning(
                     f"[RAG] Tabella {TABLE_NAME} ha dimensione {cur_dim} != {EMBEDDING_DIM}. "
-                    "Ricreazione automatica per Qwen3-Embedding (1024 dim)."
+                    "Ricreazione automatica per Qwen3-Embedding (1024 dim) e avvio reindicizzazione automatica."
                 )
                 _db_conn.drop_table(TABLE_NAME)
-                return _db_conn.create_table(TABLE_NAME, schema=_get_schema(), mode="create")
+                new_tbl = _db_conn.create_table(TABLE_NAME, schema=_get_schema(), mode="create")
+                _schedule_background_reindex()
+                return new_tbl
         except Exception as exc:
             logger.debug(f"[RAG] Controllo schema tabella: {exc}")
         return _migrate_table_schema_if_needed(_db_conn, tbl)
+
+
+def _schedule_background_reindex() -> None:
+    """Ricostruisce in background i vettori per tutte le lezioni esistenti dopo un cambio di schema/dimensione."""
+    def _worker():
+        try:
+            from database import SessionLocal, Lecture
+            with SessionLocal() as db:
+                lectures = db.query(Lecture).all()
+                for lec in lectures:
+                    if lec.raw_transcript or lec.processed_notes:
+                        try:
+                            index_lecture(
+                                subject_id=lec.subject_id,
+                                lecture_id=lec.id,
+                                title=lec.title,
+                                transcript=lec.raw_transcript or "",
+                                notes=lec.processed_notes,
+                            )
+                        except Exception as e:
+                            logger.warning(f"[RAG Reindex] Errore reindicizzazione lezione {lec.id}: {e}")
+            logger.info("[RAG Reindex] Reindicizzazione automatica completata.")
+        except Exception as exc:
+            logger.warning(f"[RAG Reindex] Errore worker: {exc}")
+        finally:
+            unload_embedding_model()
+            clear_metal_cache()
+
+    threading.Thread(target=_worker, daemon=True, name="RAG-Reindex-Worker").start()
 
 
 def _load_portable_embedder(model_path: str) -> Any:
@@ -664,7 +700,8 @@ def delete_lecture_vectors(subject_id: int, lecture_id: int) -> None:
     """Elimina i vettori associati a una specifica lezione da LanceDB."""
     try:
         tbl = get_lancedb_table()
-        tbl.delete(f"subject_id = {int(subject_id)} AND lecture_id = {int(lecture_id)}")
+        cond = f"subject_id = {int(subject_id)} AND (lecture_id = {int(lecture_id)} OR source_id = 'lecture_{int(lecture_id)}')"
+        tbl.delete(cond)
         logger.info(f"[RAG] Eliminati vettori LanceDB per lezione {lecture_id} (Materia {subject_id}).")
     except Exception as exc:
         logger.warning(f"[RAG] Errore eliminazione vettori lezione {lecture_id}: {exc}")
@@ -753,10 +790,34 @@ def _format_snippet_and_citation(r: Dict[str, Any]) -> Tuple[str, Dict[str, Any]
     text = str(r.get("text") or "")
     page_start = int(r.get("page_start") or 0)
     raw_label = str(r.get("chunk_label") or "").strip()
+    lecture_id = int(r.get("lecture_id") or 0)
 
-    if page_start > 0:
+    if source_type == "lecture" or lecture_id > 0:
+        actual_lec_id = lecture_id if lecture_id > 0 else (
+            int(source_id.replace("lecture_", ""))
+            if source_id.startswith("lecture_") and source_id.replace("lecture_", "").isdigit()
+            else 0
+        )
+        time_sec = page_start
+        time_label = f"{time_sec // 60}:{time_sec % 60:02d}" if time_sec > 0 else ""
+        label_text = raw_label or (f"{title} ({time_label})" if time_label else title)
+        snippet = (
+            f"[FONTE AUDIO DOCENTE: {title} | LEZIONE_ID: {actual_lec_id} | SECONDI: {time_sec} | "
+            f"LINK: [[audio:{actual_lec_id}|{time_sec}|{label_text}]]]\n{text}"
+        )
+        citation = {
+            "source_id": str(actual_lec_id) if actual_lec_id > 0 else source_id,
+            "source_type": "lecture",
+            "title": title,
+            "page": time_sec if time_sec > 0 else None,
+            "label": label_text,
+        }
+    elif page_start > 0:
         label_or_page = raw_label or f"Pag. {page_start}"
-        snippet = f"[FONTE: {title} | REF: {source_id}#{page_start} | ETICHETTA: {label_or_page}]\n{text}"
+        snippet = (
+            f"[FONTE: {title} | REF: {source_id}#{page_start} | ETICHETTA: {label_or_page} | "
+            f"LINK: [[slide:{source_id}#{page_start}|{label_or_page}]]]\n{text}"
+        )
         citation = {
             "source_id": source_id,
             "source_type": source_type,
@@ -765,13 +826,15 @@ def _format_snippet_and_citation(r: Dict[str, Any]) -> Tuple[str, Dict[str, Any]
             "label": label_or_page,
         }
     else:
-        snippet = f"[FONTE: {title} ({source_type})]\n{text}"
+        link_tag = "doc" if source_type in ("notes", "doc") else "slide"
+        page_suffix = "" if link_tag == "doc" else "#1"
+        snippet = f"[FONTE: {title} ({source_type}) | REF: {source_id} | LINK: [[{link_tag}:{source_id}{page_suffix}|{title}]]]\n{text}"
         citation = {
             "source_id": source_id,
             "source_type": source_type,
             "title": title,
             "page": None,
-            "label": raw_label,
+            "label": raw_label or title,
         }
     return snippet, citation
 
@@ -783,10 +846,12 @@ def query_context_structured(
     priority_previous_lecture: bool = False,
     scope_lecture_ids: Optional[List[int]] = None,
     scope_material_ids: Optional[List[str]] = None,
+    use_vector: bool = True,
 ) -> Dict[str, Any]:
     """
     Recupera i chunk più pertinenti tramite Hybrid Search (vettoriale + lessicale RRF),
     con supporto per scope opzionale su lezioni/materiali e citazioni strutturate.
+    Con `use_vector=False` esegue solo ricerca lessicale istantanea (<5ms) senza caricare l'embedder.
     Restituisce {"context_text": str, "citations": list[dict]}.
     """
     clean_q = query.strip()
@@ -801,8 +866,8 @@ def query_context_structured(
         records: Dict[str, Dict[str, Any]] = {}
         scores: Dict[str, float] = {}
 
-        # 1. Ricerca vettoriale con cache LRU (256 query)
-        q_vec = get_cached_query_vector(clean_q)
+        # 1. Ricerca vettoriale con cache LRU (256 query) — saltata in modalità ultra-rapida se richiesto
+        q_vec = get_cached_query_vector(clean_q) if use_vector else None
         if q_vec is not None:
             try:
                 vec_matches = (
@@ -829,7 +894,7 @@ def query_context_structured(
                     tbl.search()
                     .where(where)
                     .select(_RESULT_COLUMNS)
-                    .limit(None)
+                    .limit(500)
                     .to_list()
                 )
                 lexical: List[Tuple[float, str, Dict[str, Any]]] = []

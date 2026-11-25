@@ -1,15 +1,11 @@
-import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
+import React, { useRef, useEffect, useLayoutEffect, useState, useCallback, useMemo } from 'react';
 import {
   HelpCircle,
   MessageSquare,
   Sparkles,
-  Send,
+  ArrowUp,
   Trash2,
   Square,
-  Copy,
-  Check,
-  Brain,
-  ChevronDown,
   ChevronRight,
   ChevronLeft,
   X,
@@ -21,14 +17,22 @@ import {
   FileText,
 } from 'lucide-react';
 import { clsx } from 'clsx';
-import type { ChatMessage, DetectedQuestion, MaterialPageOut, TranscriptChunk } from '../types';
+import type {
+  ChatMessage,
+  DetectedQuestion,
+  MaterialPageOut,
+  PersistentChatMessage,
+  TranscriptChunk,
+} from '../types';
 import SegmentedControl from './SegmentedControl';
 import MarkdownContent from './MarkdownContent';
-import { parseThinkingContent } from './chat/ChatMessageItem';
+import ChatMessageItem from './chat/ChatMessageItem';
+import { SlidePageSkeleton } from './Skeleton';
 import { api } from '../lib/api';
 
 interface Props {
   subjectId?: number;
+  subjectName?: string;
   chunks: TranscriptChunk[];
   isPaused?: boolean;
   audioStatus?: 'idle' | 'listening' | 'transcribing';
@@ -40,11 +44,12 @@ interface Props {
   chatInput: string;
   setChatInput: (input: string) => void;
   isSendingChat: boolean;
-  handleChatSend: (text?: string) => void;
+  handleChatSend: (text?: string, options?: { enableThinking?: boolean }) => void;
   handleCancelChat?: () => void;
   inspectorTab: 'domande' | 'chat';
   setInspectorTab: (tab: 'domande' | 'chat') => void;
   onOpenCitation?: (sourceId: string, page?: number) => void;
+  onOpenSettings?: () => void;
   onLectureCreated?: () => void;
 }
 
@@ -60,7 +65,8 @@ export const LiveTranscriptContainer = React.memo(function LiveTranscriptContain
   isPaused,
   audioStatus,
 }: LiveTranscriptContainerProps) {
-  const transcriptEndRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const isNearBottomRef = useRef<boolean>(true);
 
   // Unione fluida e lineare di tutti i chunk senza forzare mai interruzioni di riga
   const fullTargetText = useMemo(() => {
@@ -85,57 +91,104 @@ export const LiveTranscriptContainer = React.memo(function LiveTranscriptContain
     return result;
   }, [chunks]);
 
+  // Se chunks sono già presenti al montaggio iniziale, mostriamo direttamente il testo pregresso
   const [displayedLength, setDisplayedLength] = useState<number>(() => {
-    // Se chunks sono già presenti al montaggio (es. recupero sessione attiva)
-    const initialLen = chunks && chunks.length > 0
-      ? chunks.map(c => (c.text || '').trim()).filter(Boolean).join(' ').length
-      : 0;
-    return initialLen > 300 ? initialLen : 0;
+    return fullTargetText.length;
   });
 
   const displayedLengthRef = useRef<number>(displayedLength);
   const animFrameRef = useRef<number | null>(null);
-  const lastTickRef = useRef<number>(0);
+  const lastTimeRef = useRef<number>(0);
+  const charAccumulatorRef = useRef<number>(0);
 
   useEffect(() => {
     displayedLengthRef.current = displayedLength;
   }, [displayedLength]);
 
-  // Ciclo macchina da scrivere a scorrimento naturale
+  // Rileva se l'utente è vicino al fondo o se sta scrollando manualmente per leggere
+  const handleScroll = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    isNearBottomRef.current = distanceToBottom < 75;
+  }, []);
+
+  // Ciclo macchina da scrivere a scorrimento naturale sincronizzato al frame rate (60-120fps)
   useEffect(() => {
     const targetLen = fullTargetText.length;
-    // Se all'inizio o se il ritardo accumulato è eccessivo (>350 caratteri su restore)
-    if (displayedLengthRef.current === 0 && targetLen > 350) {
+
+    // Se il testo si riduce (es. rimozione duplicati o reset)
+    if (displayedLengthRef.current > targetLen) {
       setDisplayedLength(targetLen);
       displayedLengthRef.current = targetLen;
+      charAccumulatorRef.current = 0;
+      if (animFrameRef.current) {
+        cancelAnimationFrame(animFrameRef.current);
+        animFrameRef.current = null;
+      }
+      return;
+    }
+
+    // Se il ritardo è consistente (>300 caratteri, es. riconnessione di sessione attiva),
+    // aggiorna subito alla fine senza far attendere l'utente
+    if (targetLen - displayedLengthRef.current > 300) {
+      setDisplayedLength(targetLen);
+      displayedLengthRef.current = targetLen;
+      charAccumulatorRef.current = 0;
+      if (animFrameRef.current) {
+        cancelAnimationFrame(animFrameRef.current);
+        animFrameRef.current = null;
+      }
+      return;
+    }
+
+    if (displayedLengthRef.current === targetLen) {
+      if (animFrameRef.current) {
+        cancelAnimationFrame(animFrameRef.current);
+        animFrameRef.current = null;
+      }
       return;
     }
 
     const stepAnimation = (timestamp: number) => {
+      if (lastTimeRef.current === 0) {
+        lastTimeRef.current = timestamp;
+      }
+      const dt = Math.min(0.08, (timestamp - lastTimeRef.current) / 1000);
+      lastTimeRef.current = timestamp;
+
+      const remaining = targetLen - displayedLengthRef.current;
+      if (remaining <= 0) {
+        animFrameRef.current = null;
+        charAccumulatorRef.current = 0;
+        return;
+      }
+
+      // Cadenza battiti macchina da scrivere:
+      // - Per battitura normale: ~34 caratteri/s (~29ms a lettera, cadenza naturale e piacevole)
+      // - Per chunk corposi: accelera progressivamente fino a ~95 caratteri/s per non rimanere indietro
+      const charsPerSec = Math.min(110, Math.max(34, remaining * 2.8));
+      charAccumulatorRef.current += dt * charsPerSec;
+
+      const step = Math.floor(charAccumulatorRef.current);
+      if (step > 0) {
+        charAccumulatorRef.current -= step;
+        const nextLen = Math.min(targetLen, displayedLengthRef.current + step);
+        displayedLengthRef.current = nextLen;
+        setDisplayedLength(nextLen);
+      }
+
       if (displayedLengthRef.current < targetLen) {
-        if (timestamp - lastTickRef.current >= 18) {
-          lastTickRef.current = timestamp;
-          const remaining = targetLen - displayedLengthRef.current;
-          // Passo dinamico per un battito naturale da macchina da scrivere:
-          // 1-2 caratteri per parlato normale, fino a 4-8 caratteri se arriva un chunk corposo
-          const step = Math.max(1, Math.min(remaining, Math.ceil(remaining / 7)));
-          const nextLen = displayedLengthRef.current + step;
-          displayedLengthRef.current = nextLen;
-          setDisplayedLength(nextLen);
-        }
         animFrameRef.current = requestAnimationFrame(stepAnimation);
       } else {
         animFrameRef.current = null;
+        charAccumulatorRef.current = 0;
       }
     };
 
-    if (displayedLengthRef.current < targetLen) {
-      if (!animFrameRef.current) {
-        animFrameRef.current = requestAnimationFrame(stepAnimation);
-      }
-    } else if (displayedLengthRef.current > targetLen) {
-      setDisplayedLength(targetLen);
-      displayedLengthRef.current = targetLen;
+    lastTimeRef.current = 0;
+    if (!animFrameRef.current) {
+      animFrameRef.current = requestAnimationFrame(stepAnimation);
     }
 
     return () => {
@@ -153,190 +206,89 @@ export const LiveTranscriptContainer = React.memo(function LiveTranscriptContain
 
   const isTyping = displayedLength < fullTargetText.length;
 
+  // Auto-scroll fluido solo se l'utente si trova in fondo alla pagina (senza scroll thrashing)
   useEffect(() => {
-    transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    const el = scrollContainerRef.current;
+    if (!el || !isNearBottomRef.current) return;
+    el.scrollTop = el.scrollHeight;
   }, [displayedText, isPaused]);
 
   return (
     <section className="flex-1 flex flex-col h-full overflow-hidden relative pb-8 content-canvas">
-      <div className="flex-1 overflow-y-auto px-12 py-10">
+      <div
+        ref={scrollContainerRef}
+        onScroll={handleScroll}
+        className="flex-1 overflow-y-auto px-12 py-10"
+      >
         <div className="max-w-2xl mx-auto space-y-4">
-          {isPaused && (
-            <div className="flex items-center justify-center mb-4 animate-fade-in">
-              <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-amber-500/15 border border-amber-500/30 text-amber-200 text-xs shadow-liquid-sm">
-                <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-                <span className="font-medium">Registrazione in Pausa · Hardware a riposo (0% CPU/GPU)</span>
-              </div>
-            </div>
-          )}
-
           {/* Testo lineare unico e continuo (display inline), zero scritte di caricamento o interruzioni di riga forzate */}
           <div className="relative text-[16px] leading-[1.85] font-sans text-white/95 font-normal tracking-wide select-text break-words">
             <span>{displayedText}</span>
 
-            {/* Cursore verticale animato stile playhead/karaoke (effetto macchina da scrivere) */}
+            {/* Cursore verticale stile Mac (macchina da scrivere): bianco minimal, nessun bagliore hover */}
             <span
               className={clsx(
-                "inline-block rounded-full pointer-events-none transition-opacity duration-150 align-baseline",
+                "inline-block pointer-events-none transition-opacity duration-150 align-baseline",
                 (isTyping || audioStatus === 'transcribing') ? "opacity-100" : "animate-caret-blink"
               )}
               style={{
-                width: '2.5px',
-                height: '1.25em',
-                background: 'linear-gradient(180deg, #ffffff 0%, #38bdf8 100%)',
-                boxShadow: '0 0 8px #38bdf8, 0 0 14px rgba(56, 189, 248, 0.65)',
-                marginLeft: displayedText ? '3px' : '0px',
-                marginRight: '2px',
+                width: '2px',
+                height: '1.2em',
+                backgroundColor: '#ffffff',
+                boxShadow: 'none',
+                borderRadius: '1px',
+                marginLeft: displayedText ? '2.5px' : '0px',
+                marginRight: '1px',
                 verticalAlign: '-0.15em',
               }}
               aria-hidden="true"
             />
           </div>
-
-          <div ref={transcriptEndRef} />
         </div>
       </div>
     </section>
   );
 });
 
-interface LiveAssistantMessageProps {
-  message: ChatMessage;
-  isStreaming: boolean;
-  onOpenCitation?: (sourceId: string, page?: number) => void;
+// ── Adattatore ChatMessage -> PersistentChatMessage per riuso esatto di ChatMessageItem (ChatGPT 2026) ──
+function toChatMessageItemModel(
+  msg: ChatMessage,
+  index: number,
+  isStreamingThis: boolean
+): PersistentChatMessage {
+  return {
+    id: isStreamingThis ? -(index + 1) : index + 1,
+    session_id: 0,
+    role: msg.role,
+    content: msg.content,
+    thinking: msg.thinking || '',
+    mode: 'auto',
+    citations: msg.citations ?? [],
+    followups: [],
+    context_used: msg.contextUsed || '',
+    token_estimate: 0,
+    created_at: new Date(msg.timestamp).toISOString(),
+  };
 }
 
-function LiveAssistantMessage({
-  message,
-  isStreaming,
-  onOpenCitation,
-}: LiveAssistantMessageProps) {
-  const [copied, setCopied] = useState(false);
-  const [thinkingExpanded, setThinkingExpanded] = useState(false);
-  const copyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const isMountedRef = useRef(true);
-
-  useEffect(() => {
-    isMountedRef.current = true;
-    return () => {
-      isMountedRef.current = false;
-      if (copyTimeoutRef.current !== null) {
-        clearTimeout(copyTimeoutRef.current);
-        copyTimeoutRef.current = null;
-      }
-    };
-  }, []);
-
-  if (message.role === 'user') {
-    return (
-      <div className="flex flex-col items-end max-w-[88%] ml-auto text-xs leading-relaxed animate-fade-in">
-        <div className="px-3.5 py-2 rounded-2xl rounded-br-sm bg-zinc-800/85 text-zinc-100 border border-white/10 break-words select-text">
-          <p className="text-xs whitespace-pre-wrap">{message.content}</p>
-        </div>
-      </div>
-    );
+function formatQuestionAnswer(raw: string): string {
+  if (!raw) return '';
+  const trimmed = raw.trim();
+  if (
+    trimmed.includes('modello LLM non ancora scaricato') ||
+    trimmed.includes('Risposta non disponibile') ||
+    trimmed.includes('modello LLM non installato') ||
+    trimmed.includes('Scarica un modello LLM dalle Impostazioni')
+  ) {
+    return 'Scarica un modello LLM dalle [[action:settings|Impostazioni]] per attivare le risposte rapide.';
   }
-
-  const parsed = parseThinkingContent(message.content);
-  const isThinkingStreaming = isStreaming && parsed.isThinkingStreaming;
-  const waitingFirstToken = isStreaming && !parsed.visible && !isThinkingStreaming;
-
-  const handleCopy = () => {
-    const textToCopy = parsed.visible || message.content;
-    if (!textToCopy) return;
-    navigator.clipboard
-      ?.writeText(textToCopy)
-      .then(() => {
-        if (!isMountedRef.current) return;
-        setCopied(true);
-        if (copyTimeoutRef.current !== null) {
-          clearTimeout(copyTimeoutRef.current);
-        }
-        copyTimeoutRef.current = setTimeout(() => {
-          if (isMountedRef.current) {
-            setCopied(false);
-          }
-          copyTimeoutRef.current = null;
-        }, 1500);
-      })
-      .catch(() => {});
-  };
-
-  return (
-    <div className="group flex flex-col items-start w-full text-xs leading-relaxed animate-fade-in">
-      <div className="flex items-center justify-between w-full mb-1">
-        <span className="inline-flex items-center gap-1.5 text-[10px] font-medium text-zinc-400">
-          <Sparkles size={10} className="text-emerald-400" />
-          <span>SbobinAI</span>
-        </span>
-        {!isStreaming && (parsed.visible || message.content) && (
-          <button
-            type="button"
-            onClick={handleCopy}
-            title="Copia risposta"
-            className="opacity-0 group-hover:opacity-100 inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] text-zinc-400 hover:text-zinc-100 hover:bg-white/[0.08] transition-all cursor-pointer"
-          >
-            {copied ? (
-              <>
-                <Check size={10} className="text-emerald-400" />
-                <span className="text-emerald-300">Copiato</span>
-              </>
-            ) : (
-              <>
-                <Copy size={10} />
-                <span>Copia</span>
-              </>
-            )}
-          </button>
-        )}
-      </div>
-
-      {(parsed.thinking || isThinkingStreaming) && (
-        <div className="w-full mb-1.5">
-          <button
-            type="button"
-            onClick={() => setThinkingExpanded((prev) => !prev)}
-            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] text-[10px] transition-colors cursor-pointer"
-          >
-            <Brain size={10} className="text-indigo-300/80" />
-            <span className={clsx(isThinkingStreaming ? 'chat-shimmer-text font-medium' : 'text-zinc-300')}>
-              {isThinkingStreaming ? 'Ragionamento...' : 'Ragionamento'}
-            </span>
-            {thinkingExpanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
-          </button>
-          {thinkingExpanded && parsed.thinking && (
-            <div className="mt-1.5 pl-2.5 border-l-2 border-white/10 text-[11px] text-zinc-400 whitespace-pre-wrap max-h-40 overflow-y-auto select-text">
-              {parsed.thinking}
-            </div>
-          )}
-        </div>
-      )}
-
-      {waitingFirstToken && (
-        <div className="flex items-center gap-2 py-1">
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-          <span className="chat-shimmer-text text-[11px] font-medium">
-            SbobinAI sta formulando la spiegazione...
-          </span>
-        </div>
-      )}
-
-      {parsed.visible && (
-        <div className="w-full text-zinc-100 break-words select-text">
-          <MarkdownContent
-            content={parsed.visible}
-            onOpenCitation={onOpenCitation}
-            className="chat-prose"
-          />
-        </div>
-      )}
-    </div>
-  );
+  return raw;
 }
 
 // ── LiveRecordingWorkspace / LiveLecture Container ───────────────────────────
 function LiveRecordingWorkspaceComponent({
   subjectId,
+  subjectName,
   chunks,
   isPaused = false,
   audioStatus = 'idle',
@@ -353,8 +305,15 @@ function LiveRecordingWorkspaceComponent({
   inspectorTab,
   setInspectorTab,
   onOpenCitation,
+  onOpenSettings,
 }: Props) {
+  const [isComposerMultiline, setIsComposerMultiline] = useState(false);
+  const [isComposerOverflow, setIsComposerOverflow] = useState(false);
+
+  const chatScrollRef = useRef<HTMLDivElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const chatNearBottomRef = useRef(true);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   const isMountedRef = useRef(true);
   const previewSeqRef = useRef(0);
 
@@ -375,9 +334,69 @@ function LiveRecordingWorkspaceComponent({
     };
   }, []);
 
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [chatMessages]);
+  // Auto-grow textarea stile ChatGPT 2026 (senza flicker e senza scrollbar fantasma in Safari)
+  useLayoutEffect(() => {
+    const el = composerRef.current;
+    if (!el) return;
+    if (!chatInput) {
+      el.style.height = '24px';
+      setIsComposerMultiline(false);
+      setIsComposerOverflow(false);
+      return;
+    }
+    el.style.height = 'auto';
+    const scrollH = el.scrollHeight;
+    if (scrollH <= 32 && !chatInput.includes('\n')) {
+      el.style.height = '24px';
+      setIsComposerMultiline(false);
+      setIsComposerOverflow(false);
+    } else {
+      el.style.height = `${Math.min(scrollH, 120)}px`;
+      setIsComposerMultiline(true);
+      setIsComposerOverflow(scrollH > 120);
+    }
+  }, [chatInput, inspectorTab]);
+
+  // Snap istantaneo al fondo aprendo la tab chat (zero animazione/flash dall'alto)
+  useLayoutEffect(() => {
+    if (inspectorTab !== 'chat') return;
+    const el = chatScrollRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+      chatNearBottomRef.current = true;
+    }
+  }, [inspectorTab]);
+
+  // Follow fluido durante l'arrivo di nuovi messaggi/token (con doppio frame per catturare il layout Framer Motion)
+  useLayoutEffect(() => {
+    if (inspectorTab !== 'chat') return;
+    const el = chatScrollRef.current;
+    if (!el || !chatNearBottomRef.current) return;
+    el.scrollTop = el.scrollHeight;
+    const raf = requestAnimationFrame(() => {
+      if (chatScrollRef.current && chatNearBottomRef.current) {
+        chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
+        if (chatEndRef.current) {
+          chatEndRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' });
+        }
+      }
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [chatMessages, isSendingChat, inspectorTab]);
+
+  const handleChatScroll = useCallback(() => {
+    const el = chatScrollRef.current;
+    if (!el) return;
+    chatNearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 72;
+  }, []);
+
+  const sendLiveChat = useCallback(
+    (overrideText?: string) => {
+      chatNearBottomRef.current = true;
+      handleChatSend(overrideText, { enableThinking: false });
+    },
+    [handleChatSend]
+  );
 
   const closeCitationPreview = useCallback(() => {
     previewSeqRef.current += 1;
@@ -453,7 +472,7 @@ function LiveRecordingWorkspaceComponent({
   }, [citationPreview, closeCitationPreview]);
 
   return (
-    <div className="flex-1 flex flex-row w-full h-full overflow-hidden relative select-none">
+    <div className="flex-1 flex flex-row w-full h-full overflow-hidden relative select-none" style={{ transform: 'translateZ(0)' }}>
       {/* ── Foglio Centrale (Isolato tramite React.memo) ── */}
       <LiveTranscriptContainer
         chunks={chunks}
@@ -462,7 +481,7 @@ function LiveRecordingWorkspaceComponent({
       />
 
       {/* ── Inspector Laterale Destro (30% larghezza) ── */}
-      <aside className="w-80 flex-shrink-0 flex flex-col h-full border-l border-white/[0.08] bg-[#111520]/85 backdrop-blur-2xl z-10">
+      <aside className="w-80 xl:w-[356px] flex-shrink-0 flex flex-col h-full border-l border-white/[0.08] bg-[#111520]/85 backdrop-blur-2xl z-10" style={{ transform: 'translateZ(0)' }}>
         {/* 2 Tab a pillola in alto con SegmentedControl */}
         <div className="p-3 border-b border-white/[0.06]">
           <SegmentedControl
@@ -492,12 +511,6 @@ function LiveRecordingWorkspaceComponent({
         {/* ── Pannello 1: Rilevamento Domande del Prof ── */}
         {inspectorTab === 'domande' && (
           <div className="flex-1 overflow-y-auto p-4 space-y-3">
-            <div className="flex items-center justify-between pb-1">
-              <span className="text-[10px] uppercase font-mono tabular-nums tracking-wider text-white/40 leading-normal">
-                Domande Rilevate ({detectedQuestions.length})
-              </span>
-            </div>
-
             {detectedQuestions.length === 0 ? (
               <div className="py-16 text-center">
                 <HelpCircle size={20} strokeWidth={1.5} className="mx-auto text-white/20 mb-2" />
@@ -514,17 +527,17 @@ function LiveRecordingWorkspaceComponent({
                 return (
                   <div
                     key={q.id}
-                    className="p-3.5 rounded-2xl liquid-glass border border-white/[0.12] shadow-liquid-sm space-y-2 animate-slide-up group"
+                    className="p-3.5 rounded-2xl bg-white/[0.03] border border-white/[0.09] hover:border-white/[0.14] transition-colors space-y-2.5 animate-slide-up group"
                   >
                     <div className="flex items-start justify-between gap-2">
-                      <p className="text-xs font-semibold text-white/90 leading-snug">
-                        &ldquo;{q.question}&rdquo;
+                      <p className="text-[12.5px] font-medium text-white/90 leading-snug">
+                        {q.question}
                       </p>
                       {onDeleteQuestion && (
                         <button
                           type="button"
                           onClick={() => onDeleteQuestion(q.id)}
-                          className="opacity-0 group-hover:opacity-100 p-1 rounded-lg text-white/30 hover:text-red-400 hover:bg-white/[0.08] transition-all cursor-pointer flex items-center justify-center"
+                          className="opacity-0 group-hover:opacity-100 p-1 rounded-lg text-white/30 hover:text-red-400 hover:bg-white/[0.08] transition-all cursor-pointer flex items-center justify-center flex-shrink-0"
                           title="Rimuovi domanda"
                         >
                           <Trash2 size={11} />
@@ -532,63 +545,74 @@ function LiveRecordingWorkspaceComponent({
                       )}
                     </div>
 
-                    {/* Stato 1: Risposta pronta (generata su click) */}
+                    {/* Stato 1: Risposta pronta o in streaming token-by-token */}
                     {hasAnswer && (
                       <>
                         <div className="p-2.5 rounded-xl bg-white/[0.04] border border-white/[0.06] text-xs text-white/80 space-y-1">
-                          <div className="flex items-center gap-1.5 text-[10px] text-amber-300/80 font-mono leading-normal">
-                            <Sparkles size={10} />
-                            <span>Risposta flash suggerita:</span>
+                          <div className="flex items-center gap-1.5 text-[10px] text-white/50 font-mono leading-normal" style={{ transform: 'translateZ(0)' }}>
+                            <Sparkles size={10} className={clsx(isAnswering && 'animate-pulse text-emerald-300')} />
+                            <span className={clsx(isAnswering && 'chat-shimmer-text')}>
+                              {isAnswering ? 'Risposta in corso...' : 'Risposta rapida'}
+                            </span>
                           </div>
-                          <div className="text-[11px] font-sans text-white/90 leading-relaxed">
-                            <MarkdownContent content={q.answer || q.suggestedAnswer || ''} />
+                          <div className="text-[11.5px] font-sans text-white/90 leading-relaxed select-text">
+                            <MarkdownContent
+                              content={formatQuestionAnswer(q.answer || q.suggestedAnswer || '')}
+                              onOpenSettings={onOpenSettings}
+                              onOpenCitation={onOpenCitation}
+                            />
                           </div>
                         </div>
-                        <div className="pt-1">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setInspectorTab('chat');
-                              handleChatSend(`Approfondisci la risposta alla domanda del docente: "${q.question}"`);
-                            }}
-                            className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium text-white/70 hover:text-white bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-all cursor-pointer leading-normal"
-                          >
-                            <MessageSquare size={12} className="text-indigo-400" />
-                            <span className="leading-normal">Approfondisci in Chat</span>
-                          </button>
-                        </div>
+                        {!isAnswering && (
+                          <div className="pt-0.5">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setInspectorTab('chat');
+                                sendLiveChat(`Approfondisci la risposta alla domanda del docente: "${q.question}"`);
+                              }}
+                              className="w-full h-8 inline-flex items-center justify-center gap-1.5 px-3 rounded-full text-xs font-medium text-white/75 hover:text-white bg-white/[0.05] hover:bg-white/[0.10] border border-white/[0.10] transition-all cursor-pointer whitespace-nowrap"
+                            >
+                              <MessageSquare size={12} className="text-white/60 flex-shrink-0" />
+                              <span>Approfondisci in Chat</span>
+                            </button>
+                          </div>
+                        )}
                       </>
                     )}
 
-                    {/* Stato 2: Generazione risposta AI in corso */}
+                    {/* Stato 2: Generazione risposta AI in corso (prima del primo token) */}
                     {isAnswering && !hasAnswer && (
-                      <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-200 text-xs animate-fade-in">
-                        <Loader2 size={13} className="animate-spin text-amber-400 flex-shrink-0" />
-                        <span className="font-medium text-[11px] leading-normal">Generazione risposta AI in corso...</span>
+                      <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-white/[0.05] border border-white/[0.10] text-white/75 text-xs animate-fade-in" style={{ transform: 'translateZ(0)' }}>
+                        <Loader2 size={13} className="animate-spin text-white/60 flex-shrink-0" style={{ willChange: 'transform' }} />
+                        <span className="font-medium text-[11px] leading-normal chat-shimmer-text">
+                          Elaborazione immediata...
+                        </span>
                       </div>
                     )}
 
-                    {/* Stato 3: Senza risposta e non in generazione: 2 pulsanti chiari */}
+                    {/* Stato 3: Controlli minimali su una sola riga */}
                     {!hasAnswer && !isAnswering && (
-                      <div className="flex items-center gap-2 pt-1 animate-fade-in">
+                      <div className="flex items-center gap-2 pt-0.5 animate-fade-in">
                         <button
                           type="button"
                           onClick={() => onAnswerQuestion?.(q.id)}
-                          className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium text-amber-200 bg-amber-500/15 hover:bg-amber-500/25 border border-amber-500/30 shadow-liquid-sm transition-all cursor-pointer group/btn leading-normal"
+                          className="flex-1 h-8 inline-flex items-center justify-center gap-1.5 px-3 rounded-full text-xs font-medium text-white bg-white/[0.10] hover:bg-white/[0.16] border border-white/[0.14] shadow-liquid-sm transition-all cursor-pointer whitespace-nowrap"
                         >
-                          <Sparkles size={12} className="text-amber-400 group-hover/btn:scale-110 transition-transform" />
-                          <span className="leading-normal">Rispondi con l&apos;AI</span>
+                          <Sparkles size={12} className="text-white/80 flex-shrink-0" />
+                          <span>Rispondi</span>
                         </button>
                         <button
                           type="button"
                           onClick={() => {
                             setInspectorTab('chat');
-                            handleChatSend(`Spiega e rispondi alla domanda del docente: "${q.question}"`);
+                            sendLiveChat(`Spiega e rispondi alla domanda del docente: "${q.question}"`);
                           }}
-                          className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium text-white/80 hover:text-white bg-white/[0.05] hover:bg-white/[0.10] border border-white/[0.10] shadow-liquid-sm transition-all cursor-pointer leading-normal"
+                          title="Approfondisci in Chat"
+                          aria-label="Approfondisci in Chat"
+                          className="w-8 h-8 rounded-full inline-flex items-center justify-center text-white/65 hover:text-white bg-white/[0.05] hover:bg-white/[0.12] border border-white/[0.10] transition-all cursor-pointer flex-shrink-0"
                         >
-                          <MessageSquare size={12} className="text-zinc-400" />
-                          <span className="leading-normal">Chiedi in Chat</span>
+                          <MessageSquare size={13} />
                         </button>
                       </div>
                     )}
@@ -599,100 +623,135 @@ function LiveRecordingWorkspaceComponent({
           </div>
         )}
 
-        {/* ── Pannello 2: Chat Live "Non ho capito!" ── */}
+        {/* ── Pannello 2: Chat Live (Stile ChatGPT 2026 identico all'Assistente Corso) ── */}
         {inspectorTab === 'chat' && (
           <div className="flex-1 flex flex-col h-full overflow-hidden">
-            <div className="flex-1 overflow-y-auto p-4 space-y-3">
+            <div
+              ref={chatScrollRef}
+              onScroll={handleChatScroll}
+              className="flex-1 overflow-y-auto [scrollbar-gutter:stable] px-3.5 py-4"
+            >
               {chatMessages.length === 0 ? (
-                <div className="py-16 text-center space-y-3">
-                  <MessageSquare size={20} strokeWidth={1.5} className="mx-auto text-white/20 mb-1" />
-                  <p className="text-xs text-white/50">Non hai capito un concetto spiegato dal docente?</p>
-                  <div className="flex flex-col gap-1.5 max-w-[200px] mx-auto pt-2">
+                /* Empty Welcome State: Pure ChatGPT 2026 Style (respiro pieno nella sidebar) */
+                <div className="h-full min-h-[260px] flex flex-col items-center justify-center text-center px-1.5 animate-fade-in select-none">
+                  <h2 className="text-[20px] font-medium tracking-tight text-white/95">
+                    Da dove cominciamo?
+                  </h2>
+                  <p className="text-[12.5px] text-white/50 mt-2 leading-relaxed max-w-[295px]">
+                    Chiedi spiegazioni sulla lezione
+                    {subjectName ? (
+                      <>
+                        {' '}di <span className="text-white/85 font-medium">{subjectName}</span>
+                      </>
+                    ) : null}
+                    {' '}o sui materiali del corso.
+                  </p>
+                  <div className="flex flex-col gap-2 w-full mt-6">
                     <button
                       type="button"
-                      onClick={() => handleChatSend("Non ho capito l'ultimo concetto, puoi rispiegarmelo con un esempio pratico?")}
-                      className="px-2.5 py-1.5 rounded-xl text-[11px] text-left bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.06] text-white/70 hover:text-white transition-all cursor-pointer"
+                      onClick={() =>
+                        sendLiveChat("Non ho capito l'ultimo concetto, puoi rispiegarmelo in modo semplice con un esempio?")
+                      }
+                      className="w-full px-4 py-2.5 rounded-2xl text-[12px] text-left bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.09] hover:border-white/[0.16] text-white/80 hover:text-white transition-all cursor-pointer leading-snug"
                     >
-                      "Non ho capito l'ultimo concetto..."
+                      Rispiega l&apos;ultimo concetto con un esempio
                     </button>
                     <button
                       type="button"
-                      onClick={() => handleChatSend("Qual è la differenza principale tra i due termini appena spiegati?")}
-                      className="px-2.5 py-1.5 rounded-xl text-[11px] text-left bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.06] text-white/70 hover:text-white transition-all cursor-pointer"
+                      onClick={() =>
+                        sendLiveChat('Cosa ha detto il docente negli ultimi 2 minuti?')
+                      }
+                      className="w-full px-4 py-2.5 rounded-2xl text-[12px] text-left bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.09] hover:border-white/[0.16] text-white/80 hover:text-white transition-all cursor-pointer leading-snug"
                     >
-                      "Qual è la differenza tra i due termini?"
+                      Riassumi gli ultimi 2 minuti di lezione
                     </button>
                   </div>
                 </div>
               ) : (
-                chatMessages.map((msg, idx) => (
-                  <LiveAssistantMessage
-                    key={msg.id}
-                    message={msg}
-                    isStreaming={
+                <div className="space-y-3.5 pb-4">
+                  {chatMessages.map((msg, idx) => {
+                    const isStreamingThis =
                       isSendingChat &&
                       idx === chatMessages.length - 1 &&
-                      msg.role === 'assistant'
-                    }
-                    onOpenCitation={handleCitationOpen}
-                  />
-                ))
+                      msg.role === 'assistant';
+                    return (
+                      <ChatMessageItem
+                        key={msg.id}
+                        message={toChatMessageItemModel(msg, idx, isStreamingThis)}
+                        isStreamingThis={isStreamingThis}
+                        isAnyStreaming={isSendingChat}
+                        compact
+                        onOpenCitation={handleCitationOpen}
+                        onOpenSettings={onOpenSettings}
+                      />
+                    );
+                  })}
+                </div>
               )}
-              {isSendingChat &&
-                (chatMessages.length === 0 ||
-                  chatMessages[chatMessages.length - 1]?.role === 'user') && (
-                  <div className="flex items-center gap-2 py-1.5">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                    <span className="chat-shimmer-text text-[11px] font-medium">
-                      SbobinAI sta formulando la spiegazione...
-                    </span>
-                  </div>
-                )}
               <div ref={chatEndRef} />
             </div>
 
-            {/* Chat Input Bar */}
-            <div className="p-3 border-t border-white/[0.08] bg-black/20">
-              <div className="flex items-center gap-2">
-                <input
-                  type="text"
+            {/* ChatGPT 2026 Floating Pill Composer */}
+            <div className="px-3 pb-3 pt-1.5 flex-shrink-0">
+              <div
+                className={clsx(
+                  'rounded-[24px] bg-[#121622]/90 border border-white/[0.12] focus-within:border-white/[0.24] shadow-xl transition-all pl-3.5 pr-1.5 py-1.5 flex gap-2',
+                  isComposerMultiline ? 'items-end' : 'items-center'
+                )}
+              >
+                <textarea
+                  ref={composerRef}
+                  rows={1}
                   value={chatInput}
                   onChange={(e) => setChatInput(e.target.value)}
                   onKeyDown={(e) => {
                     if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
                       e.preventDefault();
-                      handleChatSend();
+                      if (!isSendingChat && chatInput.trim()) {
+                        sendLiveChat();
+                      }
                     }
                   }}
-                  placeholder="Chiedi al volo..."
-                  className="flex-1 px-3 py-2 rounded-xl liquid-input text-xs text-white placeholder-white/30 focus:outline-none"
+                  placeholder="Chiedi qualsiasi cosa..."
+                  className={clsx(
+                    'flex-1 min-w-0 resize-none bg-transparent pl-0.5 py-[1px] text-[12.5px] leading-[22px] text-zinc-100 placeholder-zinc-500 focus:outline-none max-h-[120px] select-text block',
+                    isComposerOverflow ? 'overflow-y-auto' : 'overflow-hidden'
+                  )}
                 />
-                {isSendingChat ? (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (handleCancelChat) {
-                        handleCancelChat();
-                      } else {
-                        api.ai.stop(true).catch(() => {});
-                      }
-                    }}
-                    title="Interrompi risposta IA e libera RAM"
-                    className="px-2.5 h-7 rounded-xl flex items-center gap-1.5 bg-red-500/25 hover:bg-red-500/35 text-red-300 border border-red-500/40 text-[11px] font-semibold transition-all cursor-pointer animate-pulse"
-                  >
-                    <Square size={10} fill="currentColor" strokeWidth={0} />
-                    <span>Stop</span>
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() => handleChatSend()}
-                    disabled={!chatInput.trim()}
-                    className="w-7 h-7 rounded-xl flex items-center justify-center bg-white/[0.14] hover:bg-white/[0.22] text-white transition-all disabled:opacity-30 border border-white/[0.10] cursor-pointer"
-                  >
-                    <Send size={12} strokeWidth={2} />
-                  </button>
-                )}
+
+                <div className={clsx('flex items-center flex-shrink-0', isComposerMultiline && 'mb-0.5')}>
+                  {isSendingChat ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (handleCancelChat) {
+                          handleCancelChat();
+                        } else {
+                          api.ai.stop(true).catch(() => {});
+                        }
+                      }}
+                      title="Interrompi generazione"
+                      className="w-7 h-7 rounded-full flex items-center justify-center bg-white text-[#0d1017] hover:bg-white/90 transition-all cursor-pointer flex-shrink-0 shadow-md"
+                    >
+                      <Square size={9} fill="currentColor" strokeWidth={0} />
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => sendLiveChat()}
+                      disabled={!chatInput.trim()}
+                      title="Invia messaggio"
+                      className={clsx(
+                        'w-7 h-7 rounded-full flex items-center justify-center transition-all flex-shrink-0',
+                        chatInput.trim()
+                          ? 'bg-white text-[#0d1017] hover:bg-white/90 cursor-pointer shadow-md'
+                          : 'bg-white/[0.08] text-white/30 cursor-not-allowed'
+                      )}
+                    >
+                      <ArrowUp size={15} strokeWidth={2.5} />
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
           </div>
@@ -706,7 +765,7 @@ function LiveRecordingWorkspaceComponent({
           onClick={closeCitationPreview}
         >
           <div
-            className="w-full max-w-3xl max-h-[88vh] flex flex-col rounded-3xl liquid-glass border border-white/[0.14] shadow-liquid-lg p-5 sm:p-6 animate-slide-up"
+            className="w-full max-w-3xl max-h-[88vh] flex flex-col rounded-3xl liquid-modal border border-white/[0.14] shadow-liquid-lg p-5 sm:p-6 animate-slide-up"
             onClick={(e) => e.stopPropagation()}
           >
             {/* Header */}
@@ -825,10 +884,7 @@ function LiveRecordingWorkspaceComponent({
                   {citationPreview.nonPaginatedNote}
                 </div>
               ) : previewLoading ? (
-                <div className="h-64 flex flex-col items-center justify-center gap-2 text-xs text-white/50 font-mono">
-                  <Loader2 size={22} className="animate-spin text-white/50" />
-                  <span>Caricamento pagina {citationPreview.page}...</span>
-                </div>
+                <SlidePageSkeleton />
               ) : previewError ? (
                 <div className="p-5 rounded-2xl bg-red-500/[0.08] border border-red-500/25 text-center space-y-2.5">
                   <AlertCircle size={22} className="text-red-400 mx-auto" />

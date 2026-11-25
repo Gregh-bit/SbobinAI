@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useLayoutEffect, useMemo } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
 import {
   Plus,
   ArrowUp,
@@ -53,6 +54,9 @@ export interface ChatComposerProps {
   subjectName: string;
   studyMode: ChatStudyMode;
   onStudyModeChange: (mode: ChatStudyMode) => void;
+  thinkingMode: boolean;
+  onThinkingModeChange: (enabled: boolean) => void;
+  supportsThinking?: boolean;
   scope: ChatScope;
   onScopeChange: (scope: ChatScope) => void;
   lectures: Lecture[];
@@ -73,6 +77,9 @@ export default function ChatComposer({
   subjectName,
   studyMode,
   onStudyModeChange,
+  thinkingMode,
+  onThinkingModeChange,
+  supportsThinking = true,
   scope,
   onScopeChange,
   lectures,
@@ -81,8 +88,8 @@ export default function ChatComposer({
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuView, setMenuView] = useState<'main' | 'scope'>('main');
   const [isListening, setIsListening] = useState(false);
-  const [thinkingMode, setThinkingMode] = useState(false);
   const [isMultiline, setIsMultiline] = useState(false);
+  const [isOverflow, setIsOverflow] = useState(false);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -91,13 +98,14 @@ export default function ChatComposer({
   const valueRef = useRef(value);
   valueRef.current = value;
 
-  // Auto-grow textarea up to ~160px with optical single-line centering (layout effect avoids frame flicker)
+  // Auto-grow textarea up to ~160px with optical single-line centering (zero scrollbar fantasma in Safari)
   useLayoutEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
-    if (!value.trim()) {
+    if (!value) {
       el.style.height = '24px';
       setIsMultiline(false);
+      setIsOverflow(false);
       return;
     }
     el.style.height = 'auto';
@@ -105,9 +113,11 @@ export default function ChatComposer({
     if (scrollH <= 34 && !value.includes('\n')) {
       el.style.height = '24px';
       setIsMultiline(false);
+      setIsOverflow(false);
     } else {
       el.style.height = `${Math.min(scrollH, 160)}px`;
       setIsMultiline(true);
+      setIsOverflow(scrollH > 160);
     }
   }, [value]);
 
@@ -253,9 +263,28 @@ export default function ChatComposer({
   return (
     <div className="px-4 sm:px-6 pb-4 pt-2 flex-shrink-0">
       <div ref={containerRef} className="max-w-3xl mx-auto relative">
-        {/* ChatGPT Actions Popover (+) */}
-        {menuOpen && (
-          <div className="absolute bottom-full left-0 mb-3 w-80 sm:w-[440px] max-w-[calc(100vw-2rem)] rounded-2xl bg-zinc-900/98 border border-white/10 shadow-2xl backdrop-blur-xl p-1.5 z-40 animate-fade-in">
+        {/* ChatGPT Actions Popover (+) con animazione a bolla liquid-glass (identica a condividi/cestino) */}
+        <AnimatePresence>
+          {menuOpen && (
+            <motion.div
+              initial={{ opacity: 0, scale: 0.15, y: 16, filter: 'blur(10px)' }}
+              animate={{
+                opacity: 1,
+                scale: 1,
+                y: 0,
+                filter: 'blur(0px)',
+                transition: { type: 'spring', damping: 22, stiffness: 340, mass: 0.75 },
+              }}
+              exit={{
+                opacity: 0,
+                scale: 0.25,
+                y: 12,
+                filter: 'blur(8px)',
+                transition: { duration: 0.16, ease: 'easeIn' },
+              }}
+              style={{ transformOrigin: 'bottom left' }}
+              className="absolute bottom-full left-0 mb-3 w-80 sm:w-[440px] max-w-[calc(100vw-2rem)] rounded-3xl bg-[#121622]/[0.98] border border-white/[0.20] shadow-[0_24px_60px_rgba(0,0,0,0.85),0_0_0_1px_rgba(255,255,255,0.08)] backdrop-blur-3xl p-2 z-40"
+            >
             {menuView === 'main' ? (
               <div className="space-y-1">
                 {/* 1. Filtra fonti del corso */}
@@ -444,17 +473,18 @@ export default function ChatComposer({
                 </div>
               </div>
             )}
-          </div>
+          </motion.div>
         )}
+        </AnimatePresence>
 
         {/* ChatGPT 2026 Unified Floating Pill Container */}
         <div
           className={clsx(
-            'rounded-[28px] bg-zinc-900/95 border border-white/10 shadow-2xl backdrop-blur-md px-3 py-2 transition-all focus-within:border-white/20 flex gap-2 min-h-[50px]',
+            'rounded-[28px] bg-[#121622]/90 border border-white/[0.12] shadow-2xl backdrop-blur-md px-3 py-2 transition-all focus-within:border-white/[0.24] flex gap-2 min-h-[50px]',
             isMultiline ? 'items-end' : 'items-center'
           )}
         >
-          {/* + Actions Button */}
+          {/* + Actions Button con morphing animato rotazione icona */}
           <button
             type="button"
             onClick={() => {
@@ -463,21 +493,45 @@ export default function ChatComposer({
             }}
             title="Aggiungi file o scegli modalità"
             className={clsx(
-              'w-8 h-8 rounded-full flex items-center justify-center transition-all cursor-pointer flex-shrink-0',
+              'w-8 h-8 rounded-full flex items-center justify-center transition-all cursor-pointer flex-shrink-0 group overflow-hidden',
               isMultiline && 'mb-0.5',
               menuOpen
                 ? 'bg-white/20 text-white'
                 : 'bg-white/[0.06] hover:bg-white/[0.12] text-zinc-300 hover:text-white'
             )}
           >
-            <Plus size={16} />
+            <AnimatePresence mode="wait">
+              {menuOpen ? (
+                <motion.span
+                  key="close"
+                  initial={{ rotate: -90, opacity: 0, scale: 0.6 }}
+                  animate={{ rotate: 0, opacity: 1, scale: 1 }}
+                  exit={{ rotate: 90, opacity: 0, scale: 0.6 }}
+                  transition={{ duration: 0.16 }}
+                  className="flex items-center justify-center"
+                >
+                  <X size={15} strokeWidth={2.2} className="text-white" />
+                </motion.span>
+              ) : (
+                <motion.span
+                  key="plus"
+                  initial={{ rotate: 90, opacity: 0, scale: 0.6 }}
+                  animate={{ rotate: 0, opacity: 1, scale: 1 }}
+                  exit={{ rotate: -90, opacity: 0, scale: 0.6 }}
+                  transition={{ duration: 0.16 }}
+                  className="flex items-center justify-center"
+                >
+                  <Plus size={16} strokeWidth={2} className="text-zinc-300 group-hover:text-white" />
+                </motion.span>
+              )}
+            </AnimatePresence>
           </button>
 
           {/* Center Input Area with Active Chips and Textarea */}
           <div className="flex-1 min-w-0 flex flex-wrap items-center gap-1.5 py-0.5">
             {/* Active Study Mode Chip */}
             {activeModeMeta && (
-              <span className="h-[26px] inline-flex items-center gap-1.5 px-2.5 rounded-full bg-white/[0.08] border border-white/12 text-[12px] font-medium text-zinc-100 select-none flex-shrink-0 animate-fade-in shadow-sm">
+              <span className="h-[26px] inline-flex items-center gap-1.5 px-2.5 rounded-full bg-white/[0.08] border border-white/[0.12] text-[12px] font-medium text-zinc-100 select-none flex-shrink-0 animate-fade-in shadow-sm">
                 <activeModeMeta.icon size={12} className={clsx(activeModeMeta.colorClass, 'flex-shrink-0')} />
                 <span className="leading-none pt-[0.5px]">{activeModeMeta.label}</span>
                 <button
@@ -543,7 +597,10 @@ export default function ChatComposer({
                   ? `Specifica l'argomento (oppure premi Invio)...`
                   : `Chiedi qualsiasi cosa...`
               }
-              className="flex-1 min-w-[120px] resize-none bg-transparent px-1 py-[1px] text-[13px] leading-[22px] text-zinc-100 placeholder-zinc-500 focus:outline-none max-h-40 select-text overflow-y-auto block"
+              className={clsx(
+                'flex-1 min-w-[120px] resize-none bg-transparent px-1 py-[1px] text-[13px] leading-[22px] text-zinc-100 placeholder-zinc-500 focus:outline-none max-h-40 select-text block',
+                isOverflow ? 'overflow-y-auto' : 'overflow-hidden'
+              )}
             />
           </div>
 
@@ -554,28 +611,31 @@ export default function ChatComposer({
               isMultiline && 'mb-0.5'
             )}
           >
-            {/* Pensa Button (ChatGPT Style Reasoning Toggle) */}
-            <button
-              type="button"
-              onClick={() => setThinkingMode((prev) => !prev)}
-              title={
-                thinkingMode
-                  ? 'Ragionamento approfondito attivo'
-                  : 'Attiva ragionamento approfondito'
-              }
-              className={clsx(
-                'h-8 px-2.5 rounded-full flex items-center gap-1.5 border text-xs font-medium transition-all cursor-pointer select-none',
-                thinkingMode
-                  ? 'bg-white/10 border-white/25 text-white shadow-sm'
-                  : 'border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06]'
-              )}
-            >
-              <Brain
-                size={14}
-                className={thinkingMode ? 'text-indigo-300' : 'text-zinc-400'}
-              />
-              <span className="hidden sm:inline">Pensa</span>
-            </button>
+            {/* Pensa Button (nascosto se il modello LLM attivo non supporta il thinking) */}
+            {supportsThinking && (
+              <button
+                type="button"
+                onClick={() => onThinkingModeChange(!thinkingMode)}
+                aria-pressed={thinkingMode}
+                title={
+                  thinkingMode
+                    ? 'Ragionamento approfondito attivo (clicca per disattivare)'
+                    : 'Attiva ragionamento approfondito'
+                }
+                className={clsx(
+                  'h-8 px-2.5 rounded-full flex items-center gap-1.5 border text-xs font-medium transition-all cursor-pointer select-none',
+                  thinkingMode
+                    ? 'bg-indigo-500/15 border-indigo-400/35 text-indigo-200 shadow-sm'
+                    : 'border-transparent text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06]'
+                )}
+              >
+                <Brain
+                  size={14}
+                  className={thinkingMode ? 'text-indigo-300' : 'text-zinc-400'}
+                />
+                <span className="hidden sm:inline">Pensa</span>
+              </button>
+            )}
 
             {/* Voice Dictation */}
             {speechSupported && (
@@ -600,7 +660,7 @@ export default function ChatComposer({
                 type="button"
                 onClick={onStop}
                 title="Interrompi generazione"
-                className="w-8 h-8 rounded-full flex items-center justify-center bg-white text-zinc-950 hover:bg-zinc-200 transition-all cursor-pointer flex-shrink-0 shadow-md"
+                className="w-8 h-8 rounded-full flex items-center justify-center bg-white text-[#0d1017] hover:bg-white/90 transition-all cursor-pointer flex-shrink-0 shadow-md"
               >
                 <Square size={10} fill="currentColor" strokeWidth={0} />
               </button>
@@ -613,7 +673,7 @@ export default function ChatComposer({
                 className={clsx(
                   'w-8 h-8 rounded-full flex items-center justify-center transition-all flex-shrink-0',
                   canSend
-                    ? 'bg-white text-zinc-950 hover:bg-zinc-200 cursor-pointer shadow-md'
+                    ? 'bg-white text-[#0d1017] hover:bg-white/90 cursor-pointer shadow-md'
                     : 'bg-white/[0.08] text-white/30 cursor-not-allowed'
                 )}
               >

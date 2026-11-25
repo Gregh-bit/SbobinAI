@@ -44,15 +44,15 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional, Set, Tuple
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Request
 from fastapi.websockets import WebSocketState
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from database import Lecture, SessionLocal, get_db, init_db
-from live_session import LiveSession, end_session, get_session, has_active_sessions, start_session
+from live_session import LiveSession, get_session, has_active_sessions, start_session
 from routers.subjects import router as subjects_router
 from routers.lectures import router as lectures_router, bookmark_router
 from routers.settings import router as settings_router
@@ -119,6 +119,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.middleware("http")
+async def verify_local_origin_middleware(request: Request, call_next):
+    # Protezione CSRF per client locali: se un browser invia un'intestazione Origin esterna
+    # per una richiesta che modifica lo stato (POST, PUT, PATCH, DELETE), rifiutala con 403.
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        origin = request.headers.get("origin")
+        if origin:
+            allowed_origins = {
+                "null",
+                "tauri://localhost",
+                "http://tauri.localhost",
+                "https://tauri.localhost",
+            }
+            if origin not in allowed_origins and not re.fullmatch(r"https?://(localhost|127\.0\.0\.1)(:\d+)?/?", origin):
+                return JSONResponse(status_code=403, content={"detail": "Origine non consentita."})
+    return await call_next(request)
+
 # ── Router ─────────────────────────────────────────────────────────────────────
 app.include_router(subjects_router, prefix="/api/v1")
 app.include_router(lectures_router, prefix="/api/v1")
@@ -142,8 +159,9 @@ async def health_check():
 
 
 @app.post("/api/v1/system/shutdown", tags=["System"])
-async def system_shutdown():
+async def system_shutdown(request: Request):
     """Arresto pulito del server locale richiesto dal client desktop (es. aggiornamento app)."""
+    _check_local_control_origin(request)
     import signal
     import threading
 
@@ -157,22 +175,16 @@ async def system_shutdown():
     return {"status": "shutting_down"}
 
 
-class SaveFilePayload(BaseModel):
-    path: str
-    content: str
-
-
-@app.post("/api/v1/utils/save-file", tags=["System"])
-def save_file_to_disk(payload: SaveFilePayload):
-    try:
-        parent = os.path.dirname(os.path.abspath(payload.path))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(payload.path, "w", encoding="utf-8") as f:
-            f.write(payload.content)
-        return {"success": True, "path": payload.path}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+def _check_local_control_origin(request: Request) -> None:
+    """Blocca richieste cross-site alle API locali che controllano il processo o il disco."""
+    origin = request.headers.get("origin")
+    if not origin:
+        return  # client nativi/CLI; i browser inviano Origin nelle richieste cross-site
+    if origin in {"null", "tauri://localhost", "http://tauri.localhost", "https://tauri.localhost"}:
+        return
+    if re.fullmatch(r"https?://(localhost|127\.0\.0\.1)(:\d+)?/?", origin):
+        return
+    raise HTTPException(status_code=403, detail="Origine non consentita.")
 
 
 def extract_professor_questions(text: str) -> list[str]:
@@ -198,13 +210,23 @@ def extract_professor_questions(text: str) -> list[str]:
         "chi vuole rispondere", "ci sono domande",
     )
 
+    # Intercalari retorici di chiusura (es. "..., ok?", "..., chiaro?", "..., no?") da non scambiare per vere domande
+    rhetorical_tag_re = re.compile(
+        r"(?:,\s*|\s+)(?:ok|okay|chiaro|giusto|vero|capito|no|sì|si|eh|bene|d'accordo|va bene)\s*\?+$",
+        re.IGNORECASE,
+    )
+
     for s in sentences:
         s_clean = s.strip()
         if not s_clean or len(s_clean) < 5:
             continue
+        low = s_clean.lower()
         if "?" in s_clean:
+            # Scarta frasi puramente affermative chiuse da un intercalare retorico (", ok?") se non iniziano con un vero pronome/cue interrogativo
+            if rhetorical_tag_re.search(s_clean) and not any(low.startswith(cue) for cue in interrogative_cues):
+                continue
             results.append(s_clean)
-        elif any(s_clean.lower().startswith(cue) for cue in interrogative_cues):
+        elif any(low.startswith(cue) for cue in interrogative_cues):
             results.append(s_clean + "?")
 
     return results
@@ -263,33 +285,51 @@ async def _safe_send_json(ws: WebSocket, payload: dict) -> bool:
 
 
 async def _generate_flash_answer_task(session: LiveSession, question: str, question_id: str, ws: WebSocket):
-    """Genera la risposta flash in 3 punti elenco con l'LLM locale e aggiorna il WebSocket."""
+    """
+    Genera la risposta flash ultra-rapida in streaming con l'LLM locale (thinking disattivato)
+    usando la trascrizione live con timestamp + lookup lessicale istantaneo dei materiali del corso.
+    """
     try:
-        from rag import query_context, unload_embedding_model
-        from llm_engine import generate_flash_answer, clear_metal_cache
+        from rag import query_context_structured, is_embedding_loaded
+        from llm_engine import stream_flash_answer, _deduplicate_repeated_answer
 
-        # 1. Recupera gli ultimi 3 minuti del buffer live (puliti dai riempitivi orali)
-        from transcript_cleaner import clean_transcript_for_llm
-        raw_live = session.get_recent_context(minutes=3)
-        live_context = clean_transcript_for_llm(raw_live)
-        # 2. Interroga LanceDB per la materia corrente (priorità a lezioni precedenti e materiali)
-        try:
-            rag_context = await asyncio.to_thread(
-                query_context,
-                subject_id=session.subject_id,
-                query=question,
-                top_k=3,
-                priority_previous_lecture=True,
-            )
-        finally:
-            unload_embedding_model()
-            clear_metal_cache()
-        combined = f"Ultime spiegazioni live:\n{live_context}\n\nMateriali e lezioni precedenti:\n{rag_context}"
+        # 1. Recupera gli ultimi 15 minuti della trascrizione live CON TIMESTAMP [MM:SS | X min fa] (0ms RAM)
+        live_context = session.get_timestamped_recent_context(minutes=15, max_chars=4500)
+        if not live_context:
+            live_context = "(Nessuna frase ancora trascritta in questa lezione.)"
+
+        # 2. Ricerca istantanea (<5ms) sui materiali e lezioni precedenti: usa vettoriale solo se l'embedder è già caldo in RAM
+        rag_res = await asyncio.to_thread(
+            query_context_structured,
+            subject_id=session.subject_id,
+            query=question,
+            top_k=3,
+            priority_previous_lecture=True,
+            use_vector=is_embedding_loaded(),
+        )
+        rag_context = (rag_res.get("context_text") or "").strip()
+
+        parts = [f"TRASCRIZIONE IN DIRETTA DELLA LEZIONE CORRENTE:\n{live_context}"]
+        if rag_context:
+            parts.append(f"MATERIALI E LEZIONI PRECEDENTI DEL CORSO:\n{rag_context}")
+        combined = "\n\n".join(parts)
 
         settings = load_settings()
         llm_model = settings.get("llm_model")
 
-        flash_answer = await generate_flash_answer(question=question, context=combined, model_id=llm_model)
+        # 3. Streaming token-by-token (enable_thinking=False garantito) per risposta istantanea nella card
+        answer_chunks: list[str] = []
+        async for token in stream_flash_answer(question=question, context=combined, model_id=llm_model):
+            answer_chunks.append(token)
+            await _safe_send_json(ws, {
+                "type": "question_answer_chunk",
+                "payload": {
+                    "id": question_id,
+                    "chunk": token,
+                }
+            })
+
+        flash_answer = _deduplicate_repeated_answer("".join(answer_chunks)) or "Risposta completata."
 
         # Aggiorna la risposta nella sessione in memoria (se la domanda non è stata eliminata)
         found = False
@@ -320,6 +360,13 @@ async def _generate_flash_answer_task(session: LiveSession, question: str, quest
             logger.info(f"[Flash Answer] Risposta generata e inviata via WS per '{question[:30]}...'")
     except Exception as exc:
         logger.warning(f"[Flash Answer] Errore generazione risposta flash: {exc}")
+        await _safe_send_json(ws, {
+            "type": "error",
+            "payload": {
+                "id": question_id,
+                "message": f"Errore risposta rapida: {exc}",
+            }
+        })
 
 
 async def _handle_live_chat_stream(
@@ -328,35 +375,117 @@ async def _handle_live_chat_stream(
     query: str,
     context_minutes: int,
     subject_id: int,
+    enable_thinking: bool = False,
+    history: Optional[list[dict]] = None,
 ) -> None:
     """
-    Streaming asincrono in background per la chat live RAG.
+    Streaming asincrono in background per la chat live RAG (stile ChatGPT 2026 con fonti strutturate e opzione Pensa).
     Non blocca l'event loop né il socket e gestisce ogni errore in modo sicuro.
     """
-    from rag import query_context, unload_embedding_model
-    from llm_engine import stream_chat_response, clear_metal_cache
-    from transcript_cleaner import clean_transcript_for_llm
+    from rag import query_context_structured, is_embedding_loaded, unload_embedding_model
+    from llm_engine import stream_chat_response, clear_metal_cache, is_model_downloaded, resolve_llm_model
 
     live_context = ""
+    citations: list[dict] = []
     try:
-        raw_live = session.get_recent_context(minutes=context_minutes)
-        live_context = clean_transcript_for_llm(raw_live)
-        try:
-            rag_context = await asyncio.to_thread(query_context, subject_id=subject_id, query=query, top_k=3)
-        finally:
-            await asyncio.to_thread(unload_embedding_model)
-            clear_metal_cache()
-        combined_context = (
-            f"Ultime spiegazioni live (ultimi {context_minutes} minuti):\n{live_context}\n\n"
-            f"Materiali e nozioni del corso:\n{rag_context}"
-        )
-
         settings = load_settings()
         llm_model = settings.get("llm_model")
+        has_llm = is_model_downloaded(resolve_llm_model(llm_model))
+
+        live_context = session.get_timestamped_recent_context(minutes=context_minutes, max_chars=5000)
+
+        rag_context = ""
+        rag_citations: list[dict] = []
+        # Se nessun LLM è scaricato, evita di caricare/scaricare 600MB di embedding (risposta immediata in 0ms)
+        if has_llm:
+            was_loaded = is_embedding_loaded()
+            try:
+                rag_res = await asyncio.to_thread(
+                    query_context_structured,
+                    subject_id=subject_id,
+                    query=query,
+                    top_k=3,
+                    priority_previous_lecture=True,
+                    use_vector=True,
+                )
+                rag_context = (rag_res.get("context_text") or "").strip()
+                rag_citations = list(rag_res.get("citations") or [])
+            finally:
+                if not was_loaded:
+                    await asyncio.to_thread(unload_embedding_model)
+                    clear_metal_cache()
+
+        if live_context.strip():
+            citations.append({
+                "source_id": f"lecture-{session.lecture_id}",
+                "source_type": "live_lecture",
+                "title": "Trascrizione in diretta",
+                "page": None,
+                "label": "Lezione in diretta",
+            })
+        if has_llm:
+            citations.extend(rag_citations)
+
+        combined_parts = []
+        if live_context.strip():
+            combined_parts.append(
+                f"TRASCRIZIONE LIVE DELLA LEZIONE IN CORSO (ultimi {context_minutes} minuti):\n{live_context}"
+            )
+        if rag_context:
+            combined_parts.append(f"MATERIALI E LEZIONI PRECEDENTI DEL CORSO:\n{rag_context}")
+        combined_context = "\n\n".join(combined_parts) or "Nessun contesto disponibile per ora."
+
+        context_preview = (live_context[:400] + "...") if len(live_context) > 400 else live_context
+
+        # Invia subito i metadati (fonti strutturate) prima del primo token per il pannello Fonti
+        await _safe_send_json(ws, {
+            "type": "chat_meta",
+            "payload": {
+                "query": query,
+                "citations": citations,
+                "context_used": context_preview,
+            }
+        })
+
+        if not has_llm:
+            # Pausa realistica per visualizzare l'animazione di analisi fonti prima dello switch
+            await asyncio.sleep(0.40)
+            notice_chunks = [
+                "Il modello LLM non è ancora stato scaricato in locale.\n\n",
+                "Apri le **Impostazioni** e scarica il modello per abilitare l'assistente IA 100% offline."
+            ]
+            full_notice = "".join(notice_chunks)
+            for chunk in notice_chunks:
+                await _safe_send_json(ws, {
+                    "type": "chat_chunk",
+                    "payload": {
+                        "chunk": chunk,
+                        "query": query,
+                    }
+                })
+                await asyncio.sleep(0.04)
+
+            await _safe_send_json(ws, {
+                "type": "chat_response",
+                "payload": {
+                    "answer": full_notice,
+                    "text": full_notice,
+                    "query": query,
+                    "citations": citations,
+                    "context_used": context_preview,
+                }
+            })
+            return
 
         full_answer = ""
         try:
-            async for token in stream_chat_response(query=query, context=combined_context, model_id=llm_model):
+            async for token in stream_chat_response(
+                query=query,
+                context=combined_context,
+                model_id=llm_model,
+                enable_thinking=enable_thinking,
+                history=history,
+            ):
                 full_answer += token
                 sent = await _safe_send_json(ws, {
                     "type": "chat_chunk",
@@ -383,8 +512,10 @@ async def _handle_live_chat_stream(
             "type": "chat_response",
             "payload": {
                 "answer": full_answer,
+                "text": full_answer,
                 "query": query,
-                "context_used": (live_context[:400] + "...") if len(live_context) > 400 else live_context,
+                "citations": citations,
+                "context_used": context_preview,
             }
         })
     except Exception as exc:
@@ -394,6 +525,7 @@ async def _handle_live_chat_stream(
             "payload": {
                 "answer": f"Si è verificato un errore durante l'elaborazione della risposta: {exc}",
                 "query": query,
+                "citations": citations,
                 "context_used": (live_context[:400] + "...") if len(live_context) > 400 else live_context,
             }
         })
@@ -462,12 +594,36 @@ async def _post_lecture_summary_and_index(subject_id: int, lecture_id: int, full
         settings = load_settings()
         llm_model = settings.get("llm_model")
 
+        from llm_engine import is_model_downloaded, resolve_llm_model
+        target_llm = resolve_llm_model(llm_model)
+        if not is_model_downloaded(target_llm):
+            # Non salvare mai un segnaposto "Modello LLM non installato" dentro processed_notes:
+            # indicizza solo la trascrizione grezza per il RAG e lascia il Quaderno pulito.
+            logger.info(
+                f"[Post-Lezione] Modello LLM '{target_llm}' non scaricato: salto generazione automatica capitolo "
+                f"per lezione {lecture_id} (indicizzo solo la trascrizione)."
+            )
+            try:
+                await asyncio.to_thread(
+                    index_lecture,
+                    subject_id=subject_id,
+                    lecture_id=lecture_id,
+                    title=lecture.title,
+                    transcript=full_transcript,
+                    notes=None,
+                )
+            finally:
+                unload_embedding_model()
+                clear_metal_cache()
+            return
+
         chapter = await generate_lecture_chapter(
             title=lecture.title,
             transcript=full_transcript,
             past_references=past_refs,
             bookmarks_summary=bm_summary,
             model_id=llm_model,
+            lecture_id=lecture.id,
         )
         if not chapter:
             logger.warning(f"[Post-Lezione] Nessun capitolo generato per lezione {lecture_id}: note invariate.")
@@ -523,6 +679,15 @@ async def _post_lecture_summary_and_index(subject_id: int, lecture_id: int, full
         clear_metal_cache()
 
 
+def _microphone_error_message() -> str:
+    """Messaggio conciso e specifico per il sistema operativo corrente se il microfono non è accessibile."""
+    if sys.platform == "darwin":
+        return "Microfono non accessibile. Controlla Impostazioni di Sistema → Privacy e sicurezza → Microfono."
+    if sys.platform == "win32":
+        return "Microfono non accessibile. Controlla Impostazioni → Privacy → Microfono."
+    return "Microfono non accessibile. Verifica i permessi audio del sistema."
+
+
 # ── Worker di Trascrizione Live Whisper Large Turbo ────────────────────────────
 async def _transcription_worker(session: LiveSession, ws: WebSocket):
     """
@@ -544,18 +709,19 @@ async def _transcription_worker(session: LiveSession, ws: WebSocket):
                 "payload": {"status": new_status}
             })
 
-    # Verifiche diagnostiche proattive per avvisare subito l'utente se qualcosa impedisce la trascrizione
-    if session.audio_engine._stream is None and not session.transcriber.mock_mode:
+    # Verifiche diagnostiche proattive (NON segnalare errore microfono se la sessione è intenzionalmente in pausa!)
+    if not session.is_paused and session.audio_engine._stream is None and not session.transcriber.mock_mode:
         logger.warning(f"[WS Worker] Microfono hardware non attivo per lezione {session.lecture_id}")
         await _safe_send_json(ws, {
             "type": "error",
             "payload": {
-                "message": "Accesso al microfono non riuscito. Controlla le impostazioni Privacy di Windows (Impostazioni -> Privacy -> Microfono) o verifica che il microfono non sia disattivato."
+                "message": _microphone_error_message()
             }
         })
 
     if not session.transcriber.mock_mode:
         if not session.transcriber.local_model_path:
+            from transcriber import _resolve_model_path
             session.transcriber.local_model_path = _resolve_model_path(session.transcriber.repo_id)
         if not session.transcriber.local_model_path:
             logger.warning(f"[WS Worker] Modello Whisper non presente in locale per lezione {session.lecture_id}")
@@ -666,13 +832,21 @@ async def _post_lecture_pipeline(
     full_transcript: str,
 ) -> None:
     """Pipeline asincrona post-lezione eseguita in sequenza ordinata per evitare race condition."""
+    from llm_engine import clear_metal_cache
+
     # 1. Calcola i timestamp sincronizzati mentre Whisper è ancora in memoria
-    if audio_path and os.path.exists(audio_path) and full_transcript and len(full_transcript.strip()) > 30:
+    # Se il file audio esiste, forziamo il calcolo Whisper reale (force=True) per sostituire
+    # l'eventuale stima temporanea live e recuperare frasi perse se il microfono era a basso volume.
+    if audio_path and os.path.exists(audio_path):
         try:
             from routers.lectures import compute_and_cache_lecture_timestamps
-            await asyncio.to_thread(compute_and_cache_lecture_timestamps, lecture_id)
+            await asyncio.to_thread(compute_and_cache_lecture_timestamps, lecture_id, force=True)
         except Exception as exc:
             logger.warning(f"[WS Pipeline] Errore calcolo timestamps lezione {lecture_id}: {exc}")
+
+    # Rilascio cooperativo della cache Metal prima della compressione
+    clear_metal_cache()
+    await asyncio.sleep(0.3)
 
     # 2. Converte la traccia temporanea in formato definitivo M4A salva-spazio ed aggiorna DB
     if audio_path and audio_path.endswith(".wav") and os.path.exists(audio_path):
@@ -697,13 +871,28 @@ async def _post_lecture_pipeline(
         except Exception as exc:
             logger.warning(f"[WS Pipeline] Compressione M4A non riuscita per lezione {lecture_id}: {exc}")
 
+    # Rilascio cooperativo prima del caricamento e inferenza dell'LLM
+    clear_metal_cache()
+    await asyncio.sleep(0.3)
+
     # 3. Ora che Whisper ha terminato e i file sono pronti, genera capitoli con LLM + RAG LanceDB
-    if full_transcript and len(full_transcript.strip()) > 30:
+    # Rileggiamo il transcript aggiornato dal DB se Whisper su audio ha recuperato più parole del live
+    effective_transcript = full_transcript
+    try:
+        with SessionLocal() as db_sess:
+            lec = db_sess.query(Lecture).filter(Lecture.id == lecture_id).first()
+            if lec and lec.raw_transcript and len(lec.raw_transcript.strip()) > len((effective_transcript or "").strip()):
+                effective_transcript = lec.raw_transcript
+    except Exception:
+        pass
+
+    cleaned_words = [w for w in (effective_transcript or "").split() if w.strip()]
+    if effective_transcript and len(effective_transcript.strip()) >= 40 and len(cleaned_words) >= 6:
         try:
             await _post_lecture_summary_and_index(
                 subject_id=subject_id,
                 lecture_id=lecture_id,
-                full_transcript=full_transcript,
+                full_transcript=effective_transcript,
             )
         except Exception as exc:
             logger.warning(f"[WS Pipeline] Errore riassunto/RAG per lezione {lecture_id}: {exc}")
@@ -763,7 +952,7 @@ async def _finalize_session(session: LiveSession, subject_id: int) -> Tuple[floa
                 timeout=6.0,
             )
     except Exception as exc:
-        logger.error(f"[WS] Errore arresto AudioEngine: {exc}")
+        logger.error(f"[WS] Errore arresto AudioEngine: {type(exc).__name__}: {exc}")
 
     # ── Salvataggio IMMEDIATO nel Database (priorità assoluta per il player) ──
     full_transcript = session.get_full_transcript()
@@ -782,6 +971,19 @@ async def _finalize_session(session: LiveSession, subject_id: int) -> Tuple[floa
             )
             db_sess.commit()
             logger.info(f"[WS] Salvataggio immediato SQLite completato: lezione={session.lecture_id}, audio={audio_path}")
+
+            # Genera immediatamente la cache timestamps sincronizzata basata sui blocchi registrati in live
+            if audio_path and hasattr(session, "_buffer") and session._buffer:
+                try:
+                    from routers.lectures import _build_live_buffer_timestamps
+                    init_lines = _build_live_buffer_timestamps(list(session._buffer), duration)
+                    if init_lines:
+                        cache_ts_path = audio_path + ".timestamps.json"
+                        with open(cache_ts_path, "w", encoding="utf-8") as f_ts:
+                            json.dump(init_lines, f_ts, ensure_ascii=False)
+                        logger.info(f"[WS] Cache timestamps live generata da ring-buffer: {cache_ts_path}")
+                except Exception as ts_err:
+                    logger.debug(f"[WS] Generazione cache live non riuscita: {ts_err}")
     except Exception as db_err:
         logger.error(f"[WS] Errore salvataggio immediato lezione su DB: {db_err}")
     finally:
@@ -797,6 +999,10 @@ async def _finalize_session(session: LiveSession, subject_id: int) -> Tuple[floa
 
     # ── Task in background: coda residua, rilascio memoria ed elaborazione post-lezione ──
     async def _background_post_stop():
+        # Pausa di differimento cooperativo (1.2s): consente alla UI WebKit / Tauri di completare
+        # lo smontaggio del workspace e il ritorno fluido a 60 FPS al Quaderno senza contesa GPU/CPU.
+        await asyncio.sleep(1.2)
+
         # Trascrive eventuali frammenti residui rimasti in coda (non scarta il parlato su CPU più lente)
         if not session.transcriber.mock_mode:
             drained_any = False
@@ -1112,8 +1318,21 @@ async def live_lecture_ws(
                 query = str(payload.get("query") or "").strip()
                 if not query:
                     continue
-                context_minutes = _as_int(payload.get("context_minutes", 5), default=5, lo=1, hi=15)
-                _spawn(_handle_live_chat_stream(session, websocket, query, context_minutes, subject_id))
+                context_minutes = _as_int(payload.get("context_minutes", 15), default=15, lo=1, hi=15)
+                enable_thinking = bool(payload.get("enable_thinking", False))
+                raw_history = payload.get("history")
+                history = raw_history if isinstance(raw_history, list) else None
+                _spawn(
+                    _handle_live_chat_stream(
+                        session,
+                        websocket,
+                        query,
+                        context_minutes,
+                        subject_id,
+                        enable_thinking=enable_thinking,
+                        history=history,
+                    )
+                )
 
             # ── DELETE QUESTION (elimina domanda non pertinente in live) ───────
             elif msg_type == "delete_question":
@@ -1125,13 +1344,13 @@ async def live_lecture_ws(
 
             # ── ANSWER QUESTION (richiesta esplicita utente risposta domanda) ──
             elif msg_type == "answer_question":
+                q_id = str(payload.get("question_id") or "").strip()
+                q_text = str(payload.get("question") or "").strip()
                 if session:
-                    q_id = str(payload.get("question_id") or "")
-                    q_text = str(payload.get("question") or "")
                     if not q_text and q_id:
                         for item in session.detected_questions:
                             if str(item.get("id")) == q_id:
-                                q_text = item.get("question", "")
+                                q_text = str(item.get("question") or "").strip()
                                 break
                     if q_text and q_id:
                         logger.info(f"[WS] Richiesta esplicita utente risposta domanda: '{q_text[:30]}...'")
@@ -1140,6 +1359,23 @@ async def live_lecture_ws(
                             "payload": {"id": q_id, "question": q_text}
                         })
                         _spawn(_generate_flash_answer_task(session, q_text, q_id, websocket))
+                    elif q_id:
+                        logger.warning(f"[WS] Domanda {q_id} non trovata nella sessione corrente.")
+                        await _safe_send_json(websocket, {
+                            "type": "error",
+                            "payload": {
+                                "id": q_id,
+                                "message": "Domanda non trovata nella sessione corrente.",
+                            }
+                        })
+                elif q_id:
+                    await _safe_send_json(websocket, {
+                        "type": "error",
+                        "payload": {
+                            "id": q_id,
+                            "message": "Domanda non trovata nella sessione corrente.",
+                        }
+                    })
 
             # ── PAUSE (Consolidamento non bloccante + Stop motori + Deep sleep) ─
             elif msg_type == "pause":
@@ -1195,6 +1431,18 @@ async def live_lecture_ws(
                         logger.info(f"[WS] Registrazione RIPRESA per lezione {session.lecture_id}: microfono e modelli riattivati.")
                     await _safe_send_json(websocket, {"type": "resumed"})
 
+            # ── UPDATE_VAD (Aggiornamento a caldo della sensibilità microfono) ─
+            elif msg_type == "update_vad":
+                if session and session.is_active:
+                    new_vad = int(payload.get("vad_sensitivity", 2))
+                    session.update_vad_sensitivity(new_vad)
+                    logger.info(f"[WS] Sensibilità VAD aggiornata a caldo per lezione {session.lecture_id}: {new_vad}")
+                    await _safe_send_json(websocket, {
+                        "type": "vad_updated",
+                        "payload": {"vad_sensitivity": new_vad}
+                    })
+                continue
+
             # ── STOP ───────────────────────────────────────────────────────────
             elif msg_type == "stop":
                 if not session:
@@ -1230,10 +1478,20 @@ async def live_lecture_ws(
         _ws_locks.pop(websocket, None)
         # Se la disconnessione avviene senza 'stop' esplicito, metti in pausa e avvia timer di grazia
         if session is not None and not session.finalized and session.is_active:
+            last_audio: Optional[bytes] = None
             try:
-                session.pause()
+                last_audio = session.pause()
             except Exception as e:
                 logger.warning(f"[WS] Errore pausa sessione disconnessa: {e}")
+            if last_audio and len(last_audio) >= 1600:
+                try:
+                    session.audio_engine.speech_queue.put_nowait(last_audio)
+                    logger.info(
+                        f"[WS] Audio residuo ({len(last_audio)} B) preservato in speech_queue "
+                        f"su disconnessione per lezione {session.lecture_id}."
+                    )
+                except Exception as q_err:
+                    logger.warning(f"[WS] Impossibile preservare audio residuo in coda: {q_err}")
             session._client_disconnected_at = time.time()
             old_grace = getattr(session, "_disconnect_grace_task", None)
             if old_grace and not old_grace.done():
@@ -1279,20 +1537,27 @@ async def generate_summary_for_lecture(
         clear_metal_cache,
         generate_lecture_chapter,
         is_cancelled,
+        is_model_downloaded,
+        resolve_llm_model,
         unload_llm,
         unload_whisper,
     )
     from config import load_settings
     from database import Bookmark
 
+    settings = load_settings()
+    llm_model = (payload.model_id if payload else None) or settings.get("llm_model")
+    if not is_model_downloaded(resolve_llm_model(llm_model)):
+        raise HTTPException(
+            status_code=400,
+            detail="Modello LLM non scaricato. Apri Impostazioni → Modelli IA e scarica un modello LLM per generare la sintesi.",
+        )
+
     start_epoch = cancel_epoch()
 
     # Unload coordinato di Whisper prima del riassunto (non durante una lezione live)
     if not has_active_sessions():
         await asyncio.to_thread(unload_whisper)
-
-    settings = load_settings()
-    llm_model = (payload.model_id if payload else None) or settings.get("llm_model")
 
     bms = db.query(Bookmark).filter(Bookmark.lecture_id == lecture_id).all()
     bm_summary = (
@@ -1324,6 +1589,7 @@ async def generate_summary_for_lecture(
             past_references=past_refs,
             bookmarks_summary=bm_summary,
             model_id=llm_model,
+            lecture_id=lecture.id,
             clean_transcript=has_raw,
         )
     except InterruptedError:
@@ -1401,18 +1667,25 @@ async def generate_summary_stream_for_lecture(
         clear_metal_cache,
         generate_lecture_chapter,
         is_cancelled,
+        is_model_downloaded,
+        resolve_llm_model,
         unload_llm,
         unload_whisper,
     )
     from config import load_settings
     from database import Bookmark
 
+    settings = load_settings()
+    llm_model = (payload.model_id if payload else None) or settings.get("llm_model")
+    if not is_model_downloaded(resolve_llm_model(llm_model)):
+        raise HTTPException(
+            status_code=400,
+            detail="Modello LLM non scaricato. Apri Impostazioni → Modelli IA e scarica un modello LLM per generare la sintesi.",
+        )
+
     start_epoch = cancel_epoch()
     if not has_active_sessions():
         await asyncio.to_thread(unload_whisper)
-
-    settings = load_settings()
-    llm_model = (payload.model_id if payload else None) or settings.get("llm_model")
 
     bms = db.query(Bookmark).filter(Bookmark.lecture_id == lecture_id).all()
     bm_summary = (
@@ -1454,6 +1727,7 @@ async def generate_summary_stream_for_lecture(
                 past_references=past_refs,
                 bookmarks_summary=bm_summary,
                 model_id=llm_model,
+                lecture_id=lecture.id,
                 clean_transcript=has_raw,
                 progress_callback=_on_progress,
             )

@@ -20,6 +20,7 @@ import zipfile
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status, UploadFile, File
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -40,10 +41,11 @@ logger = logging.getLogger("sbobinai.subjects")
 router = APIRouter(prefix="/subjects", tags=["Subjects"])
 
 AUDIO_EXTENSIONS = (".mp3", ".wav", ".m4a", ".aac", ".ogg")
+MAX_MATERIAL_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 _PREVIEWABLE_TEXT_EXTENSIONS = frozenset({
     ".txt", ".md", ".markdown", ".csv", ".tsv", ".json",
     ".py", ".ts", ".tsx", ".js", ".jsx", ".html", ".css",
-    ".xml", ".yaml", ".yml", ".tex", ".log",
+    ".xml", ".yaml", ".yml", ".tex", ".log", ".docx",
 })
 
 
@@ -121,6 +123,82 @@ def _extract_pdf_pages(file_path: Path) -> list[dict]:
     return pages
 
 
+def _extract_docx_text(file_path: Path) -> str:
+    """Estrae testo, intestazioni, tabelle e sezioni da un file Word .docx preservando la struttura Markdown."""
+    try:
+        with zipfile.ZipFile(file_path, "r") as zf:
+            names = set(zf.namelist())
+            if "word/document.xml" not in names:
+                return ""
+
+            ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+
+            def _parse_xml_elements(xml_bytes: bytes) -> list[str]:
+                root = ET.fromstring(xml_bytes)
+                elements: list[str] = []
+                for child in root.iter():
+                    tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+                    if tag == "p":
+                        runs = [t.text for t in child.findall(".//w:t", ns) if t.text]
+                        line = "".join(runs).strip()
+                        if not line:
+                            continue
+                        pPr = child.find("w:pPr", ns)
+                        style = ""
+                        if pPr is not None:
+                            pStyle = pPr.find("w:pStyle", ns)
+                            if pStyle is not None:
+                                style = pStyle.attrib.get(f"{{{ns['w']}}}val", "").lower()
+                        if "heading1" in style or style == "title":
+                            elements.append(f"# {line}")
+                        elif "heading2" in style or style == "subtitle":
+                            elements.append(f"## {line}")
+                        elif "heading3" in style:
+                            elements.append(f"### {line}")
+                        elif "heading" in style:
+                            elements.append(f"#### {line}")
+                        else:
+                            elements.append(line)
+                    elif tag == "tbl":
+                        rows: list[list[str]] = []
+                        for tr in child.findall(".//w:tr", ns):
+                            row: list[str] = []
+                            for tc in tr.findall(".//w:tc", ns):
+                                tc_runs = [t.text for t in tc.findall(".//w:t", ns) if t.text]
+                                cell_text = " ".join("".join(tc_runs).split())
+                                row.append(cell_text)
+                            if row and any(c.strip() for c in row):
+                                rows.append(row)
+                        if rows:
+                            max_cols = max(len(r) for r in rows)
+                            normalized_rows = [r + [""] * (max_cols - len(r)) for r in rows]
+                            header = "| " + " | ".join(normalized_rows[0]) + " |"
+                            sep = "| " + " | ".join(["---"] * max_cols) + " |"
+                            tbl_lines = [header, sep]
+                            for r in normalized_rows[1:]:
+                                tbl_lines.append("| " + " | ".join(r) + " |")
+                            elements.append("\n".join(tbl_lines))
+                return elements
+
+            all_parts: list[str] = []
+            # 1. Intestazioni
+            for h in sorted(n for n in names if n.startswith("word/header") and n.endswith(".xml")):
+                all_parts.extend(_parse_xml_elements(zf.read(h)))
+            # 2. Documento principale (testo + tabelle)
+            all_parts.extend(_parse_xml_elements(zf.read("word/document.xml")))
+            # 3. Note
+            if "word/footnotes.xml" in names:
+                all_parts.extend(_parse_xml_elements(zf.read("word/footnotes.xml")))
+            # 4. Piè di pagina
+            for f in sorted(n for n in names if n.startswith("word/footer") and n.endswith(".xml")):
+                all_parts.extend(_parse_xml_elements(zf.read(f)))
+
+            return "\n\n".join(dict.fromkeys(all_parts))
+    except Exception as exc:
+        logger.error(f"[DOCX Extraction] Errore su {file_path}: {exc}")
+        return ""
+
+
 def _split_text_pages(text: str, page_chars: int = 2500) -> list[str]:
     """Divide un testo lungo in pagine logiche di circa 2500 caratteri."""
     if not text:
@@ -143,11 +221,32 @@ def _split_text_pages(text: str, page_chars: int = 2500) -> list[str]:
     return pages or [""]
 
 
-def _save_material_meta(fpath: str, page_count: int, content: str) -> None:
+def _save_material_meta(
+    fpath: str,
+    page_count: int,
+    content: str,
+    tag: Optional[str] = None,
+    lecture_id: Optional[int] = None,
+) -> None:
     """Salva i metadati estratti in cache .meta.json accanto al materiale."""
+    meta_path = f"{fpath}.meta.json"
+    data = {}
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as mf:
+                data = json.load(mf)
+        except Exception:
+            pass
+    data["page_count"] = page_count
+    data["content"] = content
+    if tag is not None:
+        data["tag"] = tag
+        data["source_type"] = tag
+    if lecture_id is not None:
+        data["lecture_id"] = lecture_id
     try:
-        with open(f"{fpath}.meta.json", "w", encoding="utf-8") as mf:
-            json.dump({"page_count": page_count, "content": content}, mf, ensure_ascii=False)
+        with open(meta_path, "w", encoding="utf-8") as mf:
+            json.dump(data, mf, ensure_ascii=False)
     except Exception:
         pass
 
@@ -226,15 +325,17 @@ def ensure_infocorso_file(subject: Subject) -> str:
     file_path = os.path.join(subj_dir, "InfoCorso.md")
 
     date_str = subject.created_at.strftime('%d/%m/%Y') if subject.created_at else ''
+    keywords_section = ""
+    if subject.whisper_prompt_keywords and subject.whisper_prompt_keywords.strip():
+        keywords_section = f"\n## Vocabolario e Termini Chiave\n{subject.whisper_prompt_keywords.strip()}\n"
+
+    desc = subject.description.strip() if subject.description and subject.description.strip() else "Nessuna descrizione o informazione aggiuntiva specificata."
     content = f"""# {subject.name} — Informazioni del Corso
 
 ## Informazioni Generali & Descrizione
-{subject.description or "Nessuna descrizione o informazione aggiuntiva specificata."}
-
-## Parole Chiave Riconoscimento Vocale (Whisper)
-{subject.whisper_prompt_keywords or "Nessuna parola chiave definita."}
-
-## Dettagli di Registrazione
+{desc}
+{keywords_section}
+## Dettagli Corso
 - **Materia:** {subject.name}
 - **Data creazione:** {date_str}
 - **Stato:** Attivo nel sistema SbobinAI
@@ -363,7 +464,19 @@ def delete_subject(subject_id: int, db: Session = Depends(get_db)):
 
     for lec in lectures:
         # File audio registrato
-        if lec.audio_path and os.path.exists(lec.audio_path) and os.path.isfile(lec.audio_path):
+        # audio_path può essere stato valorizzato via API: elimina solo file posseduti
+        # dall'app nelle directory audio note, mai un percorso arbitrario esterno.
+        managed_audio_path = False
+        if lec.audio_path:
+            try:
+                candidate = Path(lec.audio_path).resolve()
+                managed_audio_path = any(
+                    candidate.is_relative_to(Path(audio_dir).resolve())
+                    for audio_dir in audio_dirs
+                )
+            except (OSError, ValueError):
+                managed_audio_path = False
+        if managed_audio_path and os.path.isfile(lec.audio_path):
             try:
                 os.remove(lec.audio_path)
             except Exception:
@@ -429,45 +542,51 @@ def list_materials(subject_id: int, db: Session = Depends(get_db)):
         isAutoImported=True,
     ))
 
-    # 2. Tutte le lezioni / registrazioni della memoria del corso
+    # 2. Tutte le lezioni / registrazioni e file caricati, ordinati dal più recente
+    import unicodedata
+    from datetime import timezone as _tz
     from database import Lecture
     lectures = db.query(Lecture).filter(Lecture.subject_id == subject_id).order_by(Lecture.date.desc()).all()
-    for lec in lectures:
-        dur_str = f"{int(lec.duration_seconds // 60)}m" if lec.duration_seconds else "Audio / Appunti"
-        date_str = lec.date.strftime('%d %b %Y') if lec.date else "Lezione"
-        materials.append(MaterialOut(
-            id=f"lecture-{lec.id}",
-            name=lec.title,
-            type="lecture",
-            size=dur_str,
-            uploadedAt=date_str,
-            pageCount=1,
-            content=lec.processed_notes or lec.raw_transcript,
-            isAutoImported=False,
-            lecture_id=lec.id,
-            duration_seconds=lec.duration_seconds,
-            in_quaderno=lec.in_quaderno,
-            source_type=lec.source_type,
-        ))
 
-    # 3. Eventuali altri file fisici caricati (PDF, slide, note, audio)
+    # Mappa lezioni per ID, audio_path (filename collegato) e stem/titolo normalizzati
+    lecture_by_id: Dict[int, Lecture] = {lec.id: lec for lec in lectures}
+    lecture_by_audio: Dict[str, Lecture] = {}
+    lecture_by_key: Dict[str, Lecture] = {}
+    for lec in lectures:
+        if lec.audio_path:
+            norm_audio = unicodedata.normalize("NFC", os.path.basename(lec.audio_path)).strip().lower()
+            lecture_by_audio[norm_audio] = lec
+        lec_key = unicodedata.normalize("NFC", lec.title or "").strip().lower()
+        if lec_key:
+            lecture_by_key[lec_key] = lec
+
+    covered_lecture_ids = set()
+    dated_materials: List[tuple[float, MaterialOut]] = []
+
+    # 2. File fisici caricati in uploads (PDF, docx, slide, note, audio)
     if os.path.exists(subj_dir):
-        for fname in sorted(os.listdir(subj_dir)):
+        for fname in os.listdir(subj_dir):
             if fname == "InfoCorso.md" or fname.startswith(".") or fname.endswith(".meta.json"):
                 continue
             fpath = os.path.join(subj_dir, fname)
             if os.path.isfile(fpath):
                 f_kb = os.path.getsize(fpath) / 1024
                 size_str = f"{f_kb / 1024:.1f} MB" if f_kb > 1024 else f"{f_kb:.1f} KB"
+                norm_fname = unicodedata.normalize("NFC", fname).strip()
+                lower_name = norm_fname.lower()
+                stem = unicodedata.normalize("NFC", os.path.splitext(norm_fname)[0]).strip().lower()
+
                 ftype = (
-                    "slide" if fname.lower().endswith((".ppt", ".pptx", ".key"))
-                    else "pdf" if fname.lower().endswith(".pdf")
-                    else "audio" if fname.lower().endswith((".mp3", ".wav", ".m4a", ".aac", ".ogg"))
+                    "slide" if lower_name.endswith((".ppt", ".pptx", ".key", ".odp"))
+                    else "pdf" if lower_name.endswith(".pdf")
+                    else "audio" if lower_name.endswith(AUDIO_EXTENSIONS)
                     else "doc"
                 )
 
                 page_count = 1
                 doc_content = None
+                saved_tag = None
+                saved_lecture_id = None
 
                 # Prova a leggere metadati salvati
                 meta_path = f"{fpath}.meta.json"
@@ -477,49 +596,167 @@ def list_materials(subject_id: int, db: Session = Depends(get_db)):
                             m_data = json.load(mf)
                             page_count = m_data.get("page_count", 1)
                             doc_content = m_data.get("content")
-                    except Exception:
-                        pass
-                elif fname.lower().endswith(".pdf"):
-                    try:
-                        pages = _extract_pdf_pages(Path(fpath))
-                        page_count = len(pages) or 1
-                        text_chunks = [p["text"] for p in pages if p["text"]]
-                        if text_chunks:
-                            doc_content = "\n".join(text_chunks)
-                            _save_material_meta(fpath, page_count, doc_content)
-                    except Exception:
-                        pass
-                elif fname.lower().endswith(".pptx"):
-                    try:
-                        pages = _extract_pptx_pages(Path(fpath))
-                        page_count = len(pages) or 1
-                        text_chunks = [p["text"] for p in pages if p["text"]]
-                        if text_chunks:
-                            doc_content = "\n".join(text_chunks)
-                            _save_material_meta(fpath, page_count, doc_content)
-                    except Exception:
-                        pass
-                elif fname.lower().endswith((".txt", ".md")):
-                    try:
-                        with open(fpath, "r", encoding="utf-8", errors="ignore") as tf:
-                            doc_content = tf.read(4000)
+                            saved_tag = m_data.get("tag") or m_data.get("source_type")
+                            saved_lecture_id = m_data.get("lecture_id")
                     except Exception:
                         pass
 
-                materials.append(MaterialOut(
+                if not doc_content:
+                    if lower_name.endswith(".pdf"):
+                        try:
+                            pages = _extract_pdf_pages(Path(fpath))
+                            page_count = len(pages) or 1
+                            text_chunks = [p["text"] for p in pages if p["text"]]
+                            if text_chunks:
+                                doc_content = "\n".join(text_chunks)
+                                _save_material_meta(fpath, page_count, doc_content, tag="slide", lecture_id=saved_lecture_id)
+                        except Exception:
+                            pass
+                    elif lower_name.endswith(".pptx"):
+                        try:
+                            pages = _extract_pptx_pages(Path(fpath))
+                            page_count = len(pages) or 1
+                            text_chunks = [p["text"] for p in pages if p["text"]]
+                            if text_chunks:
+                                doc_content = "\n".join(text_chunks)
+                                _save_material_meta(fpath, page_count, doc_content, tag="slide", lecture_id=saved_lecture_id)
+                        except Exception:
+                            pass
+                    elif lower_name.endswith(".docx"):
+                        try:
+                            doc_content = _extract_docx_text(Path(fpath))
+                            page_count = 1
+                            _save_material_meta(fpath, 1, doc_content, tag="notes", lecture_id=saved_lecture_id)
+                        except Exception:
+                            pass
+                    elif lower_name.endswith((".txt", ".md")):
+                        try:
+                            with open(fpath, "r", encoding="utf-8", errors="ignore") as tf:
+                                doc_content = tf.read()
+                                _save_material_meta(fpath, 1, doc_content, tag="notes", lecture_id=saved_lecture_id)
+                        except Exception:
+                            pass
+
+                tag = saved_tag or (
+                    "slide" if ftype in ("slide", "pdf")
+                    else "notes" if lower_name.endswith((".md", ".txt", ".docx", ".doc"))
+                    else "audio" if ftype == "audio"
+                    else "doc"
+                )
+
+                # Verifica se esiste una Lezione collegata (per saved_lecture_id, audio_path, titolo o stem)
+                linked_lec = (
+                    (lecture_by_id.get(saved_lecture_id) if saved_lecture_id else None)
+                    or lecture_by_audio.get(lower_name)
+                    or lecture_by_key.get(stem)
+                    or lecture_by_key.get(lower_name)
+                )
+                if not linked_lec:
+                    for lk, lobj in lecture_by_key.items():
+                        if len(lk) >= 5 and (stem.startswith(lk) or lk.startswith(stem)):
+                            linked_lec = lobj
+                            break
+
+                linked_lec_id = None
+                linked_in_quaderno = None
+                if linked_lec:
+                    covered_lecture_ids.add(linked_lec.id)
+                    linked_lec_id = linked_lec.id
+                    linked_in_quaderno = linked_lec.in_quaderno
+
+                    # Auto-heal: se la lezione nel quaderno era salvata con solo lo stub segnaposto
+                    # ("Appunti importati da Materiali") ma ora abbiamo il contenuto vero estratto dal file,
+                    # aggiorna le note complete della lezione nel database!
+                    if doc_content:
+                        placeholder_indicators = ("appunti importati da", "documento importato da")
+                        cur_notes = (linked_lec.processed_notes or "").strip().lower()
+                        if not cur_notes or any(p in cur_notes for p in placeholder_indicators) or (len(cur_notes) < 200 and len(doc_content) > 300):
+                            linked_lec.processed_notes = doc_content
+                            try:
+                                db.commit()
+                                db.refresh(linked_lec)
+                                logger.info(f"[Materials] Aggiornato testo completo ({len(doc_content)} caratteri) per la lezione {linked_lec.id} da '{fname}'")
+                            except Exception as commit_err:
+                                db.rollback()
+                                logger.warning(f"[Materials] Errore aggiornamento note lezione {linked_lec.id}: {commit_err}")
+
+                    if not doc_content and linked_lec.processed_notes:
+                        doc_content = linked_lec.processed_notes
+
+                    if not linked_lec.audio_path:
+                        linked_lec.audio_path = fname
+                        try:
+                            db.commit()
+                        except Exception:
+                            db.rollback()
+
+                    if saved_lecture_id != linked_lec.id:
+                        _save_material_meta(fpath, page_count, doc_content, tag=tag, lecture_id=linked_lec.id)
+
+                try:
+                    file_ts = os.path.getmtime(fpath)
+                    file_date_str = datetime.fromtimestamp(file_ts, tz=_tz.utc).strftime('%d %b %Y')
+                except Exception:
+                    file_ts = 0.0
+                    file_date_str = ""
+
+                dated_materials.append((file_ts, MaterialOut(
                     id=fname,
                     name=fname,
                     type=ftype,
                     size=size_str,
-                    uploadedAt="Caricato",
+                    uploadedAt=file_date_str,
                     pageCount=page_count,
                     content=doc_content,
                     isAutoImported=False,
-                    lecture_id=None,
-                    duration_seconds=None,
-                    in_quaderno=None,
-                    source_type=None,
-                ))
+                    lecture_id=linked_lec_id,
+                    duration_seconds=linked_lec.duration_seconds if linked_lec else None,
+                    in_quaderno=linked_in_quaderno,
+                    source_type=tag,
+                )))
+
+    # 3. Lezioni registrate o create nel Quaderno non coperte da file fisici in uploads
+    for lec in lectures:
+        if lec.id in covered_lecture_ids:
+            continue
+        is_imported = (lec.source_type == "imported")
+        # Se la lezione era di tipo 'imported' e ha un file corrispondente nella cartella uploads,
+        # non duplicarla come card fantasma nei materiali
+        if is_imported and os.path.exists(subj_dir):
+            lec_norm = unicodedata.normalize("NFC", lec.title or "").strip().lower()
+            file_stems = [
+                unicodedata.normalize("NFC", os.path.splitext(f)[0]).strip().lower()
+                for f in os.listdir(subj_dir)
+                if not f.startswith(".")
+            ]
+            if lec_norm in file_stems or any(len(fs) >= 5 and (lec_norm.startswith(fs) or fs.startswith(lec_norm)) for fs in file_stems):
+                continue
+
+        dur_str = f"{int(lec.duration_seconds // 60)}m" if lec.duration_seconds else ("Appunti" if is_imported else "Audio / Appunti")
+        date_str = lec.date.strftime('%d %b %Y') if lec.date else "Lezione"
+        if lec.date:
+            dt_utc = lec.date if lec.date.tzinfo is not None else lec.date.replace(tzinfo=_tz.utc)
+            lec_ts = dt_utc.timestamp()
+        else:
+            lec_ts = 0.0
+        dated_materials.append((lec_ts, MaterialOut(
+            id=f"lecture-{lec.id}",
+            name=lec.title,
+            type="doc" if is_imported else "lecture",
+            size=dur_str,
+            uploadedAt=date_str,
+            pageCount=1,
+            content=lec.processed_notes or lec.raw_transcript,
+            isAutoImported=False,
+            lecture_id=lec.id,
+            duration_seconds=lec.duration_seconds,
+            in_quaderno=lec.in_quaderno,
+            source_type="notes" if is_imported else "audio",
+        )))
+
+    # Ordina tutti i materiali (dopo InfoCorso.md) dal più recente al meno recente
+    dated_materials.sort(key=lambda pair: pair[0], reverse=True)
+    materials.extend(item for _, item in dated_materials)
 
     return materials
 
@@ -579,9 +816,9 @@ def _process_imported_audio_bg(subject_id: int, audio_path: str, orig_filename: 
 
         if not notes:
             notes = (
-                f"# {clean_title} — Appunti di Lezione\n\n"
-                f"> [!NOTE]\n> Registrazione esterna importata nella memoria del corso.\n\n"
-                f"## Trascrizione Integrale\n{transcript if transcript else 'Trascrizione non disponibile o audio privo di parlato.'}"
+                f"# {clean_title}\n\n"
+                "> **Audio importato** — Trascrizione aggiunta alla memoria del corso.\n\n"
+                f"## Trascrizione\n\n{transcript if transcript else 'Trascrizione non disponibile o audio privo di parlato.'}"
             )
 
         # Salva in SQLite solo se la materia esiste ancora
@@ -665,8 +902,20 @@ def upload_material_file(
         raise HTTPException(status_code=400, detail="Percorso non consentito.")
     fpath = str(fpath_obj)
 
-    with open(fpath, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    copied = 0
+    try:
+        with open(fpath, "wb") as buffer:
+            while chunk := file.file.read(1024 * 1024):
+                copied += len(chunk)
+                if copied > MAX_MATERIAL_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="Il file supera il limite di 2 GB.")
+                buffer.write(chunk)
+    except Exception:
+        try:
+            os.remove(fpath)
+        except OSError:
+            pass
+        raise
 
     f_kb = os.path.getsize(fpath) / 1024
     size_str = f"{f_kb / 1024:.1f} MB" if f_kb > 1024 else f"{f_kb:.1f} KB"
@@ -683,6 +932,13 @@ def upload_material_file(
     page_count = 1
 
     # 1. PDF / Slide PPTX: Estrazione per pagina/slide & Indicizzazione LanceDB in background
+    tag = (
+        "slide" if ext in (".pdf", ".ppt", ".pptx", ".key", ".odp")
+        else "notes" if ext in (".md", ".txt", ".docx", ".doc")
+        else "audio" if ext in AUDIO_EXTENSIONS
+        else "doc"
+    )
+
     if ext in (".pdf", ".pptx"):
         try:
             pages = _extract_pdf_pages(fpath_obj) if ext == ".pdf" else _extract_pptx_pages(fpath_obj)
@@ -692,14 +948,51 @@ def upload_material_file(
             fallback_label = f"Documento PDF: {filename}" if ext == ".pdf" else f"Presentazione: {filename}"
             extracted_content = "\n\n".join(pages_text) if pages_text else fallback_label
 
-            _save_material_meta(fpath, page_count, extracted_content)
+            _save_material_meta(fpath, page_count, extracted_content, tag="slide")
 
             if background_tasks is not None:
                 background_tasks.add_task(_index_material_pages_bg, subject_id, filename, filename, pages, "slide", fpath)
             else:
-                _index_material_pages_bg(subject_id, filename, filename, pages, "slide", fpath)
+                threading.Thread(
+                    target=_index_material_pages_bg,
+                    args=(subject_id, filename, filename, pages, "slide", fpath),
+                    daemon=True,
+                ).start()
         except Exception as exc:
             logger.error(f"[Material Upload] Errore estrazione {ext} su '{filename}': {exc}")
+
+    elif ext in (".docx", ".doc"):
+        try:
+            if ext == ".docx":
+                extracted_content = _extract_docx_text(fpath_obj)
+            else:
+                extracted_content = ""
+            page_count = 1
+
+            _save_material_meta(fpath, 1, extracted_content, tag="notes")
+
+            def _index_docx_bg():
+                try:
+                    indexed_chunks = index_material_document(
+                        subject_id=subject_id,
+                        material_id=filename,
+                        title=filename,
+                        content=extracted_content,
+                        source_type="notes",
+                    )
+                    logger.info(f"[Material Upload] Docx '{filename}' indicizzato in LanceDB ({indexed_chunks} chunk).")
+                except Exception as exc:
+                    logger.error(f"[Material Upload] Errore indicizzazione docx '{filename}': {exc}")
+                finally:
+                    from rag import unload_embedding_model
+                    unload_embedding_model()
+
+            if background_tasks is not None:
+                background_tasks.add_task(_index_docx_bg)
+            else:
+                threading.Thread(target=_index_docx_bg, daemon=True).start()
+        except Exception as exc:
+            logger.error(f"[Material Upload] Errore lettura docx '{filename}': {exc}")
 
     elif ext in (".txt", ".md"):
         try:
@@ -707,16 +1000,28 @@ def upload_material_file(
                 extracted_content = tf.read()
             page_count = 1
 
-            _save_material_meta(fpath, 1, extracted_content)
+            _save_material_meta(fpath, 1, extracted_content, tag="notes")
 
-            indexed_chunks = index_material_document(
-                subject_id=subject_id,
-                material_id=filename,
-                title=filename,
-                content=extracted_content,
-                source_type="notes" if ext == ".md" else "material",
-            )
-            logger.info(f"[Material Upload] Testo '{filename}' indicizzato in LanceDB ({indexed_chunks} chunk).")
+            def _index_text_bg():
+                try:
+                    indexed_chunks = index_material_document(
+                        subject_id=subject_id,
+                        material_id=filename,
+                        title=filename,
+                        content=extracted_content,
+                        source_type="notes",
+                    )
+                    logger.info(f"[Material Upload] Testo '{filename}' indicizzato in LanceDB ({indexed_chunks} chunk).")
+                except Exception as exc:
+                    logger.error(f"[Material Upload] Errore indicizzazione testo '{filename}': {exc}")
+                finally:
+                    from rag import unload_embedding_model
+                    unload_embedding_model()
+
+            if background_tasks is not None:
+                background_tasks.add_task(_index_text_bg)
+            else:
+                threading.Thread(target=_index_text_bg, daemon=True).start()
         except Exception as exc:
             logger.error(f"[Material Upload] Errore lettura testo '{filename}': {exc}")
 
@@ -742,7 +1047,77 @@ def upload_material_file(
         lecture_id=None,
         duration_seconds=None,
         in_quaderno=None,
-        source_type=None,
+        source_type=tag,
+    )
+
+
+class MaterialTagUpdate(BaseModel):
+    tag: str
+
+
+@router.patch("/{subject_id}/materials/{filename}/tag", response_model=MaterialOut)
+def update_material_tag(
+    subject_id: int,
+    filename: str,
+    payload: MaterialTagUpdate,
+    db: Session = Depends(get_db)
+):
+    """Aggiorna il tag/classificazione di un materiale (Appunti vs Slide vs Doc)."""
+    valid_tags = {"notes", "slide", "doc", "audio"}
+    new_tag = payload.tag.lower().strip()
+    if new_tag not in valid_tags:
+        raise HTTPException(status_code=400, detail=f"Tag non valido. Usa uno tra: {', '.join(valid_tags)}")
+
+    safe_name, resolved = _resolve_material_file(subject_id, filename, db)
+    meta_path = f"{str(resolved)}.meta.json"
+
+    meta_data = {}
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as mf:
+                meta_data = json.load(mf)
+        except Exception:
+            pass
+
+    meta_data["tag"] = new_tag
+    meta_data["source_type"] = new_tag
+    try:
+        with open(meta_path, "w", encoding="utf-8") as mf:
+            json.dump(meta_data, mf, ensure_ascii=False)
+    except Exception as exc:
+        logger.error(f"[Material Tag] Errore scrittura meta: {exc}")
+
+    # Aggiorna anche i vettori LanceDB per riflettere il nuovo source_type
+    try:
+        from rag import get_lancedb_table
+        tbl = get_lancedb_table()
+        tbl.update(where=f"subject_id = {subject_id} AND source_id = '{safe_name}'", values={"source_type": new_tag})
+    except Exception as exc:
+        logger.debug(f"[Material Tag] Aggiornamento LanceDB source_type saltato: {exc}")
+
+    f_kb = os.path.getsize(str(resolved)) / 1024
+    size_str = f"{f_kb / 1024:.1f} MB" if f_kb > 1024 else f"{f_kb:.1f} KB"
+    ext = resolved.suffix.lower()
+    ftype = (
+        "slide" if ext in (".ppt", ".pptx", ".key", ".odp")
+        else "pdf" if ext == ".pdf"
+        else "audio" if ext in AUDIO_EXTENSIONS
+        else "doc"
+    )
+
+    return MaterialOut(
+        id=safe_name,
+        name=safe_name,
+        type=ftype,
+        size=size_str,
+        uploadedAt="Modificato",
+        pageCount=meta_data.get("page_count", 1),
+        content=meta_data.get("content"),
+        isAutoImported=False,
+        lecture_id=None,
+        duration_seconds=None,
+        in_quaderno=None,
+        source_type=new_tag,
     )
 
 
@@ -797,6 +1172,20 @@ def delete_material_file(subject_id: int, filename: str, db: Session = Depends(g
     # Eliminazione a cascata vettori da LanceDB e compattazione
     delete_material_vectors(subject_id=subject_id, material_id=filename)
     compact_lancedb()
+
+    # Rimuovi anche l'eventuale lezione importata corrispondente nel database
+    try:
+        stem = os.path.splitext(filename)[0].strip()
+        linked_lecs = db.query(Lecture).filter(
+            Lecture.subject_id == subject_id,
+            (Lecture.title == stem) | (Lecture.title == filename) | (Lecture.audio_path == filename)
+        ).all()
+        for l_item in linked_lecs:
+            if l_item.source_type == "imported":
+                db.delete(l_item)
+        db.commit()
+    except Exception as e:
+        logger.warning(f"Errore rimozione lezione importata collegata a '{filename}': {e}")
 
     # Pulizia a cascata dello scope in tutte le sessioni di chat della materia
     try:
@@ -877,6 +1266,18 @@ def get_material_page(subject_id: int, filename: str, page_num: int, db: Session
             title=f"{safe_name} — {target['label']}",
         )
 
+    if ext == ".docx":
+        docx_text = _extract_docx_text(resolved)
+        return MaterialPageOut(
+            filename=safe_name,
+            page=1,
+            page_count=1,
+            kind="markdown",
+            image_data_url=None,
+            text=docx_text,
+            title=safe_name,
+        )
+
     if ext not in _PREVIEWABLE_TEXT_EXTENSIONS:
         raise HTTPException(
             status_code=415,
@@ -884,7 +1285,19 @@ def get_material_page(subject_id: int, filename: str, page_num: int, db: Session
         )
 
     with open(resolved, "r", encoding="utf-8", errors="replace") as tf:
-        raw_text = tf.read(200_000)
+        raw_text = tf.read(500_000)
+
+    if ext == ".md":
+        return MaterialPageOut(
+            filename=safe_name,
+            page=1,
+            page_count=1,
+            kind="markdown",
+            image_data_url=None,
+            text=raw_text,
+            title=safe_name,
+        )
+
     text_pages = _split_text_pages(raw_text, page_chars=2500)
     page_count = len(text_pages)
     if page_num > page_count:

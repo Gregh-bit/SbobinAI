@@ -1,22 +1,28 @@
-import { useState, useMemo, useRef, useEffect } from 'react';
+import { useState, useMemo, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
 import { 
   Calendar, Clock, FileText, Trash2, Sparkles, 
-  ChevronRight, BookOpen, AlignLeft, Plus, Pencil, 
+  ChevronRight, ChevronLeft, BookOpen, AlignLeft, Plus, Pencil, 
   Check, X, Search, HelpCircle, Square, Loader2,
   PanelLeftClose, PanelLeftOpen, AlertTriangle,
   Play, Pause, RotateCcw, Bookmark as BookmarkIcon,
-  FileDown, Music, Share2
+  FileDown, Music, Share2, Settings, Mic, Presentation,
+  FolderInput, GripVertical
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { clsx } from 'clsx';
-import type { Lecture, Subject, DetectedQuestion, Bookmark, KaraokeLine } from '../types';
+import type { Lecture, Subject, DetectedQuestion, Bookmark, KaraokeLine, CourseMaterial } from '../types';
 import { api } from '../lib/api';
 import { useSettings } from '../lib/SettingsContext';
 import { saveTextFile } from '../lib/tauri';
-import MaterialiFinderModal from './MaterialiFinderModal';
 import SegmentedControl from './SegmentedControl';
 import MarkdownContent from './MarkdownContent';
 import { AppleLyricsView } from './AppleLyricsView';
+import { ChapterGenerationSkeleton } from './Skeleton';
+import {
+  liquidMenuVariants,
+  liquidLayoutTransition,
+  liquidPopoverContainerClass,
+} from '../lib/animations';
 
 function normalizeKaraokeLines(raw: any): KaraokeLine[] {
   if (!raw) return [];
@@ -73,8 +79,11 @@ function normalizeKaraokeLines(raw: any): KaraokeLine[] {
 }
 
 interface Props {
+  isActive?: boolean;
   subject: Subject;
+  allSubjects?: Subject[];
   lectures: Lecture[];
+  onMoveLecture?: (lectureId: number, targetSubjectId: number) => Promise<void>;
   onDeletePermanently: (id: number) => Promise<void>;
   onRemoveFromQuadernoOnly: (id: number) => Promise<void>;
   onRestoreToQuaderno: (id: number) => Promise<void>;
@@ -85,6 +94,7 @@ interface Props {
     raw_transcript?: string;
     duration_seconds?: number;
     source_type?: string;
+    audio_path?: string;
   }) => Promise<Lecture>;
   onUpdateLecture: (
     id: number,
@@ -98,6 +108,18 @@ interface Props {
   ) => Promise<Lecture>;
   onOpenAddMaterialModal?: () => void;
   onOpenSettings?: () => void;
+  onStartLive?: () => void;
+  initialLectureId?: number | null;
+  onClearInitialLectureId?: () => void;
+  initialAudioTarget?: {
+    lectureId: number;
+    seconds: number;
+    autoPlay?: boolean;
+    key: number;
+  } | null;
+  onClearInitialAudioTarget?: () => void;
+  onOpenAudioSnippet?: (lectureId: number, seconds: number, autoPlay?: boolean) => void;
+  onOpenCitation?: (sourceId: string, page?: number) => void;
   /** Aggiorna solo lo stato locale di una lezione (il backend ha già persistito la modifica) */
   onLocalLectureUpdate?: (id: number, updater: (lecture: Lecture) => Lecture) => void;
 }
@@ -131,14 +153,24 @@ function formatSeconds(sec: number): string {
 }
 
 
-export default function QuadernoView({ 
+export default function QuadernoView({
+  isActive = true,
   subject, 
+  allSubjects,
   lectures, 
+  initialLectureId,
+  onClearInitialLectureId,
+  initialAudioTarget,
+  onClearInitialAudioTarget,
+  onOpenAudioSnippet,
+  onOpenCitation,
+  onMoveLecture,
   onDeletePermanently,
   onRemoveFromQuadernoOnly,
   onRestoreToQuaderno,
   onAddLecture, 
   onUpdateLecture,
+  onStartLive,
   onOpenAddMaterialModal,
   onOpenSettings,
   onLocalLectureUpdate,
@@ -153,6 +185,24 @@ export default function QuadernoView({
 
   // Second sidebar collapsible state
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+
+  // Menu Sposta in altro corso
+  const [showMoveMenu, setShowMoveMenu] = useState(false);
+  const [isMovingLecture, setIsMovingLecture] = useState(false);
+  const [draggingLectureId, setDraggingLectureId] = useState<number | null>(null);
+  const moveMenuRef = useRef<HTMLDivElement | null>(null);
+
+  // Chiudi il menu sposta se si clicca all'esterno
+  useEffect(() => {
+    if (!showMoveMenu) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (moveMenuRef.current && !moveMenuRef.current.contains(e.target as Node)) {
+        setShowMoveMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [showMoveMenu]);
 
   // Audio Player & Bookmarks State
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
@@ -182,19 +232,213 @@ export default function QuadernoView({
   const [karaokeLines, setKaraokeLines] = useState<KaraokeLine[] | null>(null);
   const [loadingKaraoke, setLoadingKaraoke] = useState(false);
   const [copiedTranscript, setCopiedTranscript] = useState(false);
+  const loadedKaraokeKeyRef = useRef<string | null>(null);
+
+  // Pausa audio e chiudi popover quando si cambia scheda fuori dal Quaderno
+  useEffect(() => {
+    if (isActive) return;
+    setShowAddMenu(false);
+    setShowMoveMenu(false);
+    setShowExportMenu(false);
+    setShowDeleteModal(false);
+    if (audioRef.current && !audioRef.current.paused) {
+      try {
+        audioRef.current.pause();
+      } catch {}
+      setIsPlaying(false);
+    }
+  }, [isActive]);
 
   // State per generazione risposta domanda specifica con IA
   const [answeringQuestionId, setAnsweringQuestionId] = useState<string | null>(null);
+  const [questionAnswerError, setQuestionAnswerError] = useState<string | null>(null);
 
-  // Modal Eliminazione
+  // Menu Eliminazione (bolla Liquid Glass identica a Esporta)
   const [showDeleteModal, setShowDeleteModal] = useState(false);
+  const deleteMenuRef = useRef<HTMLDivElement | null>(null);
 
-  // ── Gestione Tasto ESC per Sottofinestre (Menu Esportazione e Modal Eliminazione) ──
+  // Chiudi il menu elimina se si clicca altrove nello schermo
   useEffect(() => {
-    if (!showDeleteModal && !showExportMenu) return;
+    if (!showDeleteModal) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (deleteMenuRef.current && !deleteMenuRef.current.contains(e.target as Node)) {
+        setShowDeleteModal(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [showDeleteModal]);
+
+  // ── Menu Aggiungi (+) nel Quaderno: Liquid Glass Popover ──
+  const [showAddMenu, setShowAddMenu] = useState(false);
+  const [addMenuMode, setAddMenuMode] = useState<'main' | 'materials'>('main');
+  const [materials, setMaterials] = useState<CourseMaterial[]>([]);
+  const [isCreatingChapter, setIsCreatingChapter] = useState(false);
+  const [importingMaterialId, setImportingMaterialId] = useState<string | null>(null);
+  const [menuHeight, setMenuHeight] = useState<number | undefined>(undefined);
+  const addMenuRef = useRef<HTMLDivElement | null>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
+
+  // Misurazione continua dell'altezza per animazione fluida di espansione/ridimensionamento
+  useLayoutEffect(() => {
+    if (!showAddMenu) {
+      setMenuHeight(undefined);
+      return;
+    }
+    const el = contentRef.current;
+    if (!el) return;
+
+    const rect = el.getBoundingClientRect();
+    if (rect.height > 0) {
+      setMenuHeight(Math.round(rect.height));
+    }
+
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const h = entry.borderBoxSize?.[0]?.blockSize ?? entry.contentRect.height;
+        if (h > 0) {
+          setMenuHeight(Math.round(h));
+        }
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [showAddMenu, addMenuMode, materials.length]);
+
+  // Chiudi il menu aggiungi se si clicca altrove nello schermo
+  useEffect(() => {
+    if (!showAddMenu) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (addMenuRef.current && !addMenuRef.current.contains(e.target as Node)) {
+        setShowAddMenu(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [showAddMenu]);
+
+  // Caricamento materiali del corso per subview del popover
+  const loadMaterials = useCallback(async () => {
+    try {
+      const data = await api.subjects.getMaterials(subject.id);
+      setMaterials(data);
+    } catch {
+      setMaterials([]);
+    }
+  }, [subject.id]);
+
+  useEffect(() => {
+    if (showAddMenu) {
+      loadMaterials();
+    } else {
+      setAddMenuMode('main');
+    }
+  }, [showAddMenu, loadMaterials]);
+
+  // Materiali disponibili (non ancora presenti nel Quaderno)
+  const inQuadernoLectureIds = useMemo(() => {
+    return new Set(lectures.map((l) => l.id));
+  }, [lectures]);
+
+  const inQuadernoTitles = useMemo(() => {
+    return new Set(lectures.map((l) => l.title.toLowerCase().trim()));
+  }, [lectures]);
+
+  const isMaterialInQuaderno = useCallback((mat: CourseMaterial): boolean => {
+    if (mat.lecture_id) {
+      return inQuadernoLectureIds.has(mat.lecture_id);
+    }
+    const cleanName = mat.name.replace(/\.[^/.]+$/, '').toLowerCase().trim();
+    return inQuadernoTitles.has(cleanName) || inQuadernoTitles.has(mat.name.toLowerCase().trim());
+  }, [inQuadernoLectureIds, inQuadernoTitles]);
+
+  const availableMaterials = useMemo(() => {
+    return materials.filter((m) => !isMaterialInQuaderno(m));
+  }, [materials, isMaterialInQuaderno]);
+
+  const handleCreateEmptyChapter = async () => {
+    setIsCreatingChapter(true);
+    try {
+      const created = await onAddLecture({
+        title: 'Nuovo capitolo',
+        processed_notes: '',
+        raw_transcript: '',
+        source_type: 'custom',
+        date: new Date().toISOString(),
+      });
+      setSelectedLectureId(created.id);
+      setEditTitle(created.title || 'Nuovo capitolo');
+      setEditNotes('');
+      setEditTab('editor');
+      setIsEditing(true);
+      setShowAddMenu(false);
+    } catch (err) {
+      console.error('Errore creazione capitolo:', err);
+    } finally {
+      setIsCreatingChapter(false);
+    }
+  };
+
+  const handleImportMaterial = async (mat: CourseMaterial) => {
+    setImportingMaterialId(mat.id);
+    try {
+      if (mat.lecture_id) {
+        pendingRestoreIdRef.current = mat.lecture_id;
+        await onRestoreToQuaderno(mat.lecture_id);
+        setSelectedLectureId(mat.lecture_id);
+      } else {
+        const cleanTitle = mat.name.replace(/\.[^/.]+$/, '');
+        let initialNotes = mat.content;
+        if (!initialNotes || initialNotes.trim().length === 0) {
+          try {
+            const freshList = await api.subjects.getMaterials(subject.id);
+            const freshMat = freshList.find((m) => m.name === mat.name || m.id === mat.id);
+            if (freshMat?.content && freshMat.content.trim().length > 0) {
+              initialNotes = freshMat.content;
+            }
+          } catch (e) {
+            console.warn('[QuadernoView] Impossibile recuperare testo aggiornato:', e);
+          }
+        }
+
+        if (!initialNotes || initialNotes.trim().length === 0) {
+          if (mat.type === 'pdf' || mat.type === 'slide') {
+            initialNotes = `# ${cleanTitle}\n\nDocumento importato da **Materiali** (${mat.type.toUpperCase()}).\n\n- File: \`${mat.name}\`\n- Dimensione: ${mat.size}\n- Indicizzato nella memoria del corso.`;
+          } else {
+            initialNotes = `# ${cleanTitle}\n\nAppunti importati da **Materiali**.`;
+          }
+        }
+        const created = await onAddLecture({
+          title: cleanTitle,
+          processed_notes: initialNotes,
+          audio_path: mat.name,
+          source_type: 'imported',
+          date: new Date().toISOString(),
+          duration_seconds: mat.duration_seconds || undefined,
+        });
+        setMaterials((prev) =>
+          prev.map((m) => (m.id === mat.id || m.name === mat.name ? { ...m, lecture_id: created.id, in_quaderno: true } : m))
+        );
+        setSelectedLectureId(created.id);
+      }
+      setShowAddMenu(false);
+    } catch (err) {
+      console.error('Errore importazione materiale:', err);
+    } finally {
+      setImportingMaterialId(null);
+    }
+  };
+
+  // ── Gestione Tasto ESC per Sottofinestre (Menu Esportazione, Aggiungi e Eliminazione) ──
+  useEffect(() => {
+    if (!showDeleteModal && !showExportMenu && !showAddMenu) return;
     const handleKey = (e: KeyboardEvent) => {
       if (e.key !== 'Escape') return;
       e.stopPropagation();
+      if (showAddMenu) {
+        setShowAddMenu(false);
+        return;
+      }
       if (showDeleteModal) {
         setShowDeleteModal(false);
         return;
@@ -206,10 +450,7 @@ export default function QuadernoView({
     };
     window.addEventListener('keydown', handleKey);
     return () => window.removeEventListener('keydown', handleKey);
-  }, [showDeleteModal, showExportMenu]);
-
-  // Modal Finder Memoria (Materiali -> Quaderno)
-  const [showFinderModal, setShowFinderModal] = useState(false);
+  }, [showDeleteModal, showExportMenu, showAddMenu]);
 
   // Edit Mode per lezione selezionata
   const [isEditing, setIsEditing] = useState(false);
@@ -220,8 +461,57 @@ export default function QuadernoView({
   const [generatingLectureId, setGeneratingLectureId] = useState<number | null>(null);
   const [summaryProgress, setSummaryProgress] = useState<{ stage: string; message: string; progress: number } | null>(null);
   const [summaryError, setSummaryError] = useState<string | null>(null);
+  const [missingLlmNotice, setMissingLlmNotice] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
   const initialNotesRef = useRef<string | null>(null);
+  const pendingRestoreIdRef = useRef<number | null>(null);
+
+  const hasLLM = Boolean(settings.llmDownloaded);
+
+  useEffect(() => {
+    if (hasLLM) {
+      setMissingLlmNotice(false);
+    }
+  }, [hasLLM]);
+
+  useEffect(() => {
+    setMissingLlmNotice(false);
+  }, [selectedLectureId]);
+
+  // Mantiene selectedLectureId sincronizzato a un ID valido in `lectures`
+  // così la digitazione nella barra di ricerca non cambia `selectedLecture` né ri-scarica segnalibri/timestamp
+  useEffect(() => {
+    if (pendingRestoreIdRef.current !== null) {
+      const targetId = pendingRestoreIdRef.current;
+      if (lectures.some((l) => l.id === targetId)) {
+        pendingRestoreIdRef.current = null;
+        if (selectedLectureId !== targetId) {
+          setSelectedLectureId(targetId);
+        }
+        return;
+      }
+      if (selectedLectureId === targetId) {
+        return;
+      }
+    }
+    if (lectures.length === 0) {
+      if (selectedLectureId !== null) {
+        setSelectedLectureId(null);
+      }
+      return;
+    }
+    const exists = selectedLectureId !== null && lectures.some((l) => l.id === selectedLectureId);
+    if (!exists) {
+      setSelectedLectureId(lectures[0].id);
+    }
+  }, [lectures, selectedLectureId]);
+
+  useEffect(() => {
+    if (initialLectureId && lectures.some((l) => l.id === initialLectureId)) {
+      setSelectedLectureId(initialLectureId);
+      onClearInitialLectureId?.();
+    }
+  }, [initialLectureId, lectures, onClearInitialLectureId]);
 
   const isPlaceholderAnswer = (ans?: string) => {
     if (!ans || !ans.trim()) return true;
@@ -238,10 +528,25 @@ export default function QuadernoView({
     );
   };
 
+  const formatQuestionAnswer = (raw?: string): string => {
+    if (!raw) return '';
+    const trimmed = raw.trim();
+    if (
+      trimmed.includes('modello LLM non ancora scaricato') ||
+      trimmed.includes('Risposta non disponibile') ||
+      trimmed.includes('modello LLM non installato') ||
+      trimmed.includes('Scarica un modello LLM dalle Impostazioni')
+    ) {
+      return 'Scarica un modello LLM dalle [[action:settings|Impostazioni]] per attivare le risposte rapide.';
+    }
+    return raw;
+  };
+
   const handleAnswerQuestion = async (questionId: string) => {
     if (!selectedLecture) return;
     const lectureId = selectedLecture.id;
     setAnsweringQuestionId(questionId);
+    setQuestionAnswerError(null);
     try {
       const res = await api.lectures.answerQuestion(lectureId, questionId);
       if (res?.question && onLocalLectureUpdate) {
@@ -265,6 +570,12 @@ export default function QuadernoView({
       }
     } catch (err: any) {
       console.error('Errore risposta domanda con IA:', err);
+      const rawMsg = String(err?.message || '').trim();
+      if (rawMsg.includes('Failed to fetch') || rawMsg.includes('NetworkError') || rawMsg.includes('Load failed')) {
+        setQuestionAnswerError('Il motore di intelligenza artificiale locale non risponde. Verifica nelle Impostazioni che il modello sia attivo e riprova.');
+      } else {
+        setQuestionAnswerError(rawMsg || 'Impossibile generare la risposta alla domanda con l\'IA.');
+      }
     } finally {
       setAnsweringQuestionId(null);
     }
@@ -272,6 +583,27 @@ export default function QuadernoView({
 
   const handleGenerateSummary = async () => {
     if (!selectedLecture) return;
+    if (!hasLLM) {
+      setSummaryError(null);
+      if (
+        !selectedLecture.processed_notes &&
+        Boolean(selectedLecture.raw_transcript?.trim()) &&
+        onOpenSettings
+      ) {
+        setMissingLlmNotice(false);
+        onOpenSettings();
+        return;
+      }
+      setMissingLlmNotice(true);
+      if (activeTab !== 'notes') {
+        setActiveTab('notes');
+      }
+      return;
+    }
+    setMissingLlmNotice(false);
+    if (activeTab !== 'notes') {
+      setActiveTab('notes');
+    }
     const targetLectureId = selectedLecture.id;
     initialNotesRef.current = selectedLecture.processed_notes || null;
     const controller = new AbortController();
@@ -297,9 +629,17 @@ export default function QuadernoView({
         return;
       }
       if (updated?.processed_notes) {
-        await onUpdateLecture(targetLectureId, {
-          processed_notes: updated.processed_notes,
-        });
+        // Il backend ha già salvato processed_notes su SQLite e indicizzato LanceDB: aggiorna solo lo stato locale
+        if (onLocalLectureUpdate) {
+          onLocalLectureUpdate(targetLectureId, (lec) => ({
+            ...lec,
+            processed_notes: updated.processed_notes,
+          }));
+        } else {
+          await onUpdateLecture(targetLectureId, {
+            processed_notes: updated.processed_notes,
+          });
+        }
       }
     } catch (err: any) {
       const isAborted =
@@ -359,7 +699,10 @@ export default function QuadernoView({
       });
   }, [lectures, search, sortOrder]);
 
-  const selectedLecture = lectures.find((l) => l.id === selectedLectureId) || filteredLectures[0] || null;
+  const selectedLecture = useMemo(
+    () => lectures.find((l) => l.id === selectedLectureId) ?? lectures[0] ?? null,
+    [lectures, selectedLectureId]
+  );
 
   // Indica se la sintesi è in corso ESCLUSIVAMENTE per la lezione attualmente visualizzata
   const isGeneratingSummary = Boolean(selectedLecture && generatingLectureId === selectedLecture.id);
@@ -388,6 +731,10 @@ export default function QuadernoView({
   // Carica i segnalibri e pulisce gli errori quando cambia la lezione selezionata
   useEffect(() => {
     setSummaryError(null);
+    setQuestionAnswerError(null);
+    setMissingLlmNotice(false);
+    setShowExportMenu(false);
+    setShowDeleteModal(false);
     initialNotesRef.current = null;
     // Ignora risposte arrivate dopo il cambio di lezione
     let alive = true;
@@ -421,30 +768,63 @@ export default function QuadernoView({
     };
   }, [selectedLecture?.id]);
 
-  // Carica i timestamp parola per parola all'apertura della lezione (Stile Apple Music)
+  // Carica i timestamp parola per parola SOLO quando si apre la scheda Trascrizione (evita calcoli pesanti su 'notes')
   useEffect(() => {
-    setKaraokeLines(null);
     if (!selectedLecture) {
+      setKaraokeLines(null);
+      setLoadingKaraoke(false);
+      loadedKaraokeKeyRef.current = null;
+      return;
+    }
+    const cacheKey = `${selectedLecture.id}:${selectedLecture.raw_transcript?.length ?? 0}`;
+    if (loadedKaraokeKeyRef.current !== cacheKey) {
+      setKaraokeLines(null);
+    }
+    if (!isActive || activeTab !== 'transcript') {
+      return;
+    }
+    if (loadedKaraokeKeyRef.current === cacheKey) {
       setLoadingKaraoke(false);
       return;
     }
     let isMounted = true;
+    let pollTimeout: ReturnType<typeof setTimeout> | null = null;
     setLoadingKaraoke(true);
-    api.lectures.getTimestamps(selectedLecture.id)
-      .then((res: any) => {
-        if (isMounted) {
+
+    const fetchTimestamps = (isInitial: boolean) => {
+      api.lectures.getTimestamps(selectedLecture.id)
+        .then((res: any) => {
+          if (!isMounted) return;
           const parsed = normalizeKaraokeLines(res);
-          setKaraokeLines(parsed.length > 0 ? parsed : null);
-        }
-      })
-      .catch((err) => {
-        console.warn('[Karaoke] Timestamps non disponibili:', err);
-      })
-      .finally(() => {
-        if (isMounted) setLoadingKaraoke(false);
-      });
-    return () => { isMounted = false; };
-  }, [selectedLecture?.id, selectedLecture?.raw_transcript]);
+          if (parsed.length > 0) {
+            setKaraokeLines(parsed);
+            if (res?.cached !== false) {
+              loadedKaraokeKeyRef.current = cacheKey;
+            }
+          }
+          // Se la risposta è una stima iniziale transitoria (cached: false),
+          // rischedula un fetch dopo 3.5s per caricare i timestamp definitivi parola per parola di Whisper
+          if (res?.cached === false && isInitial) {
+            pollTimeout = setTimeout(() => {
+              if (isMounted) fetchTimestamps(false);
+            }, 3500);
+          }
+        })
+        .catch((err) => {
+          console.warn('[Karaoke] Timestamps non disponibili:', err);
+        })
+        .finally(() => {
+          if (isMounted && isInitial) setLoadingKaraoke(false);
+        });
+    };
+
+    fetchTimestamps(true);
+
+    return () => {
+      isMounted = false;
+      if (pollTimeout) clearTimeout(pollTimeout);
+    };
+  }, [isActive, activeTab, selectedLecture?.id, selectedLecture?.raw_transcript]);
 
   const handleSeekAudio = (seconds: number) => {
     if (!selectedLecture?.audio_path || !audioRef.current) return;
@@ -494,6 +874,46 @@ export default function QuadernoView({
       .then(() => setIsPlaying(true))
       .catch(() => {});
   };
+
+  const lastAudioTargetKeyRef = useRef<number | null>(null);
+
+  const handleJumpToAudioSnippet = useCallback(
+    (lectureId: number, seconds: number, autoPlay: boolean = true) => {
+      onOpenAudioSnippet?.(lectureId, seconds, autoPlay);
+      if (selectedLectureId !== lectureId) {
+        setSelectedLectureId(lectureId);
+      }
+      setActiveTab('transcript');
+
+      const applySeek = () => {
+        if (audioRef.current) {
+          audioRef.current.currentTime = Math.max(0, seconds);
+          setCurrentTime(seconds);
+          if (autoPlay) {
+            audioRef.current
+              .play()
+              .then(() => setIsPlaying(true))
+              .catch(() => {});
+          }
+        } else {
+          setCurrentTime(seconds);
+        }
+      };
+
+      setTimeout(applySeek, 80);
+      setTimeout(applySeek, 300);
+    },
+    [selectedLectureId]
+  );
+
+  useEffect(() => {
+    if (!initialAudioTarget || lastAudioTargetKeyRef.current === initialAudioTarget.key) return;
+    lastAudioTargetKeyRef.current = initialAudioTarget.key;
+
+    const { lectureId, seconds, autoPlay } = initialAudioTarget;
+    handleJumpToAudioSnippet(lectureId, seconds, autoPlay !== false);
+    onClearInitialAudioTarget?.();
+  }, [initialAudioTarget, handleJumpToAudioSnippet, onClearInitialAudioTarget]);
 
   const handleSkipAudio = (offsetSeconds: number) => {
     if (!selectedLecture?.audio_path || !audioRef.current) return;
@@ -670,7 +1090,7 @@ export default function QuadernoView({
       >
         <div className="w-72 flex flex-col h-full">
           {/* Top Bar: Search Bar with + and Collapse */}
-          <div className="p-3 border-b border-white/[0.06] flex items-center gap-1.5">
+          <div ref={addMenuRef} className="p-3 border-b border-white/[0.06] flex items-center gap-1.5 relative">
             <div className="relative flex-1 min-w-0">
               <Search size={11} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-white/30" />
               <input
@@ -685,11 +1105,43 @@ export default function QuadernoView({
             {/* Bottone + per importare o aggiungere una lezione */}
             <button
               type="button"
-              onClick={() => setShowFinderModal(true)}
-              className="w-7 h-7 rounded-xl flex items-center justify-center liquid-glass hover:bg-white/[0.14] text-white/80 hover:text-white border border-white/[0.12] transition-all cursor-pointer flex-shrink-0"
-              title="Importa o aggiungi lezione nel Quaderno"
+              onClick={() => {
+                setShowAddMenu((prev) => !prev);
+                if (showAddMenu) setAddMenuMode('main');
+              }}
+              className={clsx(
+                "w-7 h-7 rounded-xl flex items-center justify-center transition-all cursor-pointer flex-shrink-0 shadow-liquid-sm select-none",
+                showAddMenu
+                  ? "bg-white/[0.22] text-white border border-white/30 shadow-liquid-md scale-105"
+                  : "liquid-glass hover:bg-white/[0.14] text-white/80 hover:text-white border border-white/[0.12] hover:scale-105"
+              )}
+              title={showAddMenu ? "Chiudi menu" : "Aggiungi o importa nel Quaderno"}
             >
-              <Plus size={13} strokeWidth={2.2} />
+              <AnimatePresence mode="wait" initial={false}>
+                {showAddMenu ? (
+                  <motion.span
+                    key="close-add"
+                    initial={{ rotate: -90, opacity: 0, scale: 0.6 }}
+                    animate={{ rotate: 0, opacity: 1, scale: 1 }}
+                    exit={{ rotate: 90, opacity: 0, scale: 0.6 }}
+                    transition={{ duration: 0.16 }}
+                    className="flex items-center justify-center"
+                  >
+                    <X size={13} strokeWidth={2.4} className="text-white" />
+                  </motion.span>
+                ) : (
+                  <motion.span
+                    key="plus-add"
+                    initial={{ rotate: 90, opacity: 0, scale: 0.6 }}
+                    animate={{ rotate: 0, opacity: 1, scale: 1 }}
+                    exit={{ rotate: -90, opacity: 0, scale: 0.6 }}
+                    transition={{ duration: 0.16 }}
+                    className="flex items-center justify-center"
+                  >
+                    <Plus size={13} strokeWidth={2.2} className="text-white/90" />
+                  </motion.span>
+                )}
+              </AnimatePresence>
             </button>
 
             {/* Bottone per ritirare la barra laterale */}
@@ -701,6 +1153,194 @@ export default function QuadernoView({
             >
               <PanelLeftClose size={13} strokeWidth={1.75} />
             </button>
+
+            {/* Popover Liquid Glass ad espansione fluida (allineato all'indice, zero sovrapposizione laterale) */}
+            <AnimatePresence>
+              {showAddMenu && (
+                <motion.div
+                  variants={liquidMenuVariants}
+                  initial="initial"
+                  animate="animate"
+                  exit="exit"
+                  style={{ transformOrigin: 'calc(100% - 46px) top' }}
+                  className={clsx(
+                    "absolute left-3 right-3 top-[calc(100%+6px)] z-50 text-left overflow-hidden",
+                    liquidPopoverContainerClass
+                  )}
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  {/* Contenitore interno ad altezza animata fluida */}
+                  <motion.div
+                    animate={{ height: menuHeight ?? 'auto' }}
+                    transition={liquidLayoutTransition}
+                    className="overflow-hidden"
+                  >
+                    <div ref={contentRef}>
+                      <AnimatePresence mode="wait" initial={false}>
+                        {addMenuMode === 'main' ? (
+                          <motion.div
+                            key="main"
+                            initial={{ opacity: 0, x: -8 }}
+                            animate={{ opacity: 1, x: 0 }}
+                            exit={{ opacity: 0, x: -8 }}
+                            transition={{ duration: 0.14 }}
+                            className="space-y-0.5"
+                          >
+                            {/* 1. Nuovo appunto vuoto */}
+                            <button
+                              type="button"
+                              onClick={() => void handleCreateEmptyChapter()}
+                              disabled={isCreatingChapter}
+                              className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-2xl text-left hover:bg-white/[0.08] active:bg-white/[0.12] transition-colors cursor-pointer group disabled:opacity-40"
+                            >
+                              <div className="w-7 h-7 rounded-xl bg-emerald-500/20 border border-emerald-400/30 flex items-center justify-center text-emerald-300 flex-shrink-0 group-hover:scale-105 transition-transform">
+                                {isCreatingChapter ? (
+                                  <Loader2 size={13} className="animate-spin text-emerald-300" />
+                                ) : (
+                                  <Pencil size={13} />
+                                )}
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                <div className="text-[12px] font-semibold text-white/95 leading-tight">Nuovo appunto</div>
+                                <div className="text-[10px] text-white/45 leading-none mt-0.5">Crea e scrivi subito</div>
+                              </div>
+                            </button>
+
+                            {/* 2. Da Materiali */}
+                            <button
+                              type="button"
+                              onClick={() => setAddMenuMode('materials')}
+                              className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-2xl text-left hover:bg-white/[0.08] active:bg-white/[0.12] transition-colors cursor-pointer group"
+                            >
+                              <div className="w-7 h-7 rounded-xl bg-sky-500/20 border border-sky-400/30 flex items-center justify-center text-sky-300 flex-shrink-0 group-hover:scale-105 transition-transform">
+                                <BookOpen size={13} />
+                              </div>
+                              <div className="min-w-0 flex-1">
+                                <div className="text-[12px] font-semibold text-white/95 leading-tight">Da Materiali</div>
+                                <div className="text-[10px] text-white/45 leading-none mt-0.5">
+                                  Importa file del corso
+                                </div>
+                              </div>
+                              <ChevronRight size={13} className="text-white/30 group-hover:text-white/80 group-hover:translate-x-0.5 transition-all" />
+                            </button>
+
+                            {/* 3. Registra lezione */}
+                            {onStartLive && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setShowAddMenu(false);
+                                  onStartLive();
+                                }}
+                                className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-2xl text-left hover:bg-white/[0.08] active:bg-white/[0.12] transition-colors cursor-pointer group"
+                              >
+                                <div className="w-7 h-7 rounded-xl bg-rose-500/20 border border-rose-400/30 flex items-center justify-center text-rose-300 flex-shrink-0 group-hover:scale-105 transition-transform">
+                                  <Mic size={13} />
+                                </div>
+                                <div className="min-w-0 flex-1">
+                                  <div className="text-[12px] font-semibold text-white/95 leading-tight">Registra lezione</div>
+                                  <div className="text-[10px] text-white/45 leading-none mt-0.5">Audio e trascrizione live</div>
+                                </div>
+                              </button>
+                            )}
+                          </motion.div>
+                        ) : (
+                          /* Subview: Da Materiali */
+                          <motion.div
+                            key="materials"
+                            initial={{ opacity: 0, x: 8 }}
+                            animate={{ opacity: 1, x: 0 }}
+                            exit={{ opacity: 0, x: 8 }}
+                            transition={{ duration: 0.14 }}
+                            className="space-y-1"
+                          >
+                            <div className="flex items-center justify-between px-1 py-0.5 border-b border-white/[0.08] pb-1.5 mb-1">
+                              <button
+                                type="button"
+                                onClick={() => setAddMenuMode('main')}
+                                className="flex items-center gap-1 text-[11px] font-medium text-white/70 hover:text-white transition-colors cursor-pointer -ml-1 px-1.5 py-1 rounded-xl hover:bg-white/[0.08]"
+                              >
+                                <ChevronLeft size={13} />
+                                <span>Indietro</span>
+                              </button>
+                            </div>
+
+                            <div className="max-h-56 overflow-y-auto space-y-0.5 pr-0.5">
+                              {availableMaterials.length === 0 ? (
+                                <div className="py-6 px-3 text-center space-y-1">
+                                  <Check size={15} className="mx-auto text-emerald-400/80" />
+                                  <div className="text-[12px] font-semibold text-white/90">Tutto incluso</div>
+                                  <p className="text-[10px] text-white/40 leading-tight">
+                                    Tutti i file di questo corso sono già nel Quaderno.
+                                  </p>
+                                </div>
+                              ) : (
+                                availableMaterials.map((mat) => {
+                                  const isImporting = importingMaterialId === mat.id;
+                                  const cleanName = mat.name.replace(/\.[^/.]+$/, '');
+                                  const isAudio = mat.type === 'lecture' || mat.type === 'audio';
+                                  const isSlide = mat.type === 'pdf' || mat.type === 'slide';
+
+                                  return (
+                                    <button
+                                      key={mat.id}
+                                      type="button"
+                                      onClick={() => void handleImportMaterial(mat)}
+                                      disabled={isImporting}
+                                      className="w-full flex items-center gap-2 px-2 py-1.5 rounded-xl text-left hover:bg-white/[0.08] active:bg-white/[0.12] transition-colors cursor-pointer group disabled:opacity-50"
+                                    >
+                                      <div className="w-5 h-5 rounded-md bg-white/[0.06] border border-white/[0.08] flex items-center justify-center text-white/60 flex-shrink-0 group-hover:text-white">
+                                        {isImporting ? (
+                                          <Loader2 size={10} className="animate-spin text-white" />
+                                        ) : isAudio ? (
+                                          <Mic size={10} className="text-rose-400" />
+                                        ) : isSlide ? (
+                                          <Presentation size={10} className="text-amber-400" />
+                                        ) : (
+                                          <FileText size={10} className="text-sky-400" />
+                                        )}
+                                      </div>
+                                      <div className="min-w-0 flex-1">
+                                        <div className="text-[11px] font-medium text-white/90 truncate group-hover:text-white">
+                                          {cleanName}
+                                        </div>
+                                        <div className="text-[9.5px] text-white/40 leading-none mt-0.5 truncate">
+                                          {isAudio
+                                            ? mat.duration_seconds
+                                              ? formatSeconds(mat.duration_seconds)
+                                              : 'Audio lezione'
+                                            : mat.size || 'Documento'}
+                                        </div>
+                                      </div>
+                                      <Plus size={11} className="text-white/20 group-hover:text-white/70 flex-shrink-0" />
+                                    </button>
+                                  );
+                                })
+                              )}
+                            </div>
+
+                            {onOpenAddMaterialModal && (
+                              <div className="pt-1.5 border-t border-white/[0.06] mt-1">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setShowAddMenu(false);
+                                    onOpenAddMaterialModal();
+                                  }}
+                                  className="w-full text-center text-[10px] text-white/50 hover:text-white py-1 transition-colors cursor-pointer rounded-lg hover:bg-white/[0.04]"
+                                >
+                                  + Carica nuovo file in Materiali
+                                </button>
+                              </div>
+                            )}
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+                    </div>
+                  </motion.div>
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
 
           {/* Lectures List */}
@@ -710,8 +1350,11 @@ export default function QuadernoView({
                 <BookOpen size={20} strokeWidth={1.5} className="mx-auto text-white/15 mb-2" />
                 <p className="text-xs text-white/40">Nessuna lezione in {subject.name}</p>
                 <button
-                  onClick={() => setShowFinderModal(true)}
-                  className="mt-3 text-[11px] text-white/60 hover:text-white underline underline-offset-4"
+                  onClick={() => {
+                    setShowAddMenu(true);
+                    setAddMenuMode('materials');
+                  }}
+                  className="mt-3 text-[11px] text-white/60 hover:text-white underline underline-offset-4 cursor-pointer"
                 >
                   + Importa da Materiali
                 </button>
@@ -720,28 +1363,54 @@ export default function QuadernoView({
               filteredLectures.map((l) => {
                 const isSelected = selectedLecture?.id === l.id;
                 const isImported = l.source_type === 'imported';
+                const isDragging = draggingLectureId === l.id;
 
                 return (
                   <div
                     key={l.id}
+                    draggable={!isEditing}
+                    onDragStart={(e) => {
+                      e.dataTransfer.setData(
+                        'application/json',
+                        JSON.stringify({
+                          type: 'sbobinai-lecture',
+                          lectureId: l.id,
+                          lectureTitle: l.title,
+                          sourceSubjectId: subject.id,
+                        })
+                      );
+                      e.dataTransfer.setData('text/plain', `lecture:${l.id}`);
+                      e.dataTransfer.effectAllowed = 'move';
+                      setDraggingLectureId(l.id);
+                    }}
+                    onDragEnd={() => {
+                      setDraggingLectureId(null);
+                    }}
                     onClick={() => {
+                      pendingRestoreIdRef.current = null;
                       setSelectedLectureId(l.id);
                       setIsEditing(false);
                     }}
+                    title="Clicca per aprire. Trascina sul nome di un altro corso nella barra laterale a sinistra per spostarla"
                     className={clsx(
-                      'p-3 rounded-2xl cursor-pointer transition-all duration-150 border text-left group',
-                      isSelected
+                      'p-3 rounded-2xl cursor-pointer transition-colors duration-150 border text-left group select-none',
+                      isDragging
+                        ? 'opacity-35 scale-[0.98] border-dashed border-blue-400/50 bg-blue-500/10 cursor-grabbing'
+                        : isSelected
                         ? 'bg-white/[0.12] border-white/[0.16] shadow-liquid-sm'
                         : 'bg-transparent border-transparent hover:bg-white/[0.04] hover:border-white/[0.06]'
                     )}
                   >
                     <div className="flex items-start justify-between gap-2">
-                      <h4 className={clsx(
-                        'text-xs font-semibold tracking-tight leading-snug line-clamp-1',
-                        isSelected ? 'text-white' : 'text-white/80 group-hover:text-white'
-                      )}>
-                        {l.title}
-                      </h4>
+                      <div className="flex items-center gap-1.5 min-w-0 flex-1">
+                        <GripVertical size={11} className="text-white/20 opacity-0 group-hover:opacity-60 transition-opacity flex-shrink-0 cursor-grab" />
+                        <h4 className={clsx(
+                          'text-xs font-semibold tracking-tight leading-snug line-clamp-1',
+                          isSelected ? 'text-white' : 'text-white/80 group-hover:text-white'
+                        )}>
+                          {l.title}
+                        </h4>
+                      </div>
                       <ChevronRight size={12} className={clsx(
                         'flex-shrink-0 transition-opacity',
                         isSelected ? 'text-white/60' : 'opacity-0 group-hover:opacity-40'
@@ -788,10 +1457,10 @@ export default function QuadernoView({
                     type="button"
                     onClick={() => setIsSidebarCollapsed(false)}
                     title="Mostra indice lezioni"
-                    className="p-1.5 mt-0.5 rounded-xl liquid-glass-subtle hover:bg-white/[0.10] text-white/60 hover:text-white border border-white/[0.10] transition-all cursor-pointer flex items-center gap-1.5 flex-shrink-0 shadow-liquid-sm"
+                    aria-label="Mostra indice lezioni"
+                    className="w-8 h-8 rounded-full liquid-glass hover:bg-white/[0.14] text-white/70 hover:text-white border border-white/[0.14] transition-all cursor-pointer flex items-center justify-center flex-shrink-0 shadow-liquid-sm"
                   >
                     <PanelLeftOpen size={14} strokeWidth={1.75} />
-                    <span className="text-[11px] font-medium hidden sm:inline">Indice</span>
                   </button>
                 )}
                 <div className="min-w-0 flex-1">
@@ -863,44 +1532,181 @@ export default function QuadernoView({
                 ) : (
                   <>
                     {selectedLecture.raw_transcript && (
-                      isGeneratingSummary ? (
-                        <button
-                          type="button"
-                          onClick={handleCancelSummary}
-                          className="h-8 px-3.5 rounded-full bg-red-500/20 hover:bg-red-500/30 text-xs font-semibold text-red-300 border border-red-500/40 transition-all flex items-center gap-1.5 cursor-pointer shadow-liquid-sm animate-pulse"
-                          title="Interrompi subito l'inferenza IA e libera le risorse del computer"
-                        >
-                          <Square size={10} fill="currentColor" strokeWidth={0} />
-                          <span>Interrompi</span>
-                        </button>
-                      ) : (
-                        <button
-                          type="button"
-                          onClick={handleGenerateSummary}
-                          className="h-8 px-3.5 rounded-full liquid-glass-pill hover:bg-white/[0.14] text-xs font-medium text-white/90 border border-white/[0.14] transition-all flex items-center gap-1.5 cursor-pointer shadow-liquid-sm"
-                          title="Genera o rigenera la sintesi strutturata del Quaderno"
-                        >
-                          <Sparkles size={12} strokeWidth={2} className="text-amber-300" />
-                          <span>Sintesi IA</span>
-                        </button>
-                      )
+                      <div className="inline-flex">
+                        <AnimatePresence mode="popLayout" initial={false}>
+                          {isGeneratingSummary ? (
+                            <motion.button
+                              key="stop-summary"
+                              type="button"
+                              onClick={handleCancelSummary}
+                              initial={{ opacity: 0, scale: 0.92 }}
+                              animate={{ opacity: 1, scale: 1 }}
+                              exit={{ opacity: 0, scale: 0.92 }}
+                              transition={{ duration: 0.16, ease: 'easeOut' }}
+                              className="h-8 px-3.5 rounded-full bg-red-500/20 hover:bg-red-500/30 text-xs font-semibold text-red-200 hover:text-white border border-red-500/35 transition-colors flex items-center gap-1.5 cursor-pointer shadow-liquid-sm whitespace-nowrap"
+                              title="Interrompi subito l'inferenza IA e libera le risorse del computer"
+                            >
+                              <span
+                                aria-hidden="true"
+                                className="w-1.5 h-1.5 rounded-full bg-red-400 animate-pulse flex-shrink-0"
+                              />
+                              <Square size={10} fill="currentColor" strokeWidth={0} />
+                              <span>Interrompi</span>
+                            </motion.button>
+                          ) : (
+                            <motion.button
+                              key="start-summary"
+                              type="button"
+                              onClick={handleGenerateSummary}
+                              initial={{ opacity: 0, scale: 0.92 }}
+                              animate={{ opacity: hasLLM ? 1 : 0.75, scale: 1 }}
+                              whileHover={{ opacity: 1 }}
+                              exit={{ opacity: 0, scale: 0.92 }}
+                              transition={{ duration: 0.16, ease: 'easeOut' }}
+                              className={clsx(
+                                'h-8 px-3.5 rounded-full liquid-glass-pill hover:bg-white/[0.14] text-xs font-medium text-white/90 border border-white/[0.14] transition-colors flex items-center gap-1.5 cursor-pointer shadow-liquid-sm whitespace-nowrap'
+                              )}
+                              title={
+                                hasLLM
+                                  ? 'Genera o rigenera la sintesi strutturata del Quaderno'
+                                  : 'Richiede un modello LLM — clicca per configurare'
+                              }
+                            >
+                              <Sparkles size={12} strokeWidth={2} className="text-amber-300" />
+                              <span>Sintesi IA</span>
+                            </motion.button>
+                          )}
+                        </AnimatePresence>
+                      </div>
                     )}
 
-                    <button
-                      type="button"
-                      onClick={startEditing}
-                      className="h-8 px-3.5 rounded-full liquid-glass-pill hover:bg-white/[0.14] text-xs font-medium text-white/90 border border-white/[0.14] transition-all flex items-center gap-1.5 cursor-pointer shadow-liquid-sm"
-                      title="Modifica appunti o titolo"
-                    >
-                      <Pencil size={12} strokeWidth={2} />
-                      <span>Modifica</span>
-                    </button>
+                    <div className="inline-flex">
+                      <button
+                        type="button"
+                        onClick={startEditing}
+                        className="h-8 px-3.5 rounded-full liquid-glass-pill hover:bg-white/[0.14] text-xs font-medium text-white/90 border border-white/[0.14] transition-colors flex items-center gap-1.5 cursor-pointer shadow-liquid-sm"
+                        title="Modifica appunti o titolo"
+                      >
+                        <Pencil size={12} strokeWidth={2} />
+                        <span>Modifica</span>
+                      </button>
+                    </div>
+
+                    {/* Bottone Sposta con Morphing in 'X' & Pannello a Bolla Liquid Glass */}
+                    {allSubjects && allSubjects.length > 1 && onMoveLecture && (
+                      <div className="relative" ref={moveMenuRef}>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setShowDeleteModal(false);
+                            setShowExportMenu(false);
+                            setShowMoveMenu((prev) => !prev);
+                          }}
+                          className={clsx(
+                            "w-8 h-8 rounded-full flex items-center justify-center transition-all cursor-pointer shadow-liquid-sm select-none",
+                            showMoveMenu
+                              ? "bg-white/[0.25] text-white border border-white/40 shadow-liquid-md scale-105"
+                              : "liquid-glass-pill hover:bg-white/[0.18] text-white/90 border border-white/[0.14] hover:scale-105"
+                          )}
+                          title={showMoveMenu ? "Chiudi menu" : "Sposta in un altro corso"}
+                        >
+                          <AnimatePresence mode="wait" initial={false}>
+                            {showMoveMenu ? (
+                              <motion.span
+                                key="close"
+                                initial={{ rotate: -90, opacity: 0, scale: 0.6 }}
+                                animate={{ rotate: 0, opacity: 1, scale: 1 }}
+                                exit={{ rotate: 90, opacity: 0, scale: 0.6 }}
+                                transition={{ duration: 0.16 }}
+                                className="flex items-center justify-center"
+                              >
+                                <X size={14} strokeWidth={2.5} className="text-white" />
+                              </motion.span>
+                            ) : (
+                              <motion.span
+                                key="move"
+                                initial={{ rotate: 90, opacity: 0, scale: 0.6 }}
+                                animate={{ rotate: 0, opacity: 1, scale: 1 }}
+                                exit={{ rotate: -90, opacity: 0, scale: 0.6 }}
+                                transition={{ duration: 0.16 }}
+                                className="flex items-center justify-center"
+                              >
+                                <FolderInput size={13} strokeWidth={2} className="text-white/90" />
+                              </motion.span>
+                            )}
+                          </AnimatePresence>
+                        </button>
+
+                        {/* Pannello a Bolla Liquid Glass */}
+                        <AnimatePresence>
+                          {showMoveMenu && (
+                            <motion.div
+                              variants={liquidMenuVariants}
+                              initial="initial"
+                              animate="animate"
+                              exit="exit"
+                              style={{ transformOrigin: 'top right' }}
+                              className={clsx("absolute right-0 top-11 w-64 space-y-1.5 p-1.5", liquidPopoverContainerClass)}
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <div className="px-3 py-1.5 text-[10px] font-semibold text-white/45 uppercase tracking-wider">
+                                Sposta nel corso
+                              </div>
+                              <div className="max-h-56 overflow-y-auto space-y-1">
+                                {allSubjects
+                                  .filter((s) => s.id !== subject.id)
+                                  .map((s) => (
+                                    <button
+                                      key={s.id}
+                                      type="button"
+                                      disabled={isMovingLecture}
+                                      onClick={async () => {
+                                        if (!selectedLecture) return;
+                                        const movedId = selectedLecture.id;
+                                        const nextCandidate = lectures.find((l) => l.id !== movedId);
+                                        setSelectedLectureId(nextCandidate ? nextCandidate.id : null);
+                                        setShowMoveMenu(false);
+                                        setIsMovingLecture(true);
+                                        try {
+                                          await onMoveLecture(movedId, s.id);
+                                          setExportNotice(`Spostata in "${s.name}"`);
+                                          setTimeout(() => setExportNotice(null), 3000);
+                                        } catch (err) {
+                                          console.error('Errore spostamento:', err);
+                                          setSelectedLectureId(movedId);
+                                        } finally {
+                                          setIsMovingLecture(false);
+                                        }
+                                      }}
+                                      className="w-full px-3 py-2 rounded-2xl text-left text-xs font-medium text-white/90 hover:text-white hover:bg-white/[0.12] transition-colors flex items-center gap-2.5 cursor-pointer disabled:opacity-50"
+                                    >
+                                      <span
+                                        className="w-2.5 h-2.5 rounded-full flex-shrink-0"
+                                        style={{ backgroundColor: s.color }}
+                                      />
+                                      <span className="block truncate font-semibold flex-1">
+                                        {s.name}
+                                      </span>
+                                      <span className="text-[10px] text-white/40 font-mono">
+                                        {s.lecture_count || 0} lez.
+                                      </span>
+                                    </button>
+                                  ))}
+                              </div>
+                            </motion.div>
+                          )}
+                        </AnimatePresence>
+                      </div>
+                    )}
 
                     {/* Bottone Esporta con Morphing in 'X' & Pannello a Bolla Liquid Glass */}
                     <div className="relative" ref={exportMenuRef}>
                       <button
                         type="button"
-                        onClick={() => setShowExportMenu(!showExportMenu)}
+                        onClick={() => {
+                          setShowDeleteModal(false);
+                          setShowExportMenu((prev) => !prev);
+                        }}
                         className={clsx(
                           "w-8 h-8 rounded-full flex items-center justify-center transition-all cursor-pointer shadow-liquid-sm select-none",
                           showExportMenu
@@ -940,23 +1746,12 @@ export default function QuadernoView({
                       <AnimatePresence>
                         {showExportMenu && (
                           <motion.div 
-                            initial={{ opacity: 0, scale: 0.15, y: -16, filter: 'blur(10px)' }}
-                            animate={{ 
-                              opacity: 1, 
-                              scale: 1, 
-                              y: 0, 
-                              filter: 'blur(0px)',
-                              transition: { type: 'spring', damping: 22, stiffness: 340, mass: 0.75 } 
-                            }}
-                            exit={{ 
-                              opacity: 0, 
-                              scale: 0.25, 
-                              y: -12, 
-                              filter: 'blur(8px)',
-                              transition: { duration: 0.16, ease: 'easeIn' } 
-                            }}
+                            variants={liquidMenuVariants}
+                            initial="initial"
+                            animate="animate"
+                            exit="exit"
                             style={{ transformOrigin: 'top right' }}
-                            className="absolute right-0 top-11 w-72 rounded-3xl bg-[#13141c]/95 backdrop-blur-3xl border border-white/[0.20] shadow-[0_24px_60px_rgba(0,0,0,0.85),0_0_0_1px_rgba(255,255,255,0.08)] p-2 z-50 space-y-1.5"
+                            className={clsx("absolute right-0 top-11 w-72 space-y-1.5", liquidPopoverContainerClass)}
                             onClick={(e) => e.stopPropagation()}
                           >
                             <button
@@ -979,8 +1774,8 @@ export default function QuadernoView({
                               >
                                 <FileText size={15} className="text-emerald-300 flex-shrink-0" />
                                 <div className="min-w-0">
-                                  <span className="block truncate font-semibold">Solo Trascrizione (.txt)</span>
-                                  <span className="block text-[10px] text-white/45">Testo integrale sbobinato</span>
+                                  <span className="block truncate font-semibold">Trascrizione</span>
+                                  <span className="block text-[10px] text-white/45">Trascrizione integrale</span>
                                 </div>
                               </button>
                             )}
@@ -993,8 +1788,7 @@ export default function QuadernoView({
                               >
                                 <Music size={15} className="text-cyan-300 flex-shrink-0" />
                                 <div className="min-w-0">
-                                  <span className="block truncate font-semibold">File Audio Registrato</span>
-                                  <span className="block text-[10px] text-white/45">Traccia audio della lezione</span>
+                                  <span className="block truncate font-semibold">Registrazione</span>
                                 </div>
                               </button>
                             )}
@@ -1009,7 +1803,7 @@ export default function QuadernoView({
                               <BookOpen size={15} className="text-blue-300 flex-shrink-0" />
                               <div className="min-w-0">
                                 <span className="block truncate font-semibold">Intero Quaderno (.md)</span>
-                                <span className="block text-[10px] text-white/45">{lectures.length} lezioni del corso</span>
+                                <span className="block text-[10px] text-white/45">{lectures.length} {lectures.length === 1 ? 'lezione' : 'lezioni'} del corso</span>
                               </div>
                             </button>
                           </motion.div>
@@ -1017,14 +1811,103 @@ export default function QuadernoView({
                       </AnimatePresence>
                     </div>
 
-                    <button
-                      type="button"
-                      onClick={() => setShowDeleteModal(true)}
-                      title="Rimuovi lezione"
-                      className="w-8 h-8 rounded-full flex items-center justify-center text-white/40 hover:text-red-400 hover:bg-red-500/10 border border-transparent hover:border-red-500/20 transition-all cursor-pointer"
-                    >
-                      <Trash2 size={14} strokeWidth={1.75} />
-                    </button>
+                    {/* Bottone Elimina con Morphing in 'X' & Pannello a Bolla Liquid Glass (identico a Esporta) */}
+                    <div className="relative" ref={deleteMenuRef}>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowExportMenu(false);
+                          setShowDeleteModal((prev) => !prev);
+                        }}
+                        title={showDeleteModal ? 'Chiudi menu' : 'Rimuovi lezione'}
+                        className={clsx(
+                          'w-8 h-8 rounded-full flex items-center justify-center transition-all cursor-pointer shadow-liquid-sm select-none',
+                          showDeleteModal
+                            ? 'bg-red-500/25 text-red-200 border border-red-400/45 shadow-liquid-md scale-105'
+                            : 'bg-red-500/[0.12] hover:bg-red-500/20 text-red-400 hover:text-red-300 border border-red-500/25 hover:border-red-400/40 hover:scale-105'
+                        )}
+                      >
+                        <AnimatePresence mode="wait" initial={false}>
+                          {showDeleteModal ? (
+                            <motion.span
+                              key="close-delete"
+                              initial={{ rotate: -90, opacity: 0, scale: 0.6 }}
+                              animate={{ rotate: 0, opacity: 1, scale: 1 }}
+                              exit={{ rotate: 90, opacity: 0, scale: 0.6 }}
+                              transition={{ duration: 0.16 }}
+                              className="flex items-center justify-center"
+                            >
+                              <X size={14} strokeWidth={2.5} className="text-red-200" />
+                            </motion.span>
+                          ) : (
+                            <motion.span
+                              key="trash"
+                              initial={{ rotate: 90, opacity: 0, scale: 0.6 }}
+                              animate={{ rotate: 0, opacity: 1, scale: 1 }}
+                              exit={{ rotate: -90, opacity: 0, scale: 0.6 }}
+                              transition={{ duration: 0.16 }}
+                              className="flex items-center justify-center"
+                            >
+                              <Trash2 size={14} strokeWidth={1.75} />
+                            </motion.span>
+                          )}
+                        </AnimatePresence>
+                      </button>
+
+                      <AnimatePresence>
+                        {showDeleteModal && (
+                          <motion.div
+                            variants={liquidMenuVariants}
+                            initial="initial"
+                            animate="animate"
+                            exit="exit"
+                            style={{ transformOrigin: 'top right' }}
+                            className={clsx("absolute right-0 top-11 w-72 space-y-1.5", liquidPopoverContainerClass)}
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                try {
+                                  await onRemoveFromQuadernoOnly(selectedLecture.id);
+                                  setShowDeleteModal(false);
+                                } catch (err) {
+                                  console.error('Impossibile rimuovere dal quaderno:', err);
+                                }
+                              }}
+                              className="w-full px-3 py-2 rounded-2xl text-left text-xs font-medium text-white/90 hover:text-white hover:bg-white/[0.12] transition-colors flex items-center gap-2.5 cursor-pointer"
+                            >
+                              <BookOpen size={15} className="text-white/65 flex-shrink-0" />
+                              <div className="min-w-0">
+                                <span className="block truncate font-semibold">Rimuovi dal Quaderno</span>
+                                <span className="block text-[10px] text-white/45">Resta salvata nei Materiali</span>
+                              </div>
+                            </button>
+
+                            <div className="h-px bg-white/[0.10] my-1" />
+
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                try {
+                                  await onDeletePermanently(selectedLecture.id);
+                                  setShowDeleteModal(false);
+                                } catch (err) {
+                                  console.error('Impossibile eliminare la lezione:', err);
+                                }
+                              }}
+                              className="w-full px-3 py-2 rounded-2xl text-left text-xs font-medium text-red-300 hover:text-red-200 hover:bg-red-500/15 transition-colors flex items-center gap-2.5 cursor-pointer"
+                            >
+                              <Trash2 size={15} className="text-red-400 flex-shrink-0" />
+                              <div className="min-w-0">
+                                <span className="block truncate font-semibold">Elimina definitivamente</span>
+                                <span className="block text-[10px] text-red-300/60">Cancella audio, testo e appunti</span>
+                              </div>
+                            </button>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+                    </div>
                   </>
                 )}
               </div>
@@ -1042,8 +1925,9 @@ export default function QuadernoView({
             {!isEditing && (
               <div className="flex items-center pt-1 border-t border-white/[0.04]">
                 <SegmentedControl
+                  key={`quaderno-seg-${selectedLecture?.id ?? 'default'}`}
                   size="sm"
-                  layoutId="quaderno-reading-tab"
+                  layoutId={`quaderno-tab-${selectedLecture?.id ?? 'default'}`}
                   options={[
                     { id: 'notes' as const, label: 'Quaderno', icon: FileText },
                     { id: 'transcript' as const, label: 'Trascrizione', icon: AlignLeft },
@@ -1051,11 +1935,6 @@ export default function QuadernoView({
                       id: 'questions' as const,
                       label: 'Domande',
                       icon: HelpCircle,
-                      badge: parsedQuestions.length > 0 ? (
-                        <span className="text-[10px] font-mono font-medium bg-amber-400/20 text-amber-300 px-1.5 py-0.5 rounded-full border border-amber-400/30">
-                          {parsedQuestions.length}
-                        </span>
-                      ) : undefined,
                     },
                   ]}
                   value={activeTab}
@@ -1066,8 +1945,8 @@ export default function QuadernoView({
           </div>
 
           {/* Sheet Body */}
-          <div className="flex-1 overflow-y-auto px-12 py-8 pb-32">
-            <div className="max-w-3xl mx-auto space-y-6">
+          <div className="flex-1 overflow-y-auto overflow-x-hidden px-6 sm:px-12 py-8 pb-32 [overscroll-behavior-x:none]">
+            <div className="max-w-3xl mx-auto space-y-6 w-full min-w-0">
               {isEditing ? (
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
@@ -1110,7 +1989,13 @@ export default function QuadernoView({
                   ) : (
                     <div className="p-6 rounded-2xl bg-white/[0.02] border border-white/[0.06] min-h-[300px]">
                       {editNotes.trim() ? (
-                        <MarkdownContent content={editNotes} className="quaderno-markdown" />
+                        <MarkdownContent
+                          content={editNotes}
+                          className="quaderno-markdown"
+                          onOpenAudioSnippet={handleJumpToAudioSnippet}
+                          onOpenCitation={onOpenCitation}
+                          onOpenSettings={onOpenSettings}
+                        />
                       ) : (
                         <p className="text-xs text-white/40 italic">Nessun contenuto da visualizzare nell'anteprima.</p>
                       )}
@@ -1119,52 +2004,50 @@ export default function QuadernoView({
                 </div>
               ) : activeTab === 'notes' ? (
                 <>
-                  {isGeneratingSummary ? (
-                    <div className="p-8 rounded-3xl bg-white/[0.03] border border-amber-400/25 text-center space-y-4 animate-fade-in shadow-liquid-md max-w-xl mx-auto">
-                      <div className="w-12 h-12 rounded-2xl bg-amber-400/10 border border-amber-400/30 flex items-center justify-center mx-auto text-amber-300">
-                        <Loader2 size={22} className="animate-spin text-amber-400" />
-                      </div>
-                      <div className="space-y-1">
-                        <h3 className="text-sm font-semibold text-white">Generazione Capitolo con Qwen 3.5</h3>
-                        <p className="text-xs text-white/70 max-w-md mx-auto leading-relaxed">
-                          {summaryProgress?.message || "L'LLM sta sintetizzando la trascrizione e i concetti chiave della lezione per redigere il capitolo strutturato per il tuo Quaderno."}
-                        </p>
-                      </div>
-
-                      {/* Progress Bar in streaming */}
-                      {typeof summaryProgress?.progress === 'number' && (
-                        <div className="max-w-xs mx-auto w-full pt-1">
-                          <div className="h-1.5 w-full bg-white/10 rounded-full overflow-hidden p-0.5">
-                            <div
-                              className="h-full bg-gradient-to-r from-amber-400 to-amber-300 rounded-full transition-all duration-300 shadow-[0_0_8px_rgba(251,191,36,0.5)]"
-                              style={{ width: `${Math.max(5, Math.min(100, summaryProgress.progress))}%` }}
-                            />
-                          </div>
-                          <div className="flex justify-between items-center text-[10px] text-white/40 mt-1.5 font-mono">
-                            <span>Avanzamento</span>
-                            <span>{summaryProgress.progress}%</span>
-                          </div>
+                  {!isGeneratingSummary && missingLlmNotice && (
+                    <div className="p-4 rounded-2xl liquid-glass border border-amber-400/25 bg-amber-500/[0.07] shadow-liquid-sm flex flex-col sm:flex-row sm:items-center justify-between gap-3.5 text-left animate-fade-in">
+                      <div className="flex items-start gap-3 min-w-0">
+                        <div className="w-8 h-8 rounded-xl bg-amber-400/15 border border-amber-400/25 flex items-center justify-center text-amber-300 flex-shrink-0 mt-0.5">
+                          <AlertTriangle size={15} strokeWidth={2} />
                         </div>
-                      )}
-
-                      <div className="flex items-center justify-center gap-1.5 py-1">
-                        <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
-                        <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse [animation-delay:150ms]" />
-                        <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse [animation-delay:300ms]" />
-                        <span className="text-[11px] font-mono text-amber-300/80 ml-2">Inferenza locale attiva (100% Offline)</span>
+                        <div className="min-w-0 space-y-0.5">
+                          <h4 className="text-xs font-semibold text-white tracking-tight">
+                            Nessun modello LLM scaricato
+                          </h4>
+                          <p className="text-xs text-white/65 leading-relaxed">
+                            Scarica un modello IA dalle Impostazioni per generare automaticamente il capitolo del Quaderno.
+                          </p>
+                        </div>
                       </div>
-                      <div className="pt-2">
+                      <div className="flex items-center gap-2 flex-shrink-0 self-end sm:self-center">
+                        {onOpenSettings && (
+                          <button
+                            type="button"
+                            onClick={onOpenSettings}
+                            className="h-8 px-3.5 rounded-full bg-white/[0.14] hover:bg-white/[0.22] border border-white/[0.20] text-xs font-semibold text-white transition-all flex items-center gap-1.5 cursor-pointer shadow-liquid-sm"
+                          >
+                            <Settings size={12} strokeWidth={2} />
+                            <span>Apri Impostazioni</span>
+                          </button>
+                        )}
                         <button
                           type="button"
-                          onClick={handleCancelSummary}
-                          className="px-4 py-1.5 rounded-full bg-red-500/20 hover:bg-red-500/30 border border-red-500/40 text-xs font-semibold text-red-300 transition-all inline-flex items-center gap-1.5 cursor-pointer shadow-liquid-sm"
-                          title="Interrompi subito l'elaborazione IA e libera la RAM"
+                          onClick={() => setMissingLlmNotice(false)}
+                          className="w-7 h-7 rounded-full flex items-center justify-center text-white/45 hover:text-white hover:bg-white/[0.10] transition-colors cursor-pointer"
+                          title="Chiudi avviso"
+                          aria-label="Chiudi avviso"
                         >
-                          <Square size={10} fill="currentColor" strokeWidth={0} />
-                          <span>Interrompi e libera risorse</span>
+                          <X size={13} strokeWidth={2} />
                         </button>
                       </div>
                     </div>
+                  )}
+
+                  {isGeneratingSummary ? (
+                    <ChapterGenerationSkeleton
+                      statusMessage={summaryProgress?.message}
+                      progress={summaryProgress?.progress}
+                    />
                   ) : selectedLecture.processed_notes ? (
                     <div className="space-y-4">
                       {summaryError && (
@@ -1178,15 +2061,22 @@ export default function QuadernoView({
                           <button
                             type="button"
                             onClick={() => setSummaryError(null)}
-                            className="text-white/40 hover:text-white text-xs px-1"
+                            className="w-6 h-6 rounded-full flex items-center justify-center text-red-200/60 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer flex-shrink-0"
                             title="Chiudi avviso"
+                            aria-label="Chiudi avviso"
                           >
-                            ✕
+                            <X size={13} />
                           </button>
                         </div>
                       )}
-                      <div className="p-4 sm:p-6 rounded-3xl bg-white/[0.02] border border-white/[0.06] shadow-liquid-sm">
-                        <MarkdownContent content={selectedLecture.processed_notes} className="quaderno-markdown" />
+                      <div className="p-4 sm:p-6 rounded-3xl bg-white/[0.02] border border-white/[0.06] shadow-liquid-sm w-full min-w-0 overflow-hidden">
+                        <MarkdownContent
+                          content={selectedLecture.processed_notes}
+                          className="quaderno-markdown"
+                          onOpenAudioSnippet={handleJumpToAudioSnippet}
+                          onOpenCitation={onOpenCitation}
+                          onOpenSettings={onOpenSettings}
+                        />
                       </div>
                     </div>
                   ) : (
@@ -1194,11 +2084,26 @@ export default function QuadernoView({
                       <Sparkles size={24} strokeWidth={1.5} className="mx-auto text-amber-300 mb-2" />
                       <h3 className="text-sm font-semibold text-white/90">Nessun appunto nel Quaderno</h3>
                       <p className="text-xs text-white/50 max-w-sm mx-auto leading-relaxed">
-                        {selectedLecture.raw_transcript 
-                          ? "La trascrizione è pronta! Puoi generare automaticamente il capitolo strutturato per il Quaderno con l'LLM locale."
-                          : "Non ci sono note scritte per questa lezione. Puoi scriverle o incollarle cliccando su Modifica."}
+                        {selectedLecture.raw_transcript?.trim()
+                          ? hasLLM
+                            ? 'La trascrizione è pronta. Usa "Sintesi IA" in alto per generare il capitolo, oppure "Modifica" per scrivere manualmente.'
+                            : 'La trascrizione è pronta. Scarica un modello LLM dalle Impostazioni per generare il capitolo con l\'IA, oppure usa Modifica in alto.'
+                          : 'Non ci sono ancora note per questa lezione. Usa "Modifica" in alto per scriverle o incollarle.'}
                       </p>
-                      
+
+                      {selectedLecture.raw_transcript?.trim() && !hasLLM && onOpenSettings && (
+                        <div className="pt-1">
+                          <button
+                            type="button"
+                            onClick={onOpenSettings}
+                            className="h-8 px-3.5 rounded-full liquid-glass-pill hover:bg-white/[0.14] text-xs font-medium text-white/85 hover:text-white border border-white/[0.14] transition-all inline-flex items-center gap-1.5 cursor-pointer shadow-liquid-sm"
+                          >
+                            <Settings size={12} strokeWidth={2} />
+                            <span>Apri Impostazioni</span>
+                          </button>
+                        </div>
+                      )}
+
                       {summaryError && (
                         <div className="max-w-md mx-auto p-3 rounded-2xl bg-red-500/10 border border-red-500/25 flex items-start gap-2.5 text-left animate-fade-in">
                           <AlertTriangle size={15} className="text-red-400 flex-shrink-0 mt-0.5" />
@@ -1210,33 +2115,14 @@ export default function QuadernoView({
                           <button
                             type="button"
                             onClick={() => setSummaryError(null)}
-                            className="text-white/40 hover:text-white text-xs px-1"
+                            className="w-6 h-6 rounded-full flex items-center justify-center text-red-200/60 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer flex-shrink-0"
                             title="Chiudi avviso"
+                            aria-label="Chiudi avviso"
                           >
-                            ✕
+                            <X size={13} />
                           </button>
                         </div>
                       )}
-
-                      <div className="flex items-center justify-center gap-2 pt-2">
-                        {selectedLecture.raw_transcript && (
-                          <button
-                            type="button"
-                            onClick={handleGenerateSummary}
-                            className="px-4 py-1.5 rounded-full bg-white/[0.18] hover:bg-white/[0.26] border border-white/[0.22] text-xs font-semibold text-white transition-all inline-flex items-center gap-1.5 cursor-pointer shadow-liquid-sm"
-                          >
-                            <Sparkles size={13} className="text-amber-300" />
-                            <span>Genera Capitolo</span>
-                          </button>
-                        )}
-                        <button
-                          onClick={startEditing}
-                          className="px-4 py-1.5 rounded-full liquid-glass-pill hover:bg-white/[0.14] text-xs font-semibold text-white transition-all inline-flex items-center gap-1.5 cursor-pointer"
-                        >
-                          <Pencil size={12} strokeWidth={2} />
-                          <span>Modifica Manuale</span>
-                        </button>
-                      </div>
                     </div>
                   )}
                 </>
@@ -1245,9 +2131,9 @@ export default function QuadernoView({
                   <AppleLyricsView
                     lines={karaokeLines}
                     audioRef={audioRef}
+                    audioPath={selectedLecture.audio_path || ''}
                     isPlaying={isPlaying}
                     onSeek={handleSeekAudio}
-                    subjectColor={subject.color}
                     rawTranscript={selectedLecture.raw_transcript || ''}
                     onCopyTranscript={handleCopyTranscript}
                     copiedTranscript={copiedTranscript}
@@ -1256,30 +2142,36 @@ export default function QuadernoView({
                 </div>
               ) : (
                 <div className="space-y-4">
-                  <div className="flex items-center justify-between pb-3 border-b border-white/[0.06]">
-                    <div className="flex items-center gap-2">
-                      <HelpCircle size={15} className="text-amber-400" />
-                      <span className="text-xs font-semibold text-white/90">
-                        Domande e Interventi del Docente
-                      </span>
+                  {questionAnswerError && (
+                    <div className="p-3.5 rounded-2xl bg-red-500/10 border border-red-500/25 flex items-start gap-2.5 text-left animate-fade-in">
+                      <AlertTriangle size={15} className="text-red-400 flex-shrink-0 mt-0.5" />
+                      <p className="flex-1 text-xs font-medium text-red-300 leading-relaxed">
+                        {questionAnswerError}
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => setQuestionAnswerError(null)}
+                        className="w-5 h-5 rounded-full flex items-center justify-center text-red-200/60 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer flex-shrink-0"
+                        title="Chiudi avviso"
+                        aria-label="Chiudi avviso"
+                      >
+                        <X size={12} />
+                      </button>
                     </div>
-                    <span className="text-[11px] font-mono text-white/40">
-                      {parsedQuestions.length} {parsedQuestions.length === 1 ? 'domanda registrata' : 'domande registrate'}
-                    </span>
-                  </div>
+                  )}
 
                   {parsedQuestions.length === 0 ? (
-                    <div className="p-8 rounded-3xl bg-white/[0.02] border border-white/[0.06] text-center">
-                      <HelpCircle size={24} strokeWidth={1.5} className="mx-auto text-white/30 mb-3" />
-                      <h3 className="text-sm font-semibold text-white/90">Nessuna domanda per questa lezione</h3>
-                      <p className="text-xs text-white/50 mt-1 max-w-sm mx-auto">
-                        In questa specifica registrazione non sono state rilevate domande dirette o frasi interrogative del docente.
+                    <div className="p-8 rounded-3xl bg-white/[0.02] border border-white/[0.06] text-center space-y-2.5">
+                      <HelpCircle size={22} strokeWidth={1.5} className="mx-auto text-white/30" />
+                      <h3 className="text-sm font-semibold text-white/90">Nessuna domanda rilevata</h3>
+                      <p className="text-xs text-white/50 max-w-sm mx-auto leading-relaxed">
+                        Non sono state intercettate domande del docente durante questa lezione.
                       </p>
                     </div>
                   ) : (
                     <div className="space-y-3">
                       {parsedQuestions.map((q, idx) => {
-                        const hasModel = Boolean(settings.modelsDownloaded);
+                        const hasModel = Boolean(settings.llmDownloaded);
                         const isPending = isPlaceholderAnswer(q.suggestedAnswer);
                         // Fallback sull'indice: il backend riconosce le domande anche per posizione
                         const qKey = q.id || String(idx);
@@ -1288,66 +2180,86 @@ export default function QuadernoView({
                         return (
                           <div
                             key={qKey}
-                            className="p-4 rounded-2xl liquid-glass border border-white/[0.12] shadow-liquid-sm space-y-2.5 animate-slide-up"
+                            className="p-4 rounded-2xl bg-white/[0.03] border border-white/[0.09] hover:border-white/[0.14] transition-colors space-y-3 animate-slide-up group"
                           >
                             <div className="flex items-start justify-between gap-3">
                               <p className="text-xs sm:text-[13px] font-medium text-white/95 leading-relaxed">
-                                "{q.question}"
+                                &ldquo;{q.question}&rdquo;
                               </p>
-                              <div className="flex items-center gap-1.5 flex-shrink-0">
-                                <span className="text-[9px] font-mono text-amber-300/80 bg-amber-500/10 border border-amber-500/20 px-2 py-0.5 rounded-md">
-                                  Prof
-                                </span>
+                              <div className="flex items-center gap-1 flex-shrink-0">
+                                {hasModel && !isPending && (
+                                  <button
+                                    type="button"
+                                    disabled={isAnswering}
+                                    onClick={() => handleAnswerQuestion(qKey)}
+                                    title="Rigenera risposta"
+                                    aria-label="Rigenera risposta"
+                                    className="w-7 h-7 rounded-lg flex items-center justify-center text-white/40 hover:text-white hover:bg-white/[0.08] transition-all cursor-pointer disabled:opacity-40"
+                                  >
+                                    <RotateCcw size={13} className={isAnswering ? 'animate-spin text-amber-300' : ''} />
+                                  </button>
+                                )}
                                 <button
                                   type="button"
                                   onClick={() => handleDeleteSavedQuestion(qKey)}
-                                  title="Elimina domanda non pertinente"
-                                  className="p-1 rounded-md text-white/30 hover:text-red-400 hover:bg-white/[0.08] transition-all cursor-pointer"
+                                  title="Elimina domanda"
+                                  aria-label="Elimina domanda"
+                                  className="w-7 h-7 rounded-lg flex items-center justify-center text-white/30 hover:text-red-400 hover:bg-white/[0.08] transition-all cursor-pointer"
                                 >
-                                  <Trash2 size={12} strokeWidth={1.75} />
+                                  <Trash2 size={13} strokeWidth={1.75} />
                                 </button>
                               </div>
                             </div>
 
                             {/* Stato risposta */}
                             {isPending ? (
-                              <div className="pt-2 border-t border-white/[0.06]">
+                              <div className="pt-2.5 border-t border-white/[0.06]">
                                 {!hasModel ? (
-                                  <div className="flex items-center justify-between gap-3 bg-amber-500/[0.08] border border-amber-500/20 p-3 rounded-xl">
-                                    <div className="flex items-center gap-2 text-xs text-amber-200/90 leading-relaxed">
-                                      <AlertTriangle size={14} className="text-amber-400 flex-shrink-0" />
-                                      <span>Modello LLM non installato. Vai nelle Impostazioni e scarica un modello LLM per avere le risposte alle domande.</span>
+                                  <div className="p-3.5 rounded-2xl liquid-glass border border-amber-400/25 bg-amber-500/[0.07] shadow-liquid-sm flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-left">
+                                    <div className="flex items-start gap-3 min-w-0">
+                                      <div className="w-8 h-8 rounded-xl bg-amber-400/15 border border-amber-400/25 flex items-center justify-center text-amber-300 flex-shrink-0 mt-0.5">
+                                        <AlertTriangle size={14} strokeWidth={2} />
+                                      </div>
+                                      <div className="min-w-0 space-y-0.5">
+                                        <h4 className="text-xs font-semibold text-white tracking-tight">
+                                          Nessun modello LLM scaricato
+                                        </h4>
+                                        <p className="text-xs text-white/65 leading-relaxed">
+                                          Scarica un modello IA dalle Impostazioni per generare risposte alle domande del docente.
+                                        </p>
+                                      </div>
                                     </div>
                                     {onOpenSettings && (
                                       <button
                                         type="button"
                                         onClick={onOpenSettings}
-                                        className="px-3 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/30 text-[11px] font-semibold transition-all flex-shrink-0 cursor-pointer"
+                                        className="h-8 px-3.5 rounded-full bg-white/[0.14] hover:bg-white/[0.22] border border-white/[0.20] text-xs font-semibold text-white transition-all flex items-center gap-1.5 flex-shrink-0 self-end sm:self-center cursor-pointer shadow-liquid-sm"
                                       >
-                                        Impostazioni
+                                        <Settings size={12} strokeWidth={2} />
+                                        <span>Apri Impostazioni</span>
                                       </button>
                                     )}
                                   </div>
                                 ) : (
-                                  <div className="flex items-center justify-between gap-3 bg-white/[0.02] border border-white/[0.04] p-3 rounded-xl">
-                                    <span className="text-xs text-white/40 italic">
+                                  <div className="flex items-center justify-between gap-3">
+                                    <span className="text-xs text-white/45">
                                       Nessuna risposta memorizzata per questa domanda.
                                     </span>
                                     <button
                                       type="button"
                                       disabled={isAnswering}
                                       onClick={() => handleAnswerQuestion(qKey)}
-                                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-white/[0.14] hover:bg-white/[0.22] text-white text-xs font-semibold border border-white/[0.18] shadow-liquid-sm transition-all cursor-pointer disabled:opacity-50"
+                                      className="h-8 px-3.5 rounded-full bg-white/[0.10] hover:bg-white/[0.16] text-white text-xs font-medium border border-white/[0.14] shadow-liquid-sm transition-all inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50 whitespace-nowrap flex-shrink-0"
                                     >
                                       {isAnswering ? (
                                         <>
-                                          <Loader2 size={12} className="animate-spin text-amber-300" />
-                                          <span>SbobinAI sta rispondendo...</span>
+                                          <Loader2 size={12} className="animate-spin text-white/75" />
+                                          <span className="chat-shimmer-text">SbobinAI sta rispondendo...</span>
                                         </>
                                       ) : (
                                         <>
                                           <Sparkles size={12} className="text-amber-300" />
-                                          <span>Rispondi con l'IA</span>
+                                          <span>Rispondi con l&apos;IA</span>
                                         </>
                                       )}
                                     </button>
@@ -1355,26 +2267,14 @@ export default function QuadernoView({
                                 )}
                               </div>
                             ) : (
-                              <div className="pt-2.5 border-t border-white/[0.06]">
-                                <div className="flex items-center justify-between mb-1.5">
-                                  <div className="flex items-center gap-1.5 text-[10px] font-mono text-white/40">
-                                    <Sparkles size={11} className="text-amber-400/70" />
-                                    <span>Risposta SbobinAI (locale)</span>
-                                  </div>
-                                  {hasModel && (
-                                    <button
-                                      type="button"
-                                      disabled={isAnswering}
-                                      onClick={() => handleAnswerQuestion(qKey)}
-                                      title="Rigenera la risposta a questa domanda con SbobinAI"
-                                      className="text-[10px] text-white/40 hover:text-white/80 underline underline-offset-2 transition-colors cursor-pointer"
-                                    >
-                                      {isAnswering ? 'Rigenerazione...' : 'Rigenera'}
-                                    </button>
-                                  )}
-                                </div>
-                                <div className="text-xs text-white/80 leading-relaxed bg-white/[0.03] p-3 rounded-xl border border-white/[0.04]">
-                                  <MarkdownContent content={q.suggestedAnswer!} />
+                              <div className="pt-2 border-t border-white/[0.06]">
+                                <div className="text-xs text-white/85 leading-relaxed bg-white/[0.03] p-3.5 rounded-xl border border-white/[0.06] select-text">
+                                  <MarkdownContent
+                                    content={formatQuestionAnswer(q.suggestedAnswer!)}
+                                    onOpenAudioSnippet={handleJumpToAudioSnippet}
+                                    onOpenCitation={onOpenCitation}
+                                    onOpenSettings={onOpenSettings}
+                                  />
                                 </div>
                               </div>
                             )}
@@ -1393,7 +2293,7 @@ export default function QuadernoView({
             <div className="absolute bottom-6 left-0 right-0 z-30 flex flex-col items-center pointer-events-none px-6">
               {/* Segnalibri Esame: Floating mini-pill dock above player */}
               {bookmarks.length > 0 && (
-                <div className="pointer-events-auto mb-2 flex items-center gap-1.5 overflow-x-auto max-w-xl py-1 px-3.5 rounded-full bg-[#0c0d14]/85 backdrop-blur-2xl border border-white/[0.12] shadow-[0_8px_24px_rgba(0,0,0,0.5)] no-scrollbar animate-fade-in">
+                <div className="pointer-events-auto mb-2 flex items-center gap-1.5 overflow-x-auto max-w-xl py-1 px-3.5 rounded-full bg-[#0c0d14]/88 backdrop-blur-xl border border-white/[0.12] shadow-[0_8px_24px_rgba(0,0,0,0.5)] no-scrollbar animate-fade-in">
                   <span className="text-[10px] font-mono uppercase text-amber-400 flex items-center gap-1 flex-shrink-0 mr-1 font-semibold">
                     <BookmarkIcon size={11} className="fill-amber-400/20 text-amber-400" />
                     <span>Segnalibri:</span>
@@ -1423,11 +2323,11 @@ export default function QuadernoView({
               )}
 
               {/* Floating Pill Player Container — Apple Music Liquid Glass Capsule */}
-              <div className="pointer-events-auto w-full max-w-xl h-[52px] px-4 rounded-full bg-white/[0.08] hover:bg-white/[0.11] backdrop-blur-3xl border border-white/[0.20] shadow-[0_20px_50px_rgba(0,0,0,0.65),inset_0_1px_1px_rgba(255,255,255,0.30)] flex items-center gap-3 transition-all">
-                {/* HTML Audio element */}
+              <div className="pointer-events-auto w-full max-w-xl h-[52px] px-4 rounded-full bg-[#121622]/78 hover:bg-[#121622]/86 backdrop-blur-xl border border-white/[0.20] shadow-[0_20px_50px_rgba(0,0,0,0.65),inset_0_1px_1px_rgba(255,255,255,0.30)] flex items-center gap-3 transition-colors">
+                {/* HTML Audio element — cache-buster su audio_path evita errori 416 in Safari quando .wav diventa .m4a */}
                 <audio
                   ref={audioRef}
-                  src={api.lectures.getAudioUrl(selectedLecture.id)}
+                  src={`${api.lectures.getAudioUrl(selectedLecture.id)}?v=${encodeURIComponent(selectedLecture.audio_path || '')}`}
                   preload="metadata"
                   onTimeUpdate={() => setCurrentTime(audioRef.current?.currentTime || 0)}
                   onLoadedMetadata={() => setAudioDuration(audioRef.current?.duration || selectedLecture.duration_seconds || 0)}
@@ -1505,15 +2405,16 @@ export default function QuadernoView({
           )}
         </div>
       ) : (
-        <div className="flex-1 flex flex-col items-center justify-center p-8 text-center">
+        <div className="flex-1 flex flex-col items-center justify-center p-8 text-center relative">
           {isSidebarCollapsed && (
             <button
               type="button"
               onClick={() => setIsSidebarCollapsed(false)}
-              className="mb-4 px-3 py-1.5 rounded-xl liquid-glass hover:bg-white/[0.12] text-xs font-medium text-white flex items-center gap-2 border border-white/[0.10] shadow-liquid-sm cursor-pointer"
+              title="Mostra indice lezioni"
+              aria-label="Mostra indice lezioni"
+              className="absolute top-4 left-4 w-9 h-9 rounded-full liquid-glass hover:bg-white/[0.14] text-white/75 hover:text-white flex items-center justify-center border border-white/[0.14] shadow-liquid-sm transition-all cursor-pointer"
             >
-              <PanelLeftOpen size={14} />
-              <span>Mostra indice lezioni</span>
+              <PanelLeftOpen size={15} strokeWidth={1.75} />
             </button>
           )}
           <BookOpen size={32} strokeWidth={1.5} className="text-white/20 mb-3" />
@@ -1522,115 +2423,6 @@ export default function QuadernoView({
         </div>
       )}
 
-      {/* ── Modal Finder Memoria: Importa da Materiali nel Quaderno ── */}
-      <MaterialiFinderModal
-        isOpen={showFinderModal}
-        onClose={() => setShowFinderModal(false)}
-        subject={subject}
-        lecturesInQuaderno={lectures}
-        onIncludeLectureInQuaderno={async (lectureId) => {
-          await onRestoreToQuaderno(lectureId);
-        }}
-        onImportMaterialAsLecture={async (data) => {
-          const created = await onAddLecture(data);
-          setSelectedLectureId(created.id);
-          return created;
-        }}
-        onOpenAddMaterialModal={onOpenAddMaterialModal}
-      />
-
-      {/* ── Modal: Scelta Eliminazione (Solo Quaderno vs Definitiva) ── */}
-      {showDeleteModal && selectedLecture && (
-        <div 
-          className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-black/60 backdrop-blur-md animate-fade-in"
-          onClick={() => setShowDeleteModal(false)}
-        >
-          <div 
-            className="w-full max-w-md rounded-3xl liquid-glass border border-white/[0.14] shadow-liquid-lg p-6 animate-slide-up space-y-4"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-start justify-between">
-              <div className="flex items-center gap-2.5">
-                <div className="w-8 h-8 rounded-xl liquid-glass-subtle border border-red-500/20 flex items-center justify-center text-red-400">
-                  <Trash2 size={15} strokeWidth={1.75} />
-                </div>
-                <div>
-                  <h3 className="text-sm font-semibold tracking-tight text-white">
-                    Rimuovi Lezione
-                  </h3>
-                  <p className="text-[11px] text-white/40 truncate max-w-[240px]">
-                    {selectedLecture.title}
-                  </p>
-                </div>
-              </div>
-
-              <button
-                onClick={() => setShowDeleteModal(false)}
-                className="w-6 h-6 rounded-full flex items-center justify-center text-white/40 hover:text-white transition-colors"
-              >
-                <X size={14} />
-              </button>
-            </div>
-
-            <p className="text-xs text-white/70 leading-relaxed">
-              Puoi rimuovere questa lezione solo dal quaderno di studio, oppure cancellarla per sempre dall'archivio del corso.
-            </p>
-
-            <div className="space-y-2 pt-1">
-              {/* Opzione 1: Rimuovi solo dal quaderno */}
-              <button
-                onClick={async () => {
-                  await onRemoveFromQuadernoOnly(selectedLecture.id);
-                  setShowDeleteModal(false);
-                }}
-                className="w-full p-3.5 rounded-2xl liquid-glass-subtle hover:bg-white/[0.08] border border-white/[0.10] text-left transition-all group flex items-start gap-3"
-              >
-                <BookOpen size={16} className="text-white/60 mt-0.5 flex-shrink-0 group-hover:text-white transition-colors" />
-                <div>
-                  <h4 className="text-xs font-semibold text-white/95">
-                    Rimuovi solo dal Quaderno
-                  </h4>
-                  <p className="text-[11px] text-white/40 leading-snug mt-0.5">
-                    La registrazione e la trascrizione restano salvate nella memoria (sezione Materiali). Potrai ripristinarla quando vuoi.
-                  </p>
-                </div>
-              </button>
-
-              {/* Opzione 2: Elimina definitivamente */}
-              <button
-                onClick={async () => {
-                  try {
-                    await onDeletePermanently(selectedLecture.id);
-                    setShowDeleteModal(false);
-                  } catch (err) {
-                    console.error('Impossibile eliminare la lezione:', err);
-                  }
-                }}
-                className="w-full p-3.5 rounded-2xl bg-red-500/10 hover:bg-red-500/15 border border-red-500/20 text-left transition-all group flex items-start gap-3"
-              >
-                <Trash2 size={16} className="text-red-400 mt-0.5 flex-shrink-0" />
-                <div>
-                  <h4 className="text-xs font-semibold text-red-300">
-                    Elimina definitivamente anche dalla memoria
-                  </h4>
-                  <p className="text-[11px] text-red-300/60 leading-snug mt-0.5">
-                    Cancella definitivamente la lezione, la registrazione e gli appunti da tutto il database.
-                  </p>
-                </div>
-              </button>
-            </div>
-
-            <div className="pt-2 flex justify-end">
-              <button
-                onClick={() => setShowDeleteModal(false)}
-                className="px-4 py-1.5 rounded-full text-xs font-medium text-white/50 hover:text-white transition-colors"
-              >
-                Annulla
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

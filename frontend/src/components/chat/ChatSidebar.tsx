@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import type { ChatSession } from '../../types';
+import { useDelayedLoading, SkeletonBlock } from '../Skeleton';
 
 export interface ChatSidebarProps {
   sessions: ChatSession[];
@@ -58,9 +59,12 @@ export default function ChatSidebar({
 }: ChatSidebarProps) {
   const [editingId, setEditingId] = useState<number | null>(null);
   const [draftTitle, setDraftTitle] = useState('');
+  const isCancellingRenameRef = useRef(false);
   const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
   const editInputRef = useRef<HTMLInputElement>(null);
+  const isListLoading = isLoading && sessions.length === 0;
+  const showListSkeleton = useDelayedLoading(isListLoading, 140, 220);
 
   useEffect(() => {
     if (editingId !== null) {
@@ -70,12 +74,17 @@ export default function ChatSidebar({
   }, [editingId]);
 
   const startRename = (session: ChatSession) => {
+    isCancellingRenameRef.current = false;
     setConfirmDeleteId(null);
     setEditingId(session.id);
     setDraftTitle(session.title);
   };
 
   const commitRename = async (session: ChatSession) => {
+    if (isCancellingRenameRef.current) {
+      isCancellingRenameRef.current = false;
+      return;
+    }
     const trimmed = draftTitle.trim();
     setEditingId(null);
     if (!trimmed || trimmed === session.title) return;
@@ -103,7 +112,7 @@ export default function ChatSidebar({
       {isOpen && (
         <div
           onClick={onToggleSidebar}
-          className="md:hidden fixed inset-0 z-20 bg-black/50 backdrop-blur-xs"
+          className="md:hidden fixed inset-0 z-20 bg-black/50 backdrop-blur-sm"
           aria-hidden="true"
         />
       )}
@@ -111,7 +120,7 @@ export default function ChatSidebar({
       <aside
         aria-label="Cronologia chat"
         className={clsx(
-          'flex-shrink-0 flex flex-col h-full border-r border-white/[0.07] bg-zinc-950/90 backdrop-blur-xl transition-all duration-200 ease-out overflow-hidden z-30',
+          'flex-shrink-0 flex flex-col h-full border-r border-white/[0.07] bg-[#0e121c]/90 backdrop-blur-xl transition-all duration-200 ease-out overflow-hidden z-30',
           'fixed md:relative inset-y-0 left-0',
           isOpen
             ? 'w-64 opacity-100 translate-x-0'
@@ -145,15 +154,26 @@ export default function ChatSidebar({
 
           {/* Session list */}
           <div className="flex-1 overflow-y-auto px-2 py-2.5 space-y-1">
-            {isLoading && sessions.length === 0 ? (
-              <div className="space-y-2 px-2 py-2">
-                {[0, 1, 2].map((idx) => (
-                  <div
-                    key={idx}
-                    className="h-11 rounded-xl bg-white/[0.03] border border-white/[0.05] animate-pulse"
-                  />
-                ))}
-              </div>
+            {isListLoading || showListSkeleton ? (
+              showListSkeleton ? (
+                <div
+                  aria-busy="true"
+                  aria-label="Caricamento conversazioni"
+                  className="space-y-1.5 px-1 py-1.5 animate-fade-in select-none"
+                >
+                  {(['w-4/5', 'w-2/3', 'w-3/4'] as const).map((titleWidth, idx) => (
+                    <div
+                      key={idx}
+                      className="rounded-xl px-2.5 py-2.5 bg-white/[0.03] border border-white/[0.06] space-y-2"
+                    >
+                      <SkeletonBlock className={clsx('h-3 rounded-full', titleWidth)} />
+                      <SkeletonBlock className="h-2 w-1/3 rounded-full bg-white/[0.04]" />
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="h-36" aria-busy="true" />
+              )
             ) : sessions.length === 0 ? (
               <div className="px-3 py-8 text-center">
                 <MessageSquare size={18} className="mx-auto text-zinc-600 mb-2" />
@@ -191,11 +211,13 @@ export default function ChatSidebar({
                               e.preventDefault();
                               void commitRename(session);
                             } else if (e.key === 'Escape') {
+                              e.preventDefault();
+                              isCancellingRenameRef.current = true;
                               setEditingId(null);
                             }
                           }}
                           onBlur={() => void commitRename(session)}
-                          className="w-full bg-zinc-900/90 border border-white/20 rounded-lg px-2 py-1 text-xs text-zinc-100 focus:outline-none focus:border-emerald-400/60"
+                          className="w-full bg-[#121622]/90 border border-white/20 rounded-lg px-2 py-1 text-xs text-zinc-100 focus:outline-none focus:border-emerald-400/60"
                         />
                       </div>
                     ) : isConfirmingDelete ? (

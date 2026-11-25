@@ -55,6 +55,7 @@ class ModelSpec:
     aliases: Tuple[str, ...] = field(default_factory=tuple)
     is_default: bool = False
     is_system_core: bool = False
+    supports_thinking: bool = False
 
     @property
     def variant(self) -> Variant:
@@ -97,6 +98,7 @@ CATALOG: Dict[str, ModelSpec] = {
         id=LLM_DEFAULT_ID,
         type="llm",
         is_default=True,
+        supports_thinking=True,
         aliases=("qwen3.5-4b", "qwen"),
         variants={
             "mlx": Variant(
@@ -121,6 +123,7 @@ CATALOG: Dict[str, ModelSpec] = {
     LLM_LIGHT_ID: ModelSpec(
         id=LLM_LIGHT_ID,
         type="llm",
+        supports_thinking=True,
         aliases=("qwen3.5-2b", "qwen-2b", "mlx-community/Qwen3.5-2B-4bit"),
         variants={
             "mlx": Variant(
@@ -145,6 +148,7 @@ CATALOG: Dict[str, ModelSpec] = {
     LLM_ALT_ID: ModelSpec(
         id=LLM_ALT_ID,
         type="llm",
+        supports_thinking=True,
         aliases=("gemma-4-e4b", "gemma"),
         variants={
             "mlx": Variant(
@@ -261,6 +265,17 @@ def human_size(nbytes: int) -> str:
     return f"~{int(round(nbytes / MB))} MB"
 
 
+def model_supports_thinking(model_id: Optional[str]) -> bool:
+    """Restituisce True se il modello LLM indicato supporta la modalità thinking nativa."""
+    spec = resolve(model_id, kind="llm")
+    if spec is not None:
+        return bool(spec.supports_thinking)
+    low = (model_id or "").strip().lower()
+    if not low:
+        return bool(CATALOG[LLM_DEFAULT_ID].supports_thinking)
+    return any(tok in low for tok in ("qwen3", "gemma-4", "gemma4", "deepseek-r1", "thinking", "qwq"))
+
+
 def info_dict(spec: ModelSpec) -> Dict[str, object]:
     """Descrizione JSON (formato storico di routers/models.py) per il backend corrente."""
     v = spec.variant
@@ -272,6 +287,7 @@ def info_dict(spec: ModelSpec) -> Dict[str, object]:
         "type": spec.type,
         "is_default": spec.is_default,
         "is_system_core": spec.is_system_core,
+        "supports_thinking": spec.supports_thinking,
         "approx_size": human_size(v.approx_bytes),
         "approx_bytes": v.approx_bytes,
         "description": v.description,

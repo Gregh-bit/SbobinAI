@@ -1,4 +1,4 @@
-import { useMemo, type MouseEvent } from 'react';
+import { memo, useMemo, type MouseEvent } from 'react';
 import { Marked, type Tokens } from 'marked';
 import DOMPurify from 'dompurify';
 import katex from 'katex';
@@ -8,6 +8,8 @@ interface MarkdownContentProps {
   content: string;
   className?: string;
   onOpenCitation?: (sourceId: string, page?: number) => void;
+  onOpenAudioSnippet?: (lectureId: number, seconds: number, autoPlay?: boolean) => void;
+  onOpenSettings?: () => void;
 }
 
 function escapeHtml(text: string): string {
@@ -54,6 +56,22 @@ function renderKatexSafe(expr: string, displayMode: boolean): string {
   });
 }
 
+function parseTimestampToSeconds(val: string | undefined): number {
+  if (!val) return 0;
+  const trimmed = val.trim();
+  if (trimmed.includes(':')) {
+    const parts = trimmed.split(':').map((p) => Number.parseFloat(p));
+    if (parts.length === 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+      return Math.max(0, parts[0] * 60 + parts[1]);
+    }
+    if (parts.length === 3 && !isNaN(parts[0]) && !isNaN(parts[1]) && !isNaN(parts[2])) {
+      return Math.max(0, parts[0] * 3600 + parts[1] * 60 + parts[2]);
+    }
+  }
+  const num = Number.parseFloat(trimmed);
+  return isNaN(num) ? 0 : Math.max(0, num);
+}
+
 function parseMarkdownWithMathAndCitations(raw: string): string {
   const nonce = Math.random().toString(36).slice(2, 8);
   const codeTokenPrefix = `@@SBCODE_${nonce}_`;
@@ -93,14 +111,43 @@ function parseMarkdownWithMathAndCitations(raw: string): string {
     return `${katexTokenPrefix}${idx}ZTOKEN`;
   });
 
-  // 3. Extract clickable slide/material citations [[ref:SOURCE_ID#PAGE|LABEL]] or [[ref:SOURCE_ID|LABEL]]
-  text = text.replace(/\[\[ref:([^\]|]+?)(?:#(\d+))?\|([^\]]+?)\]\]/g, (_match, sourceId: string, page: string | undefined, label: string) => {
+  // 3a. Extract clickable audio citations [[audio:LECTURE_ID|SECONDS|LABEL]] or [[audio:LECTURE_ID#SECONDS|LABEL]]
+  text = text.replace(
+    /\[\[audio:(\d+)(?:[#|](\d+(?::\d+)?(?:\.\d+)?))?\|([^\]]+?)\]\]/g,
+    (_match, lectureId: string, secondsStr: string | undefined, label: string) => {
+      const idx = citationTokens.length;
+      const safeLecId = escapeHtml(lectureId.trim());
+      const parsedSeconds = parseTimestampToSeconds(secondsStr);
+      const safeSec = escapeHtml(String(parsedSeconds));
+      const safeLabel = escapeHtml(label.trim());
+      citationTokens.push(
+        `<a href="#audio-ref" data-audio-lecture-id="${safeLecId}" data-audio-seconds="${safeSec}" class="audio-citation-link inline-flex items-center gap-1 font-medium text-sky-300 hover:text-sky-100 underline decoration-sky-400/60 hover:decoration-sky-300 underline-offset-4 cursor-pointer transition-colors px-1 py-0.5 rounded hover:bg-sky-500/10"><svg class="w-3 h-3 shrink-0 fill-current text-sky-400" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg><span>${safeLabel}</span></a>`
+      );
+      return `${citeTokenPrefix}${idx}ZTOKEN`;
+    }
+  );
+
+  // 3b. Extract clickable slide/material citations [[slide:SOURCE_ID#PAGE|LABEL]] or [[ref:...]] or [[doc:...]]
+  text = text.replace(
+    /\[\[(?:ref|slide|doc):([^\]|#]+?)(?:[#|](\d+))?\|([^\]]+?)\]\]/g,
+    (_match, sourceId: string, page: string | undefined, label: string) => {
+      const idx = citationTokens.length;
+      const safeSource = escapeHtml(sourceId.trim());
+      const safeLabel = escapeHtml(label.trim());
+      const pageAttr = page ? ` data-slide-page="${escapeHtml(page)}"` : '';
+      citationTokens.push(
+        `<a href="#slide-ref" data-slide-source="${safeSource}"${pageAttr} class="slide-citation-link inline-flex items-center gap-1 font-medium text-emerald-300 hover:text-emerald-100 underline decoration-emerald-400/60 hover:decoration-emerald-300 underline-offset-4 cursor-pointer transition-colors px-1 py-0.5 rounded hover:bg-emerald-500/10"><svg class="w-3 h-3 shrink-0 stroke-current text-emerald-400 fill-none" viewBox="0 0 24 24" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg><span>${safeLabel}</span></a>`
+      );
+      return `${citeTokenPrefix}${idx}ZTOKEN`;
+    }
+  );
+
+  // 3c. Extract clickable internal settings link [[action:settings|LABEL]]
+  text = text.replace(/\[\[action:settings\|([^\]]+?)\]\]/g, (_match, label: string) => {
     const idx = citationTokens.length;
-    const safeSource = escapeHtml(sourceId.trim());
     const safeLabel = escapeHtml(label.trim());
-    const pageAttr = page ? ` data-slide-page="${escapeHtml(page)}"` : '';
     citationTokens.push(
-      `<a href="#slide-ref" data-slide-source="${safeSource}"${pageAttr} class="slide-citation-link underline decoration-emerald-400/70 underline-offset-4 text-emerald-300 hover:text-emerald-200 font-medium cursor-pointer transition-colors">${safeLabel}</a>`
+      `<a href="#open-settings" data-open-settings="true" class="underline decoration-white/55 hover:decoration-white underline-offset-4 text-white font-medium cursor-pointer transition-colors">${safeLabel}</a>`
     );
     return `${citeTokenPrefix}${idx}ZTOKEN`;
   });
@@ -125,12 +172,24 @@ function parseMarkdownWithMathAndCitations(raw: string): string {
     ADD_ATTR: [
       'data-slide-source',
       'data-slide-page',
+      'data-audio-lecture-id',
+      'data-audio-seconds',
+      'data-open-settings',
       'data-code-copy',
       'data-code-index',
       'target',
       'rel',
       'aria-hidden',
+      'viewBox',
+      'strokeWidth',
+      'stroke-width',
+      'stroke-linecap',
+      'stroke-linejoin',
+      'fill',
+      'stroke',
+      'd',
     ],
+    ADD_TAGS: ['svg', 'path'],
   });
 
   // 8. Restore sanitized KaTeX HTML (nonce prefix prevents collisions with literal text in code blocks)
@@ -142,10 +201,12 @@ function parseMarkdownWithMathAndCitations(raw: string): string {
   return html;
 }
 
-export default function MarkdownContent({
+const MarkdownContent = memo(function MarkdownContent({
   content,
   className = '',
   onOpenCitation,
+  onOpenAudioSnippet,
+  onOpenSettings,
 }: MarkdownContentProps) {
   const html = useMemo(() => {
     if (!content) return '';
@@ -158,6 +219,30 @@ export default function MarkdownContent({
 
   function handleContainerClick(e: MouseEvent<HTMLDivElement>) {
     const target = e.target as HTMLElement | null;
+
+    // 0a. Clickable audio playback citation link
+    const audioEl = target?.closest('a[data-audio-lecture-id], button[data-audio-lecture-id]') as HTMLElement | null;
+    if (audioEl) {
+      e.preventDefault();
+      const lectureIdStr = audioEl.getAttribute('data-audio-lecture-id');
+      const secondsStr = audioEl.getAttribute('data-audio-seconds');
+      if (lectureIdStr) {
+        const lectureId = Number.parseInt(lectureIdStr, 10);
+        const seconds = secondsStr ? Math.max(0, Number.parseFloat(secondsStr)) : 0;
+        if (Number.isFinite(lectureId)) {
+          onOpenAudioSnippet?.(lectureId, Number.isFinite(seconds) ? seconds : 0, true);
+        }
+      }
+      return;
+    }
+
+    // 0b. Internal settings action link
+    const settingsLink = target?.closest('a[data-open-settings], button[data-open-settings]') as HTMLElement | null;
+    if (settingsLink) {
+      e.preventDefault();
+      onOpenSettings?.();
+      return;
+    }
 
     // 1. Clickable slide / material citation
     const citationEl = target?.closest('a[data-slide-source], button[data-slide-source]') as HTMLElement | null;
@@ -210,4 +295,6 @@ export default function MarkdownContent({
       dangerouslySetInnerHTML={{ __html: html }}
     />
   );
-}
+});
+
+export default MarkdownContent;

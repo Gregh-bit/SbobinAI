@@ -160,6 +160,7 @@ def save_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
                     os.remove(tmp)
                 except Exception:
                     pass
+            raise RuntimeError(f"Impossibile salvare le impostazioni: {e}") from e
     return settings
 
 
@@ -314,7 +315,6 @@ def update_storage_path(new_path: str, migrate_data: bool = True) -> Dict[str, A
         os.makedirs(new_audio, exist_ok=True)
         os.makedirs(new_uploads, exist_ok=True)
         os.makedirs(new_lancedb, exist_ok=True)
-        _active_storage_root = expanded_new
     except (PermissionError, OSError) as e:
         logger.warning(f"[Config] Cartella '{expanded_new}' non accessibile ({e}). Uso fallback in data/storage.")
         expanded_new = os.path.join(REPO_DATA_DIR, "storage")
@@ -326,11 +326,12 @@ def update_storage_path(new_path: str, migrate_data: bool = True) -> Dict[str, A
         os.makedirs(new_audio, exist_ok=True)
         os.makedirs(new_uploads, exist_ok=True)
         os.makedirs(new_lancedb, exist_ok=True)
-        _active_storage_root = expanded_new
 
     old_audio = os.path.join(old_root, "audio")
 
-    # Migrazione se abilitata
+    # Migrazione se abilitata. Non commutare lo storage attivo finché tutte le
+    # copie richieste non sono riuscite: evita di avviare l'app su dati parziali.
+    migration_errors: list[str] = []
     if migrate_data and os.path.exists(old_root):
         # 1. DB SQLite (forza checkpoint WAL per consolidare le transazioni pendenti)
         try:
@@ -357,6 +358,7 @@ def update_storage_path(new_path: str, migrate_data: bool = True) -> Dict[str, A
                 logger.info(f"[Config] Database spostato in {new_db}")
             except Exception as e:
                 logger.error(f"[Config] Errore copia DB: {e}")
+                migration_errors.append(f"database: {e}")
 
         # 2. Cartella Audio
         if os.path.exists(old_audio):
@@ -368,6 +370,7 @@ def update_storage_path(new_path: str, migrate_data: bool = True) -> Dict[str, A
                         shutil.copy2(src, dst)
                     except Exception as e:
                         logger.warning(f"[Config] Errore copia file audio {fname}: {e}")
+                        migration_errors.append(f"audio/{fname}: {e}")
 
         # 3. Cartella Uploads
         old_uploads = os.path.join(old_root, "uploads")
@@ -383,6 +386,7 @@ def update_storage_path(new_path: str, migrate_data: bool = True) -> Dict[str, A
                             shutil.copy2(src, dst)
                     except Exception as e:
                         logger.warning(f"[Config] Errore copia uploads {item}: {e}")
+                        migration_errors.append(f"uploads/{item}: {e}")
 
         # 4. Cartella LanceDB
         old_lancedb = os.path.join(old_root, "lancedb")
@@ -398,6 +402,15 @@ def update_storage_path(new_path: str, migrate_data: bool = True) -> Dict[str, A
                             shutil.copy2(src, dst)
                     except Exception as e:
                         logger.warning(f"[Config] Errore copia lancedb {item}: {e}")
+                        migration_errors.append(f"lancedb/{item}: {e}")
+
+    if migration_errors:
+        raise RuntimeError(
+            "Migrazione non completata; lo storage precedente resta attivo. "
+            + "; ".join(migration_errors[:5])
+        )
+
+    _active_storage_root = expanded_new
 
     # Salva le nuove impostazioni
     update_settings({"storage_path": expanded_new})
@@ -426,7 +439,15 @@ def update_storage_path(new_path: str, migrate_data: bool = True) -> Dict[str, A
                     db_mig.commit()
                     logger.info(f"[Config] Aggiornati {updated_count} percorsi audio nel database.")
     except Exception as e:
-        logger.warning(f"[Config] Rebind database / migrazione audio_path: {e}")
+        logger.error(f"[Config] Rebind database / migrazione audio_path fallita: {e}")
+        _active_storage_root = old_root
+        update_settings({"storage_path": old_root})
+        try:
+            from database import rebind_database
+            rebind_database()
+        except Exception:
+            pass
+        raise RuntimeError(f"Riconnessione al database nella nuova cartella fallita ({e}). Ripristinato storage precedente.") from e
 
     # Riapre LanceDB sulla nuova cartella
     try:
