@@ -51,10 +51,10 @@ jobs:
         with:
           projectPath: frontend
           tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v__VERSION__' }}
-          releaseName: 'SbobinAI ${{ github.ref_name }}'
+          releaseName: SbobinAI ${{ github.ref_type == 'tag' && github.ref_name || 'v__VERSION__' }}
           releaseDraft: false
           prerelease: false
-          uploadUpdaterJson: true
+          includeUpdaterJson: true
           args: ${{ matrix.args }}
 
       - name: Ad-hoc codesign app bundle (macOS)

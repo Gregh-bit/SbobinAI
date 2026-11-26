@@ -18,7 +18,7 @@ interface State {
   currentVersion: string;
 }
 
-let state: State = { status: 'idle', version: null, progress: 0, error: null, currentVersion: '0.0.16' };
+let state: State = { status: 'idle', version: null, progress: 0, error: null, currentVersion: '0.0.17' };
 let handle: UpdateHandle | null = null;
 let versionFetched = false;
 const listeners = new Set<() => void>();

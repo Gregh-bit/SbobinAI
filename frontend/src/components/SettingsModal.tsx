@@ -1676,7 +1676,7 @@ export default function SettingsModal({ isOpen, onClose }: Props) {
                       </p>
                     </div>
                     <span className="text-[10px] font-mono font-medium px-2.5 py-1 rounded-full bg-white/[0.08] text-white/70 border border-white/10 flex-shrink-0">
-                      v{updater.currentVersion || '0.0.16'}
+                      v{updater.currentVersion || '0.0.17'}
                     </span>
                   </div>
 

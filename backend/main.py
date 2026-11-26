@@ -154,7 +154,7 @@ async def health_check():
         "status": "ok",
         "service": "SbobinAI",
         "version": "0.1.0",
-        "app_version": os.environ.get("SBOBINAI_APP_VERSION") or "0.0.16",
+        "app_version": os.environ.get("SBOBINAI_APP_VERSION") or "0.0.17",
     }
 
 
