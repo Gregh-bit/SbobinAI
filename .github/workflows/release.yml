@@ -43,6 +43,21 @@ jobs:
         working-directory: frontend
         run: npm ci
 
+      - name: Ensure GitHub release exists
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME="v$(node -p "require('./frontend/package.json').version")"
+          for attempt in 1 2 3; do
+            if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+              exit 0
+            fi
+            gh release create "$TAG_NAME" --target "$GITHUB_SHA" --title "SbobinAI $TAG_NAME" --generate-notes || true
+            sleep 2
+          done
+          gh release view "$TAG_NAME"
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -50,8 +65,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: frontend
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v__VERSION__' }}
-          releaseName: SbobinAI ${{ github.ref_type == 'tag' && github.ref_name || 'v__VERSION__' }}
+          tagName: v__VERSION__
+          releaseName: SbobinAI v__VERSION__
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
@@ -70,10 +85,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG_NAME="${{ github.ref_type == 'tag' && github.ref_name || '' }}"
-          if [ -z "$TAG_NAME" ]; then
-            TAG_NAME=$(gh release list --limit 1 | awk '{print $1}')
-          fi
+          TAG_NAME="v$(node -p "require('./frontend/package.json').version")"
           DMG_FILE=$(find frontend/src-tauri/target -name "*.dmg" | head -n 1)
           if [ -n "$DMG_FILE" ] && [ -n "$TAG_NAME" ]; then
             cp "$DMG_FILE" SbobinAI-macOS.dmg
@@ -86,10 +98,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG_NAME="${{ github.ref_type == 'tag' && github.ref_name || '' }}"
-          if [ -z "$TAG_NAME" ]; then
-            TAG_NAME=$(gh release list --limit 1 | awk '{print $1}')
-          fi
+          TAG_NAME="v$(node -p "require('./frontend/package.json').version")"
           # Seleziona prioritariamente l'installer NSIS (-setup.exe), non il binario raw privo di installer
           EXE_FILE=$(find frontend/src-tauri/target -type f -name "*setup*.exe" | head -n 1)
           if [ -z "$EXE_FILE" ]; then
